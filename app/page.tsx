@@ -8,7 +8,7 @@ import {
   summarizeSessionRuns,
   type SessionRunMetric,
 } from "@/lib/client-analytics";
-import { runClientDirectRetrieval } from "@/lib/client-retrieval";
+import { probeClientDirectRetrieval, runClientDirectRetrieval } from "@/lib/client-retrieval";
 import { QueryVariant } from "@/lib/pipeline/types";
 import { evaluateQueryCoach } from "@/lib/query-coach";
 import { NearMissCase, ScoredCase, SearchResponse } from "@/lib/types";
@@ -46,7 +46,7 @@ type DebugPayload = {
     phase?: string;
     parserMode?: string;
     challengeDetected?: boolean;
-    blockedType?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
+    blockedType?: "local_cooldown" | "cloudflare_challenge" | "rate_limit" | "cors";
     parsedCount: number;
     error: string | null;
     htmlPreview?: string;
@@ -291,15 +291,83 @@ export default function Home() {
       let sourceDebug: DebugPayload | null = null;
 
       if (CLIENT_DIRECT_ENABLED) {
-        const planStartedAt = Date.now();
-        const plan = await postJsonWithTimeout<PlanResponse>(
-          "/api/search/plan",
-          { query, maxResults: 20, debug: enableDebugDiagnostics },
-          12_000,
-        );
-        const planElapsedMs = Date.now() - planStartedAt;
+        const probeStartedAt = Date.now();
+        const probe = await probeClientDirectRetrieval();
+        const probeElapsedMs = Date.now() - probeStartedAt;
 
-        if (plan.clientRetrieval.enabled) {
+        if (!probe.supported) {
+          responsePayload = await postJsonWithTimeout<SearchResponse>(
+            "/api/search",
+            { query, maxResults: 20, debug: enableDebugDiagnostics },
+            REQUEST_TIMEOUT_MS,
+          );
+          responsePayload = {
+            ...responsePayload,
+            notes: [
+              ...(responsePayload.notes ?? []),
+              `Client-direct retrieval unavailable (${probe.reason ?? "unknown"}${
+                probe.detail ? `: ${probe.detail}` : ""
+              }); server fallback used.`,
+            ],
+            executionPath: "server_fallback",
+            clientDirectAttempted: false,
+            clientDirectSucceeded: false,
+            pipelineTrace: responsePayload.pipelineTrace
+              ? {
+                  ...responsePayload.pipelineTrace,
+                  routing: {
+                    decision: "server_fallback",
+                    reason: "client_direct_probe_unsupported",
+                    clientProbe: `${probe.reason ?? "unknown"}${probe.detail ? `|${probe.detail}` : ""}`,
+                  },
+                  timing: {
+                    stageMs: {
+                      ...(responsePayload.pipelineTrace.timing?.stageMs ?? {}),
+                      client_probe: probeElapsedMs,
+                      total: Date.now() - runStartedAt,
+                    },
+                  },
+                }
+              : responsePayload.pipelineTrace,
+          };
+
+          if (enableDebugDiagnostics) {
+            const serverDebug = responsePayload.debug;
+            sourceDebug = {
+              requestId: serverDebug?.requestId ?? responsePayload.requestId ?? "n/a",
+              cleanedQuery: serverDebug?.cleanedQuery,
+              planner: serverDebug?.planner,
+              phrases: serverDebug?.phrases ?? [],
+              source: [
+                {
+                  phrase: "client_probe",
+                  searchQuery: undefined,
+                  status: 0,
+                  ok: false,
+                  phase: "client_probe",
+                  parserMode: "n/a",
+                  challengeDetected: false,
+                  blockedType: "cors",
+                  parsedCount: 0,
+                  error: probe.reason ?? "client_direct_unavailable",
+                  htmlPreview: probe.detail ?? "No client probe details available.",
+                },
+                ...(serverDebug?.source ?? []),
+              ],
+            };
+          }
+        }
+
+        if (!responsePayload) {
+          const planStartedAt = Date.now();
+          const plan = await postJsonWithTimeout<PlanResponse>(
+            "/api/search/plan",
+            { query, maxResults: 20, debug: enableDebugDiagnostics },
+            12_000,
+          );
+          const planElapsedMs = Date.now() - planStartedAt;
+
+          if (plan.clientRetrieval.enabled) {
           const clientStartedAt = Date.now();
           const clientResult = await runClientDirectRetrieval({
             variants: plan.queryPlan.strictVariants,
@@ -322,10 +390,7 @@ export default function Home() {
                     phase: "client_direct",
                     parserMode: attempt.parserMode,
                     challengeDetected: attempt.challenge,
-                    blockedType:
-                      clientResult.blockedKind === "cors"
-                        ? "cloudflare_challenge"
-                        : clientResult.blockedKind,
+                    blockedType: clientResult.blockedKind,
                     parsedCount: attempt.parsedCount,
                     error: attempt.error ?? null,
                     htmlPreview: clientResult.reason,
@@ -339,10 +404,7 @@ export default function Home() {
                       phase: "client_probe",
                       parserMode: "n/a",
                       challengeDetected: false,
-                      blockedType:
-                        clientResult.blockedKind === "cors"
-                          ? "cloudflare_challenge"
-                          : clientResult.blockedKind,
+                      blockedType: clientResult.blockedKind,
                       parsedCount: 0,
                       error: clientResult.reason ?? "client_direct_unavailable",
                       htmlPreview: clientResult.probeDetail ?? "No client probe details available.",
@@ -421,6 +483,7 @@ export default function Home() {
                     timing: {
                       stageMs: {
                         ...(responsePayload.pipelineTrace.timing?.stageMs ?? {}),
+                        client_probe: probeElapsedMs,
                         plan: planElapsedMs,
                         client_direct: clientElapsedMs,
                         total: Date.now() - runStartedAt,
@@ -430,18 +493,19 @@ export default function Home() {
                 : responsePayload.pipelineTrace,
             };
           }
-        } else {
-          responsePayload = await postJsonWithTimeout<SearchResponse>(
-            "/api/search",
-            { query, maxResults: 20, debug: enableDebugDiagnostics },
-            REQUEST_TIMEOUT_MS,
-          );
-          responsePayload = {
-            ...responsePayload,
-            executionPath: "server_only",
-            clientDirectAttempted: false,
-            clientDirectSucceeded: false,
-          };
+          } else {
+            responsePayload = await postJsonWithTimeout<SearchResponse>(
+              "/api/search",
+              { query, maxResults: 20, debug: enableDebugDiagnostics },
+              REQUEST_TIMEOUT_MS,
+            );
+            responsePayload = {
+              ...responsePayload,
+              executionPath: "server_only",
+              clientDirectAttempted: false,
+              clientDirectSucceeded: false,
+            };
+          }
         }
       } else {
         responsePayload = await postJsonWithTimeout<SearchResponse>(

@@ -177,7 +177,7 @@ function classifyReasonerHealth(input: {
 
   return {
     status: "error",
-    attempted: false,
+    attempted: true,
     skipReason: error,
   };
 }

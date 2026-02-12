@@ -177,7 +177,6 @@ async function callBedrockPlanner(
     ],
     inferenceConfig: {
       temperature: 0.1,
-      topP: 0.9,
       maxTokens: 700,
     },
   });

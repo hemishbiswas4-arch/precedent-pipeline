@@ -285,6 +285,9 @@ function buildPropositionStrategy(input: {
   const strict: string[] = [];
   const broad: string[] = [];
   const noHookStrictMode = requiredHookGroups.length === 0;
+  const noHookActorRequired = noHookStrictMode && actors.length > 0;
+  const noHookProceedingRequired = noHookStrictMode && proceedings.length > 0;
+  const noHookOutcomeRequired = noHookStrictMode && (polarityCues.length > 0 || outcomes.length > 0);
 
   const actorPool = actors.length > 0 ? actors : [""];
   const proceedingPool = proceedings.length > 0 ? proceedings : [""];
@@ -294,7 +297,12 @@ function buildPropositionStrategy(input: {
   for (const actor of actorPool.slice(0, 3)) {
     for (const proceeding of proceedingPool.slice(0, 3)) {
       for (const outcome of outcomePool.slice(0, 3)) {
-        if (noHookStrictMode && (!actor || !proceeding || !outcome)) {
+        if (
+          noHookStrictMode &&
+          ((noHookActorRequired && !actor) ||
+            (noHookProceedingRequired && !proceeding) ||
+            (noHookOutcomeRequired && !outcome))
+        ) {
           continue;
         }
         const phrase = sanitizeTokens(
@@ -445,15 +453,15 @@ function appendPhaseVariants(input: {
         const tokenSet = new Set(tokens);
         const hasActor =
           strictAxisRequirement.actorTokens.size === 0
-            ? false
+            ? true
             : Array.from(strictAxisRequirement.actorTokens).some((token) => tokenSet.has(token));
         const hasProceeding =
           strictAxisRequirement.proceedingTokens.size === 0
-            ? false
+            ? true
             : Array.from(strictAxisRequirement.proceedingTokens).some((token) => tokenSet.has(token));
         const hasOutcome =
           strictAxisRequirement.outcomeTokens.size === 0
-            ? false
+            ? true
             : Array.from(strictAxisRequirement.outcomeTokens).some((token) => tokenSet.has(token));
         const hasRole =
           strictAxisRequirement.roleTokens.size === 0

@@ -40,8 +40,8 @@ export type ReasonerMode = "pass1" | "pass2";
 let inflightReasonerCalls = 0;
 
 const MODE = (process.env.LLM_REASONER_MODE ?? "initial").toLowerCase();
-const TIMEOUT_MS = Math.max(200, Number(process.env.LLM_REASONER_TIMEOUT_MS ?? "1200"));
-const MAX_TIMEOUT_MS = Math.max(TIMEOUT_MS, Number(process.env.LLM_REASONER_MAX_TIMEOUT_MS ?? "1800"));
+const TIMEOUT_MS = Math.max(200, Number(process.env.LLM_REASONER_TIMEOUT_MS ?? "1500"));
+const MAX_TIMEOUT_MS = Math.max(TIMEOUT_MS, Number(process.env.LLM_REASONER_MAX_TIMEOUT_MS ?? "2400"));
 const MAX_TOKENS = Math.max(100, Number(process.env.LLM_REASONER_MAX_TOKENS ?? "450"));
 const MAX_CALLS_PER_REQUEST = Math.max(0, Number(process.env.LLM_REASONER_MAX_CALLS_PER_REQUEST ?? "2"));
 const CACHE_TTL_SEC = Math.max(60, Number(process.env.LLM_REASONER_CACHE_TTL_SEC ?? "21600"));
@@ -54,6 +54,9 @@ const GLOBAL_RATE_LIMIT = Math.max(0, Number(process.env.LLM_REASONER_GLOBAL_RAT
 const GLOBAL_RATE_WINDOW_SEC = Math.max(5, Number(process.env.LLM_REASONER_GLOBAL_RATE_WINDOW_SEC ?? "60"));
 const LOCK_TTL_SEC = Math.max(2, Math.ceil(TIMEOUT_MS / 1000) + 2);
 const LOCK_WAIT_MS = Math.max(100, Number(process.env.LLM_REASONER_LOCK_WAIT_MS ?? "250"));
+const FORCE_PASS1_ATTEMPT = (process.env.LLM_REASONER_FORCE_PASS1_ATTEMPT ?? "1") !== "0";
+const RETRY_ON_TIMEOUT_ENABLED = (process.env.LLM_REASONER_RETRY_ON_TIMEOUT ?? "1") !== "0";
+const RETRY_TIMEOUT_BONUS_MS = Math.max(200, Number(process.env.LLM_REASONER_RETRY_TIMEOUT_BONUS_MS ?? "800"));
 
 const CIRCUIT_KEY = "reasoner:circuit:v1";
 
@@ -76,6 +79,19 @@ function safeJsonParse(text: string): Record<string, unknown> | null {
       return null;
     }
   }
+}
+
+function mergeWarnings(...sets: Array<string[] | undefined>): string[] {
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const set of sets) {
+    for (const warning of set ?? []) {
+      if (!warning || seen.has(warning)) continue;
+      seen.add(warning);
+      output.push(warning);
+    }
+  }
+  return output;
 }
 
 function promptForReasoner(query: string, context: ContextProfile): string {
@@ -315,7 +331,6 @@ async function invokeReasonerModel(input: {
       ],
       inferenceConfig: {
         temperature: 0,
-        topP: 0.85,
         maxTokens: MAX_TOKENS,
       },
     });
@@ -389,6 +404,7 @@ export async function runOpusReasoner(input: {
 }): Promise<ReasonerExecution> {
   const mode = input.mode ?? "pass1";
   const fingerprint = buildQueryFingerprint(input.cleanedQuery, input.context);
+  const forcePass1Attempt = FORCE_PASS1_ATTEMPT && mode === "pass1";
 
   const complexityScore =
     (input.context.statutesOrSections.length >= 2 ? 1 : 0) +
@@ -396,7 +412,8 @@ export async function runOpusReasoner(input: {
     (input.context.procedures.length >= 2 ? 1 : 0) +
     (input.cleanedQuery.length > 180 ? 1 : 0) +
     (input.mode === "pass2" ? 1 : 0);
-  const timeoutMsUsed = Math.min(MAX_TIMEOUT_MS, TIMEOUT_MS + (complexityScore >= 2 ? 600 : 0));
+  const adaptiveBumpMs = complexityScore >= 3 ? 800 : complexityScore >= 1 ? 400 : 0;
+  const timeoutMsUsed = Math.min(MAX_TIMEOUT_MS, TIMEOUT_MS + adaptiveBumpMs);
   const adaptiveTimeoutApplied = timeoutMsUsed > TIMEOUT_MS;
 
   if (mode === "pass2" && !input.basePlan) {
@@ -457,7 +474,7 @@ export async function runOpusReasoner(input: {
   }
 
   const circuit = await getCircuitState();
-  if (CIRCUIT_ENABLED && circuit.openUntil > Date.now()) {
+  if (CIRCUIT_ENABLED && circuit.openUntil > Date.now() && !forcePass1Attempt) {
     return telemetryDeterministic(fingerprint, "reasoner_circuit_open", {
       modelId: modelConfig.debugModelId,
       timeoutMsUsed,
@@ -518,7 +535,8 @@ export async function runOpusReasoner(input: {
   const startedAt = Date.now();
 
   try {
-    const modelResult = await invokeReasonerModel({
+    let effectiveTimeoutMs = timeoutMsUsed;
+    let modelResult = await invokeReasonerModel({
       mode,
       query: input.query,
       context: input.context,
@@ -527,6 +545,37 @@ export async function runOpusReasoner(input: {
       basePlan: input.basePlan,
       snippets: input.snippets,
     });
+
+    if (
+      !modelResult.plan &&
+      modelResult.timeout &&
+      mode === "pass1" &&
+      RETRY_ON_TIMEOUT_ENABLED &&
+      timeoutMsUsed < MAX_TIMEOUT_MS
+    ) {
+      const retryTimeoutMs = Math.min(MAX_TIMEOUT_MS, timeoutMsUsed + RETRY_TIMEOUT_BONUS_MS);
+      const retryResult = await invokeReasonerModel({
+        mode,
+        query: input.query,
+        context: input.context,
+        modelId: modelConfig.modelId,
+        timeoutMs: retryTimeoutMs,
+        basePlan: input.basePlan,
+        snippets: input.snippets,
+      });
+      effectiveTimeoutMs = retryTimeoutMs;
+      if (retryResult.plan) {
+        modelResult = {
+          ...retryResult,
+          warnings: mergeWarnings(modelResult.warnings, ["reasoner_timeout_retry_success"], retryResult.warnings),
+        };
+      } else {
+        modelResult = {
+          ...retryResult,
+          warnings: mergeWarnings(modelResult.warnings, ["reasoner_timeout_retry_failed"], retryResult.warnings),
+        };
+      }
+    }
 
     const latencyMs = Date.now() - startedAt;
 
@@ -539,7 +588,7 @@ export async function runOpusReasoner(input: {
           cacheHit: false,
           degraded: true,
           timeout: modelResult.timeout,
-          timeoutMsUsed,
+          timeoutMsUsed: effectiveTimeoutMs,
           adaptiveTimeoutApplied,
           latencyMs,
           error: modelResult.error ?? "reasoner_plan_empty",
@@ -569,7 +618,7 @@ export async function runOpusReasoner(input: {
         cacheHit: false,
         degraded: false,
         timeout: false,
-        timeoutMsUsed,
+        timeoutMsUsed: effectiveTimeoutMs,
         adaptiveTimeoutApplied,
         latencyMs,
         modelId: modelConfig.debugModelId,
@@ -585,7 +634,7 @@ export async function runOpusReasoner(input: {
         cacheHit: false,
         degraded: true,
         timeout: false,
-        timeoutMsUsed,
+        timeoutMsUsed: timeoutMsUsed,
         adaptiveTimeoutApplied,
         latencyMs: Date.now() - startedAt,
         error: error instanceof Error ? error.message : "reasoner_unexpected_error",
