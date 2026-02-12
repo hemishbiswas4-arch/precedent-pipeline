@@ -133,8 +133,9 @@ export async function runRetrievalSchedule(input: {
   intent: IntentProfile;
   config: SchedulerConfig;
   carryState?: SchedulerCarryState;
+  cooldownScope?: string;
 }): Promise<SchedulerResult> {
-  const { variants, intent, config, carryState } = input;
+  const { variants, intent, config, carryState, cooldownScope } = input;
   const seenSignatures = new Set<string>(carryState?.seenSignatures ?? []);
   const attempts: SchedulerResult["attempts"] = [...(carryState?.attempts ?? [])];
   const allCandidates: CaseCandidate[] = [...(carryState?.candidates ?? [])];
@@ -260,6 +261,7 @@ export async function runRetrievalSchedule(input: {
           fetchTimeoutMs: perAttemptTimeoutMs,
           max429Retries: dynamicMax429Retries,
           maxRetryAfterMs: config.maxRetryAfterMs,
+          cooldownScope,
         });
 
         attempts.push({

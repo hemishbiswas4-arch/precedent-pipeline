@@ -54,11 +54,11 @@ function clientIpHash(req: NextRequest): string {
   return createHash("sha256").update(ip).digest("hex").slice(0, 16);
 }
 
-async function enforceIpRateLimit(req: NextRequest): Promise<{ allowed: boolean; retryAfterMs?: number }> {
+async function enforceIpRateLimit(ipHash: string): Promise<{ allowed: boolean; retryAfterMs?: number }> {
   if (SEARCH_IP_RATE_LIMIT <= 0) return { allowed: true };
 
   const bucket = Math.floor(Date.now() / (SEARCH_IP_RATE_WINDOW_SEC * 1000));
-  const key = `search:rl:${bucket}:${clientIpHash(req)}`;
+  const key = `search:rl:${bucket}:${ipHash}`;
   const count = await sharedCache.increment(key, SEARCH_IP_RATE_WINDOW_SEC + 2);
   if (count > SEARCH_IP_RATE_LIMIT) {
     return {
@@ -129,6 +129,7 @@ export async function POST(req: NextRequest) {
     const query = body.query?.trim() ?? "";
     const maxResults = Math.min(Math.max(body.maxResults ?? DEFAULT_MAX_RESULTS, 5), 40);
     const debugEnabled = body.debug ?? DEBUG_BY_DEFAULT;
+    const ipHash = clientIpHash(req);
 
     if (!query || query.length < 12) {
       return NextResponse.json(
@@ -138,7 +139,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (!debugEnabled) {
-      const rate = await enforceIpRateLimit(req);
+      const rate = await enforceIpRateLimit(ipHash);
       if (!rate.allowed) {
         return NextResponse.json(
           {
@@ -226,6 +227,7 @@ export async function POST(req: NextRequest) {
           maxResults,
           requestId,
           debugEnabled,
+          cooldownScope: `ip:${ipHash}`,
         })
       : await runLegacySearch({
           query,

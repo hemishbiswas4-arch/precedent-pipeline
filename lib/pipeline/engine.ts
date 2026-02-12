@@ -246,6 +246,7 @@ async function runQualityAwarePhases(input: {
   intent: ReturnType<typeof buildIntentProfile>;
   config: SchedulerConfig;
   carryState?: SchedulerResult["carryState"];
+  cooldownScope?: string;
   strictStopTarget: number;
   bestEffortStopTarget: number;
   query: string;
@@ -266,6 +267,7 @@ async function runQualityAwarePhases(input: {
     intent: input.intent,
     config: input.config,
     carryState: input.carryState,
+    cooldownScope: input.cooldownScope,
   });
   let evaluation = await evaluateCandidates({
     query: input.query,
@@ -289,6 +291,7 @@ async function runQualityAwarePhases(input: {
       intent: input.intent,
       config: input.config,
       carryState: scheduler.carryState,
+      cooldownScope: input.cooldownScope,
     });
     const currentCandidateSignature = `${scheduler.candidates.length}|${scheduler.candidates
       .slice(0, 48)
@@ -359,6 +362,7 @@ export async function runPipelineSearch(input: {
   maxResults: number;
   requestId: string;
   debugEnabled: boolean;
+  cooldownScope?: string;
 }): Promise<{
   response: SearchResponse;
   debug?: {
@@ -486,6 +490,7 @@ export async function runPipelineSearch(input: {
     variants: initialVariants,
     intent,
     config,
+    cooldownScope: input.cooldownScope,
     strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
     bestEffortStopTarget: PROPOSITION_BEST_EFFORT_STOP_TARGET,
     query: input.query,
@@ -519,6 +524,7 @@ export async function runPipelineSearch(input: {
           intent,
           config,
           carryState: scheduler.carryState,
+          cooldownScope: input.cooldownScope,
           strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
           bestEffortStopTarget: PROPOSITION_BEST_EFFORT_STOP_TARGET,
           query: input.query,
@@ -588,6 +594,7 @@ export async function runPipelineSearch(input: {
         intent,
         config,
         carryState: scheduler.carryState,
+        cooldownScope: input.cooldownScope,
         strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
         bestEffortStopTarget: PROPOSITION_BEST_EFFORT_STOP_TARGET,
         query: input.query,

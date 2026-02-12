@@ -60,6 +60,7 @@ export type IndianKanoonSearchOptions = {
   fetchTimeoutMs?: number;
   max429Retries?: number;
   maxRetryAfterMs?: number;
+  cooldownScope?: string;
 };
 
 const DEFAULT_CHALLENGE_COOLDOWN_MS = 30_000;
@@ -82,7 +83,7 @@ const configuredMaxRetryAfter = Number(process.env.IK_MAX_RETRY_AFTER_MS ?? DEFA
 const MAX_RETRY_AFTER_MS = Number.isFinite(configuredMaxRetryAfter)
   ? Math.max(500, Math.min(5_000, Math.floor(configuredMaxRetryAfter)))
   : DEFAULT_MAX_RETRY_AFTER_MS;
-let challengeCooldownUntil = 0;
+const challengeCooldownByScope = new Map<string, number>();
 
 function stripTags(input: string): string {
   return input
@@ -95,13 +96,22 @@ function stripTags(input: string): string {
     .trim();
 }
 
-function challengeCooldownRemainingMs(): number {
-  return Math.max(0, challengeCooldownUntil - Date.now());
+function normalizeCooldownScope(scope?: string): string {
+  const value = (scope ?? "global").trim().toLowerCase();
+  return value.length > 0 ? value : "global";
 }
 
-function setChallengeCooldown(durationMs: number = CHALLENGE_COOLDOWN_MS): void {
+function challengeCooldownRemainingMs(scope?: string): number {
+  const key = normalizeCooldownScope(scope);
+  const until = challengeCooldownByScope.get(key) ?? 0;
+  return Math.max(0, until - Date.now());
+}
+
+function setChallengeCooldown(scope: string | undefined, durationMs: number = CHALLENGE_COOLDOWN_MS): void {
+  const key = normalizeCooldownScope(scope);
   const until = Date.now() + Math.max(1_000, durationMs);
-  challengeCooldownUntil = Math.max(challengeCooldownUntil, until);
+  const current = challengeCooldownByScope.get(key) ?? 0;
+  challengeCooldownByScope.set(key, Math.max(current, until));
 }
 
 function isLikelyStatute(title: string, snippet: string): boolean {
@@ -266,11 +276,14 @@ async function fetchWithRateLimitHandling(
     fetchTimeoutMs?: number;
     max429Retries?: number;
     maxRetryAfterMs?: number;
+    cooldownScope?: string;
+    applyCooldownOn429?: boolean;
   },
 ): Promise<Response> {
   const fetchTimeoutMs = Math.max(1_500, Math.min(options?.fetchTimeoutMs ?? FETCH_TIMEOUT_MS, 15_000));
   const max429Retries = Math.max(0, Math.min(options?.max429Retries ?? MAX_429_RETRIES, 3));
   const maxRetryAfterMs = Math.max(500, Math.min(options?.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS, 5_000));
+  const applyCooldownOn429 = options?.applyCooldownOn429 ?? true;
   const maxAttempts = max429Retries + 1;
   let lastResponse: Response | null = null;
 
@@ -299,9 +312,9 @@ async function fetchWithRateLimitHandling(
     }
     lastResponse = response;
 
-    if (response.status === 429) {
+    if (response.status === 429 && applyCooldownOn429) {
       const retryAfterMs = Math.min(parseRetryAfterMs(response.headers.get("retry-after")), maxRetryAfterMs);
-      setChallengeCooldown(retryAfterMs + 1_000);
+      setChallengeCooldown(options?.cooldownScope, retryAfterMs + 1_000);
     }
 
     if (response.status !== 429 || attempt === maxAttempts) {
@@ -340,7 +353,8 @@ async function crawlSearchPages(
   searchQuery: string,
   options: IndianKanoonSearchOptions = {},
 ): Promise<IndianKanoonFetchResult> {
-  const cooldownRemaining = challengeCooldownRemainingMs();
+  const cooldownScope = options.cooldownScope;
+  const cooldownRemaining = challengeCooldownRemainingMs(cooldownScope);
   if (cooldownRemaining > 0) {
     const retryAfterMs = Math.ceil(cooldownRemaining);
     const preview = `Local Cloudflare cooldown active for ${Math.ceil(
@@ -407,6 +421,8 @@ async function crawlSearchPages(
         fetchTimeoutMs: options.fetchTimeoutMs,
         max429Retries: options.max429Retries,
         maxRetryAfterMs: options.maxRetryAfterMs,
+        cooldownScope,
+        applyCooldownOn429: true,
       });
     } catch (error) {
       if (error instanceof FetchTimeoutError) {
@@ -458,7 +474,7 @@ async function crawlSearchPages(
     const challengePage = parsedPage.challenge;
     anyChallengeDetected = anyChallengeDetected || challengePage;
     if (challengePage) {
-      setChallengeCooldown(CHALLENGE_COOLDOWN_MS);
+      setChallengeCooldown(cooldownScope, CHALLENGE_COOLDOWN_MS);
     }
     const noMatchPage = parsedPage.noMatch;
     const docLinkSignals = parsedPage.docLinkSignals;
@@ -557,16 +573,16 @@ async function crawlSearchPages(
 
   if (!finalOk) {
     if (debug.status === 429) {
-      setChallengeCooldown(CHALLENGE_COOLDOWN_MS);
+      setChallengeCooldown(cooldownScope, CHALLENGE_COOLDOWN_MS);
       debug.blockedType = "rate_limit";
-      debug.retryAfterMs = Math.max(1_000, challengeCooldownRemainingMs());
+      debug.retryAfterMs = Math.max(1_000, challengeCooldownRemainingMs(cooldownScope));
     }
     throw new IndianKanoonFetchError(`Indian Kanoon returned ${debug.status}`, debug);
   }
   if (debug.challengeDetected && parsed.length === 0) {
-    setChallengeCooldown(CHALLENGE_COOLDOWN_MS);
+    setChallengeCooldown(cooldownScope, CHALLENGE_COOLDOWN_MS);
     debug.blockedType = "cloudflare_challenge";
-    debug.retryAfterMs = Math.max(1_000, challengeCooldownRemainingMs());
+    debug.retryAfterMs = Math.max(1_000, challengeCooldownRemainingMs(cooldownScope));
     throw new IndianKanoonFetchError("Cloudflare challenge detected", debug);
   }
   return { cases: parsed, debug };
@@ -647,9 +663,13 @@ export async function fetchIndianKanoonCaseDetail(
     fetchTimeoutMs?: number;
     max429Retries?: number;
     maxRetryAfterMs?: number;
+    cooldownScope?: string;
   },
 ): Promise<string> {
-  const res = await fetchWithRateLimitHandling(url, options);
+  const res = await fetchWithRateLimitHandling(url, {
+    ...options,
+    applyCooldownOn429: false,
+  });
 
   if (!res.ok) {
     throw new Error(`Case page returned ${res.status}`);
