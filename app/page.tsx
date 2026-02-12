@@ -20,6 +20,22 @@ type DebugPayload = {
     source: "bedrock" | "fallback";
     modelId?: string;
     error?: string;
+    reasonerMode?: "opus" | "deterministic";
+    reasonerDegraded?: boolean;
+    reasonerAttempted?: boolean;
+    reasonerStatus?:
+      | "ok"
+      | "timeout"
+      | "circuit_open"
+      | "config_error"
+      | "rate_limited"
+      | "lock_timeout"
+      | "semaphore_saturated"
+      | "disabled"
+      | "error";
+    reasonerSkipReason?: string;
+    reasonerTimeoutMsUsed?: number;
+    reasonerLatencyMs?: number;
   };
   phrases: string[];
   source: Array<{
@@ -769,11 +785,29 @@ export default function Home() {
                   <p className="stats">Request ID: {debugData.requestId}</p>
                   {debugData.cleanedQuery && <p className="stats">Cleaned query: {debugData.cleanedQuery}</p>}
                   {debugData.planner && (
-                    <p className="stats">
-                      Planner: {debugData.planner.source}
-                      {debugData.planner.modelId ? ` | model=${debugData.planner.modelId}` : ""}
-                      {debugData.planner.error ? ` | plannerError=${debugData.planner.error}` : ""}
-                    </p>
+                    <>
+                      <p className="stats">
+                        Planner: {debugData.planner.source}
+                        {debugData.planner.modelId ? ` | model=${debugData.planner.modelId}` : ""}
+                        {debugData.planner.error ? ` | plannerError=${debugData.planner.error}` : ""}
+                      </p>
+                      <p className="stats">
+                        Reasoner: {debugData.planner.reasonerMode ?? "unknown"}
+                        {typeof debugData.planner.reasonerAttempted === "boolean"
+                          ? ` | attempted=${String(debugData.planner.reasonerAttempted)}`
+                          : ""}
+                        {debugData.planner.reasonerStatus ? ` | status=${debugData.planner.reasonerStatus}` : ""}
+                        {typeof debugData.planner.reasonerTimeoutMsUsed === "number"
+                          ? ` | timeoutMs=${debugData.planner.reasonerTimeoutMsUsed}`
+                          : ""}
+                        {typeof debugData.planner.reasonerLatencyMs === "number"
+                          ? ` | latencyMs=${debugData.planner.reasonerLatencyMs}`
+                          : ""}
+                        {debugData.planner.reasonerSkipReason
+                          ? ` | skipReason=${debugData.planner.reasonerSkipReason}`
+                          : ""}
+                      </p>
+                    </>
                   )}
                   <div className="cases">
                     {debugData.source.map((entry, idx) => (

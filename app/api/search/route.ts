@@ -239,17 +239,25 @@ export async function POST(req: NextRequest) {
     const isBlockedRun = result.response.pipelineTrace?.scheduler.stopReason === "blocked";
     const sourceSuccessCount = successfulAttemptCount(result.response);
     const canWriteCache = !isBlockedRun && sourceSuccessCount > 0;
+    const reasonerTrace = result.response.pipelineTrace?.planner;
+    const reasonerSummary = `reasoner=${reasonerTrace?.reasonerSource ?? "n/a"}:${
+      reasonerTrace?.reasonerStatus ?? "n/a"
+    }${reasonerTrace?.reasonerError ? `:${reasonerTrace.reasonerError}` : ""}${
+      typeof reasonerTrace?.reasonerTimeoutMsUsed === "number"
+        ? ` timeoutMs=${reasonerTrace.reasonerTimeoutMsUsed}`
+        : ""
+    }${typeof reasonerTrace?.reasonerLatencyMs === "number" ? ` latencyMs=${reasonerTrace.reasonerLatencyMs}` : ""}`;
     if (isBlockedRun) {
       console.warn(
         `[search:${requestId}] blocked ip=${ipHash} reason=${result.response.pipelineTrace?.scheduler.blockedReason ?? "unknown"} kind=${
           result.response.pipelineTrace?.scheduler.blockedKind ?? "unknown"
-        } retryAfterMs=${result.response.pipelineTrace?.scheduler.retryAfterMs ?? 0}`,
+        } retryAfterMs=${result.response.pipelineTrace?.scheduler.retryAfterMs ?? 0} ${reasonerSummary}`,
       );
     } else {
       console.info(
         `[search:${requestId}] completed ip=${ipHash} stop=${result.response.pipelineTrace?.scheduler.stopReason ?? "completed"} fetched=${
           result.response.totalFetched
-        } exact=${(result.response.casesExact ?? result.response.cases).length}`,
+        } exact=${(result.response.casesExact ?? result.response.cases).length} ${reasonerSummary}`,
       );
     }
 

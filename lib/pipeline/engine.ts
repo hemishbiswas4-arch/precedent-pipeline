@@ -77,11 +77,109 @@ const PIPELINE_MAX_ELAPSED_MS = Math.min(
   60_000,
 );
 
+type ReasonerHealthStatus =
+  | "ok"
+  | "timeout"
+  | "circuit_open"
+  | "config_error"
+  | "rate_limited"
+  | "lock_timeout"
+  | "semaphore_saturated"
+  | "disabled"
+  | "error";
+
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   if (!value) return fallback;
   if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
   if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
   return fallback;
+}
+
+function classifyReasonerHealth(input: {
+  mode: "opus" | "deterministic";
+  error?: string;
+}): {
+  status: ReasonerHealthStatus;
+  attempted: boolean;
+  skipReason?: string;
+} {
+  if (input.mode === "opus") {
+    return {
+      status: "ok",
+      attempted: true,
+    };
+  }
+
+  const error = (input.error ?? "").trim();
+  if (!error) {
+    return {
+      status: "error",
+      attempted: false,
+      skipReason: "unknown",
+    };
+  }
+
+  if (error === "reasoner_timeout") {
+    return {
+      status: "timeout",
+      attempted: true,
+    };
+  }
+  if (error === "reasoner_circuit_open") {
+    return {
+      status: "circuit_open",
+      attempted: false,
+      skipReason: "circuit_open",
+    };
+  }
+  if (
+    error === "reasoner_mode_disabled" ||
+    error === "reasoner_call_budget_exhausted"
+  ) {
+    return {
+      status: "disabled",
+      attempted: false,
+      skipReason: error,
+    };
+  }
+  if (
+    error.includes("not a valid Bedrock model") ||
+    error.includes("missing") ||
+    error.includes("invalid")
+  ) {
+    return {
+      status: "config_error",
+      attempted: false,
+      skipReason: error,
+    };
+  }
+  if (error === "reasoner_global_rate_limited") {
+    return {
+      status: "rate_limited",
+      attempted: false,
+      skipReason: "global_rate_limited",
+    };
+  }
+  if (error === "reasoner_inflight_lock_wait_timeout") {
+    return {
+      status: "lock_timeout",
+      attempted: false,
+      skipReason: "inflight_lock_wait_timeout",
+    };
+  }
+  if (error === "reasoner_local_semaphore_saturated") {
+    return {
+      status: "semaphore_saturated",
+      attempted: false,
+      skipReason: "local_semaphore_saturated",
+    };
+  }
+
+  return {
+    status: "error",
+    attempted: false,
+    skipReason: error,
+  };
 }
 
 function uniqueLimit(values: string[], limit: number): string[] {
@@ -372,6 +470,13 @@ export async function runPipelineSearch(input: {
       source: "bedrock" | "fallback";
       modelId?: string;
       error?: string;
+      reasonerMode?: "opus" | "deterministic";
+      reasonerDegraded?: boolean;
+      reasonerAttempted?: boolean;
+      reasonerStatus?: ReasonerHealthStatus;
+      reasonerSkipReason?: string;
+      reasonerTimeoutMsUsed?: number;
+      reasonerLatencyMs?: number;
     };
     phrases: string[];
     source: Array<{
@@ -444,6 +549,10 @@ export async function runPipelineSearch(input: {
     cleanedQuery: intent.cleanedQuery,
     context: intent.context,
     requestCallIndex: 0,
+  });
+  const reasonerHealth = classifyReasonerHealth({
+    mode: reasonerPass1.telemetry.mode,
+    error: reasonerPass1.telemetry.error,
   });
 
   let config: SchedulerConfig = {
@@ -684,6 +793,15 @@ export async function runPipelineSearch(input: {
       `Opus pass-1 degraded to deterministic planning${reasonerPass1.telemetry.error ? ` (${reasonerPass1.telemetry.error})` : ""}.`,
     );
   }
+  if (reasonerHealth.status === "timeout") {
+    notes.push(
+      `Bedrock reasoner call was attempted but timed out at ${reasonerPass1.telemetry.timeoutMsUsed ?? 0}ms.`,
+    );
+  } else if (reasonerHealth.status === "circuit_open") {
+    notes.push("Bedrock reasoner circuit is temporarily open after recent failures; pass-1 call was skipped.");
+  } else if (reasonerHealth.status === "config_error") {
+    notes.push("Bedrock reasoner is misconfigured; deterministic planner was used.");
+  }
   if (extendedDeterministicUsed) {
     notes.push(
       `Reasoner timeout recovery used ${timeoutRecoveryMode} with expanded deterministic budget (+${EXTENDED_DETERMINISTIC_BUDGET_BONUS}).`,
@@ -868,6 +986,9 @@ export async function runPipelineSearch(input: {
         reasonerTimeout: reasonerPass1.telemetry.timeout,
         reasonerDegraded: reasonerPass1.telemetry.degraded,
         reasonerError: reasonerPass1.telemetry.error,
+        reasonerAttempted: reasonerHealth.attempted,
+        reasonerStatus: reasonerHealth.status,
+        reasonerSkipReason: reasonerHealth.skipReason,
         pass1Invoked,
         pass2Invoked,
         pass2Reason,
@@ -953,6 +1074,13 @@ export async function runPipelineSearch(input: {
         source: deterministicPlanner.plannerSource,
         modelId: deterministicPlanner.plannerModelId,
         error: deterministicPlanner.plannerError ?? reasonerPass1.telemetry.error ?? reasonerPass2Error,
+        reasonerMode: reasonerPass1.telemetry.mode,
+        reasonerDegraded: reasonerPass1.telemetry.degraded,
+        reasonerAttempted: reasonerHealth.attempted,
+        reasonerStatus: reasonerHealth.status,
+        reasonerSkipReason: reasonerHealth.skipReason,
+        reasonerTimeoutMsUsed: reasonerPass1.telemetry.timeoutMsUsed,
+        reasonerLatencyMs: reasonerPass1.telemetry.latencyMs,
       },
       phrases: allVariants.map((variant) => variant.phrase),
       source: scheduler.attempts.map((attempt) => ({

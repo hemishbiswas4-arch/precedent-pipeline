@@ -167,6 +167,18 @@ export type SearchResponse = {
       reasonerTimeout?: boolean;
       reasonerDegraded?: boolean;
       reasonerError?: string;
+      reasonerAttempted?: boolean;
+      reasonerStatus?:
+        | "ok"
+        | "timeout"
+        | "circuit_open"
+        | "config_error"
+        | "rate_limited"
+        | "lock_timeout"
+        | "semaphore_saturated"
+        | "disabled"
+        | "error";
+      reasonerSkipReason?: string;
       pass1Invoked?: boolean;
       pass2Invoked?: boolean;
       pass2Reason?: string;
