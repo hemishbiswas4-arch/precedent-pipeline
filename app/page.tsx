@@ -65,6 +65,20 @@ type PlanResponse = {
     error?: string;
     reasonerMode?: "opus" | "deterministic";
     reasonerDegraded?: boolean;
+    reasonerAttempted?: boolean;
+    reasonerStatus?:
+      | "ok"
+      | "timeout"
+      | "circuit_open"
+      | "config_error"
+      | "rate_limited"
+      | "lock_timeout"
+      | "semaphore_saturated"
+      | "disabled"
+      | "error";
+    reasonerSkipReason?: string;
+    reasonerTimeoutMsUsed?: number;
+    reasonerLatencyMs?: number;
   };
   queryPlan: {
     strictVariants: QueryVariant[];
@@ -341,6 +355,13 @@ export default function Home() {
                 source: plan.planner.source,
                 modelId: plan.planner.modelId,
                 error: plan.planner.error,
+                reasonerMode: plan.planner.reasonerMode,
+                reasonerDegraded: plan.planner.reasonerDegraded,
+                reasonerAttempted: plan.planner.reasonerAttempted,
+                reasonerStatus: plan.planner.reasonerStatus,
+                reasonerSkipReason: plan.planner.reasonerSkipReason,
+                reasonerTimeoutMsUsed: plan.planner.reasonerTimeoutMsUsed,
+                reasonerLatencyMs: plan.planner.reasonerLatencyMs,
               },
               phrases: plan.queryPlan.strictVariants.map((variant) => variant.phrase),
               source: sourceEntries,

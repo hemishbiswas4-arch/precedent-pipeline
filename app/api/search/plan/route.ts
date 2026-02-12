@@ -25,6 +25,17 @@ const CLIENT_DIRECT_PROBE_TTL_MS = Math.max(
 const SEARCH_IP_RATE_LIMIT = Math.max(0, Number(process.env.SEARCH_IP_RATE_LIMIT ?? "40"));
 const SEARCH_IP_RATE_WINDOW_SEC = Math.max(10, Number(process.env.SEARCH_IP_RATE_WINDOW_SEC ?? "60"));
 
+type ReasonerPlanStatus =
+  | "ok"
+  | "timeout"
+  | "circuit_open"
+  | "config_error"
+  | "rate_limited"
+  | "lock_timeout"
+  | "semaphore_saturated"
+  | "disabled"
+  | "error";
+
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   if (!value) return fallback;
   if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
@@ -61,6 +72,50 @@ function clientIpHash(req: NextRequest): string {
   const realIp = req.headers.get("x-real-ip")?.trim();
   const ip = firstForwarded || realIp || "unknown";
   return createHash("sha256").update(ip).digest("hex").slice(0, 16);
+}
+
+function classifyReasonerPlanStatus(input: {
+  mode: "opus" | "deterministic";
+  error?: string;
+}): {
+  status: ReasonerPlanStatus;
+  attempted: boolean;
+  skipReason?: string;
+} {
+  if (input.mode === "opus") {
+    return { status: "ok", attempted: true };
+  }
+
+  const error = (input.error ?? "").trim();
+  if (!error) {
+    return { status: "error", attempted: false, skipReason: "unknown" };
+  }
+  if (error === "reasoner_timeout") {
+    return { status: "timeout", attempted: true };
+  }
+  if (error === "reasoner_circuit_open") {
+    return { status: "circuit_open", attempted: false, skipReason: "circuit_open" };
+  }
+  if (error === "reasoner_mode_disabled" || error === "reasoner_call_budget_exhausted") {
+    return { status: "disabled", attempted: false, skipReason: error };
+  }
+  if (
+    error.includes("not a valid Bedrock model") ||
+    error.includes("missing") ||
+    error.includes("invalid")
+  ) {
+    return { status: "config_error", attempted: false, skipReason: error };
+  }
+  if (error === "reasoner_global_rate_limited") {
+    return { status: "rate_limited", attempted: false, skipReason: "global_rate_limited" };
+  }
+  if (error === "reasoner_inflight_lock_wait_timeout") {
+    return { status: "lock_timeout", attempted: false, skipReason: "inflight_lock_wait_timeout" };
+  }
+  if (error === "reasoner_local_semaphore_saturated") {
+    return { status: "semaphore_saturated", attempted: false, skipReason: "local_semaphore_saturated" };
+  }
+  return { status: "error", attempted: false, skipReason: error };
 }
 
 async function enforceIpRateLimit(req: NextRequest): Promise<{ allowed: boolean; retryAfterMs?: number }> {
@@ -118,6 +173,17 @@ export async function POST(req: NextRequest) {
       context: intent.context,
       requestCallIndex: 0,
     });
+    const reasonerStatus = classifyReasonerPlanStatus({
+      mode: reasoner.telemetry.mode,
+      error: reasoner.telemetry.error,
+    });
+    console.info(
+      `[search-plan:${requestId}] reasoner=${reasoner.telemetry.mode}:${reasonerStatus.status}${
+        reasoner.telemetry.error ? `:${reasoner.telemetry.error}` : ""
+      }${typeof reasoner.telemetry.timeoutMsUsed === "number" ? ` timeoutMs=${reasoner.telemetry.timeoutMsUsed}` : ""}${
+        typeof reasoner.telemetry.latencyMs === "number" ? ` latencyMs=${reasoner.telemetry.latencyMs}` : ""
+      }`,
+    );
 
     const planner = await planDeterministicQueryVariants(intent, reasoner.plan);
     const checklist = applyPropositionMode(
@@ -167,6 +233,11 @@ export async function POST(req: NextRequest) {
         error: planner.plannerError ?? reasoner.telemetry.error,
         reasonerMode: reasoner.telemetry.mode,
         reasonerDegraded: reasoner.telemetry.degraded,
+        reasonerAttempted: reasonerStatus.attempted,
+        reasonerStatus: reasonerStatus.status,
+        reasonerSkipReason: reasonerStatus.skipReason,
+        reasonerTimeoutMsUsed: reasoner.telemetry.timeoutMsUsed,
+        reasonerLatencyMs: reasoner.telemetry.latencyMs,
       },
       queryPlan: {
         strictVariants,
