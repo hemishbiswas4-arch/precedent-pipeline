@@ -282,6 +282,42 @@ export default function Home() {
           clientDirectSucceeded = clientResult.succeeded;
 
           if (enableDebugDiagnostics) {
+            const sourceEntries =
+              clientResult.attempts.length > 0
+                ? clientResult.attempts.map((attempt) => ({
+                    phrase: attempt.phrase,
+                    searchQuery: attempt.url,
+                    status: attempt.status ?? (attempt.ok ? 200 : 0),
+                    ok: attempt.ok,
+                    phase: "client_direct",
+                    parserMode: attempt.parserMode,
+                    challengeDetected: attempt.challenge,
+                    blockedType:
+                      clientResult.blockedKind === "cors"
+                        ? "cloudflare_challenge"
+                        : clientResult.blockedKind,
+                    parsedCount: attempt.parsedCount,
+                    error: attempt.error ?? null,
+                    htmlPreview: clientResult.reason,
+                  }))
+                : [
+                    {
+                      phrase: "client_probe",
+                      searchQuery: undefined,
+                      status: 0,
+                      ok: false,
+                      phase: "client_probe",
+                      parserMode: "n/a",
+                      challengeDetected: false,
+                      blockedType:
+                        clientResult.blockedKind === "cors"
+                          ? "cloudflare_challenge"
+                          : clientResult.blockedKind,
+                      parsedCount: 0,
+                      error: clientResult.reason ?? "client_direct_unavailable",
+                      htmlPreview: clientResult.probeDetail ?? "No client probe details available.",
+                    },
+                  ];
             sourceDebug = {
               requestId: plan.requestId,
               cleanedQuery: plan.cleanedQuery,
@@ -291,22 +327,7 @@ export default function Home() {
                 error: plan.planner.error,
               },
               phrases: plan.queryPlan.strictVariants.map((variant) => variant.phrase),
-              source: clientResult.attempts.map((attempt) => ({
-                phrase: attempt.phrase,
-                searchQuery: attempt.url,
-                status: attempt.status ?? (attempt.ok ? 200 : 0),
-                ok: attempt.ok,
-                phase: "client_direct",
-                parserMode: attempt.parserMode,
-                challengeDetected: attempt.challenge,
-                blockedType:
-                  clientResult.blockedKind === "cors"
-                    ? "cloudflare_challenge"
-                    : clientResult.blockedKind,
-                parsedCount: attempt.parsedCount,
-                error: attempt.error ?? null,
-                htmlPreview: clientResult.reason,
-              })),
+              source: sourceEntries,
             };
           }
 
@@ -341,6 +362,12 @@ export default function Home() {
             );
             responsePayload = {
               ...responsePayload,
+              notes: [
+                ...(responsePayload.notes ?? []),
+                `Client-direct retrieval unavailable (${clientResult.reason ?? "unknown"}${
+                  clientResult.probeDetail ? `: ${clientResult.probeDetail}` : ""
+                }); server fallback used.`,
+              ],
               executionPath: "server_fallback",
               clientDirectAttempted,
               clientDirectSucceeded,
@@ -350,7 +377,9 @@ export default function Home() {
                     routing: {
                       decision: "server_fallback",
                       reason: "client_direct_unavailable_or_empty",
-                      clientProbe: clientResult.reason,
+                      clientProbe: `${clientResult.reason ?? "unknown"}${
+                        clientResult.probeDetail ? `|${clientResult.probeDetail}` : ""
+                      }`,
                     },
                     timing: {
                       stageMs: {
@@ -695,6 +724,21 @@ export default function Home() {
                 {data.pipelineTrace?.routing?.clientProbe
                   ? ` | clientProbe=${data.pipelineTrace.routing.clientProbe}`
                   : ""}
+              </p>
+              <p className="stats">
+                stopReason: {data.pipelineTrace?.scheduler.stopReason ?? "n/a"}
+                {data.pipelineTrace?.scheduler.blockedReason
+                  ? ` | blockedReason=${data.pipelineTrace.scheduler.blockedReason}`
+                  : ""}
+                {data.pipelineTrace?.scheduler.blockedKind
+                  ? ` | blockedKind=${data.pipelineTrace.scheduler.blockedKind}`
+                  : ""}
+              </p>
+              <p className="stats">
+                attemptsUsed: {data.pipelineTrace?.scheduler.attemptsUsed ?? 0}/
+                {data.pipelineTrace?.scheduler.globalBudget ?? 0} | challengeCount:{" "}
+                {data.pipelineTrace?.retrieval.challengeCount ?? 0} | rateLimitCount:{" "}
+                {data.pipelineTrace?.retrieval.rateLimitCount ?? 0}
               </p>
               {typeof data.retryAfterMs === "number" && data.retryAfterMs > 0 && (
                 <p className="stats">retryAfter: {Math.max(1, Math.ceil(data.retryAfterMs / 1000))}s</p>

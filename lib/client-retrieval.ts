@@ -5,6 +5,7 @@ import { CaseCandidate } from "@/lib/types";
 export type ClientProbeResult = {
   supported: boolean;
   reason?: string;
+  detail?: string;
   checkedAt: number;
 };
 
@@ -32,6 +33,7 @@ export type ClientRetrievalResult = {
   candidates: CaseCandidate[];
   attempts: ClientRetrievalAttempt[];
   reason?: string;
+  probeDetail?: string;
 };
 
 const PROBE_CACHE_KEY = "ik_client_probe_v1";
@@ -63,6 +65,17 @@ function normalizeQueryPhrase(phrase: string): string {
     .replace(/\b(supreme court|high court)\b/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function classifyProbeFailure(message: string): { reason: string; detail: string } {
+  const normalized = message.trim() || "unknown_probe_error";
+  if (/load failed|failed to fetch|network|cors|origin|cross[- ]origin|blocked/i.test(normalized)) {
+    return { reason: "client_probe_network_or_cors_block", detail: normalized };
+  }
+  if (/timeout|abort/i.test(normalized)) {
+    return { reason: "client_probe_timeout", detail: normalized };
+  }
+  return { reason: "client_probe_error", detail: normalized };
 }
 
 function buildSearchQuery(variant: QueryVariant): string {
@@ -149,15 +162,18 @@ export async function probeClientDirectRetrieval(force = false): Promise<ClientP
     const result: ClientProbeResult = {
       supported: response.ok,
       reason: response.ok ? undefined : `http_${response.status}`,
+      detail: response.ok ? undefined : `probe_http_status_${response.status}`,
       checkedAt: startedAt,
     };
     writeProbeCache(result);
     return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : "client_probe_failed";
+    const classified = classifyProbeFailure(message);
     const result: ClientProbeResult = {
       supported: false,
-      reason: /Failed to fetch|network|cors/i.test(message) ? "cors_or_network" : message,
+      reason: classified.reason,
+      detail: classified.detail,
       checkedAt: startedAt,
     };
     writeProbeCache(result);
@@ -176,10 +192,11 @@ export async function runClientDirectRetrieval(input: {
       attempted: false,
       supported: false,
       succeeded: false,
-      blockedKind: /challenge/i.test(probe.reason ?? "") ? "cloudflare_challenge" : undefined,
+      blockedKind: /challenge/i.test(probe.reason ?? "") ? "cloudflare_challenge" : "cors",
       candidates: [],
       attempts: [],
       reason: probe.reason ?? "probe_not_supported",
+      probeDetail: probe.detail,
     };
   }
 
@@ -254,6 +271,7 @@ export async function runClientDirectRetrieval(input: {
         candidates: dedupeCandidates(candidates),
         attempts,
         reason: message,
+        probeDetail: message,
       };
     }
   }
