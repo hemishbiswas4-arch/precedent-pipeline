@@ -22,7 +22,7 @@ export const PHASE_LIMITS: Record<QueryPhase, number> = {
 export const DEFAULT_GLOBAL_BUDGET = 8;
 export const DEFAULT_BLOCKED_THRESHOLD = 4;
 export const DEFAULT_VERIFY_LIMIT = 8;
-export const DEFAULT_MAX_ELAPSED_MS = 22_000;
+export const DEFAULT_MAX_ELAPSED_MS = 9_000;
 
 function normalizeSpaces(value: string): string {
   return value.replace(/\s+/g, " ").trim();

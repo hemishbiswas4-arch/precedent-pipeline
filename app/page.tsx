@@ -72,7 +72,7 @@ type PlanResponse = {
 
 const INITIAL_QUERY =
   "State as appellant filed criminal appeal and delay condonation application was refused; find SC/HC cases where the appeal was dismissed as time-barred.";
-const REQUEST_TIMEOUT_MS = 42_000;
+const REQUEST_TIMEOUT_MS = 28_000;
 const CLIENT_DIRECT_ENABLED = process.env.NEXT_PUBLIC_CLIENT_DIRECT_RETRIEVAL_ENABLED !== "0";
 
 function ScoreMeter({ score }: { score: number }) {
@@ -435,7 +435,7 @@ export default function Home() {
     } catch (err) {
       const errorMessage =
         err instanceof DOMException && err.name === "AbortError"
-          ? "Search is taking longer than expected. Please retry in a few seconds."
+          ? "Search timed out before the source responded. Please retry; if this persists, source throttling is likely active."
           : err instanceof Error
             ? err.message
             : "Unexpected error";
@@ -689,6 +689,16 @@ export default function Home() {
           {showAdvanced && (
             <section className="panel">
               <h2>Advanced run data</h2>
+              <p className="stats">executionPath: {data.executionPath ?? "server_only"}</p>
+              <p className="stats">
+                routingReason: {data.pipelineTrace?.routing?.reason ?? "n/a"}
+                {data.pipelineTrace?.routing?.clientProbe
+                  ? ` | clientProbe=${data.pipelineTrace.routing.clientProbe}`
+                  : ""}
+              </p>
+              {typeof data.retryAfterMs === "number" && data.retryAfterMs > 0 && (
+                <p className="stats">retryAfter: {Math.max(1, Math.ceil(data.retryAfterMs / 1000))}s</p>
+              )}
               <p className="stats">domains: {data.context.domains.join(", ") || "none"}</p>
               <p className="stats">issues: {data.context.issues.join(", ") || "none"}</p>
               <p className="stats">statutes/sections: {data.context.statutesOrSections.join(", ") || "none"}</p>

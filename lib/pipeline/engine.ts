@@ -65,7 +65,7 @@ const EXTENDED_DETERMINISTIC_BUDGET_BONUS = Math.max(
   0,
   Number(process.env.EXTENDED_DETERMINISTIC_BUDGET_BONUS ?? "6"),
 );
-const IK_FETCH_TIMEOUT_MS = Math.max(1_500, Number(process.env.IK_FETCH_TIMEOUT_MS ?? "3500"));
+const IK_FETCH_TIMEOUT_MS = Math.max(1_200, Number(process.env.IK_FETCH_TIMEOUT_MS ?? "3000"));
 const IK_MAX_429_RETRIES = Math.max(0, Number(process.env.IK_MAX_429_RETRIES ?? "0"));
 const IK_MAX_RETRY_AFTER_MS = Math.max(500, Number(process.env.IK_MAX_RETRY_AFTER_MS ?? "1500"));
 const TRACE_EXPANSION_MIN_REMAINING_MS = Math.max(
@@ -73,8 +73,8 @@ const TRACE_EXPANSION_MIN_REMAINING_MS = Math.max(
   Number(process.env.TRACE_EXPANSION_MIN_REMAINING_MS ?? "6000"),
 );
 const PIPELINE_MAX_ELAPSED_MS = Math.min(
-  Math.max(Number(process.env.PIPELINE_MAX_ELAPSED_MS ?? "22000"), 8_000),
-  120_000,
+  Math.max(Number(process.env.PIPELINE_MAX_ELAPSED_MS ?? "9000"), 5_000),
+  60_000,
 );
 
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {

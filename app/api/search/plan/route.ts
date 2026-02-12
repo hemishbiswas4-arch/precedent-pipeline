@@ -7,12 +7,12 @@ import { planDeterministicQueryVariants } from "@/lib/pipeline/planner";
 import { buildPropositionChecklist } from "@/lib/proposition-gate";
 
 const PIPELINE_MAX_ELAPSED_MS = Math.min(
-  Math.max(Number(process.env.PIPELINE_MAX_ELAPSED_MS ?? "22000"), 8_000),
-  120_000,
+  Math.max(Number(process.env.PIPELINE_MAX_ELAPSED_MS ?? "9000"), 5_000),
+  60_000,
 );
 const DEFAULT_VERIFY_LIMIT = Math.max(4, Number(process.env.DEFAULT_VERIFY_LIMIT ?? "8"));
 const DEFAULT_GLOBAL_BUDGET = Math.max(4, Number(process.env.DEFAULT_GLOBAL_BUDGET ?? "8"));
-const IK_FETCH_TIMEOUT_MS = Math.max(1_500, Number(process.env.IK_FETCH_TIMEOUT_MS ?? "3500"));
+const IK_FETCH_TIMEOUT_MS = Math.max(1_200, Number(process.env.IK_FETCH_TIMEOUT_MS ?? "3000"));
 const CLIENT_DIRECT_RETRIEVAL_ENABLED = (process.env.CLIENT_DIRECT_RETRIEVAL_ENABLED ?? "1") !== "0";
 const CLIENT_DIRECT_STRICT_VARIANT_LIMIT = Math.max(
   1,

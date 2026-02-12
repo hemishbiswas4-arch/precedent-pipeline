@@ -64,7 +64,7 @@ export type IndianKanoonSearchOptions = {
 };
 
 const DEFAULT_CHALLENGE_COOLDOWN_MS = 30_000;
-const DEFAULT_FETCH_TIMEOUT_MS = 3_500;
+const DEFAULT_FETCH_TIMEOUT_MS = 3_000;
 const DEFAULT_MAX_429_RETRIES = 0;
 const DEFAULT_MAX_RETRY_AFTER_MS = 1_500;
 const configuredCooldown = Number(process.env.IK_CHALLENGE_COOLDOWN_MS ?? DEFAULT_CHALLENGE_COOLDOWN_MS);
@@ -112,6 +112,11 @@ function setChallengeCooldown(scope: string | undefined, durationMs: number = CH
   const until = Date.now() + Math.max(1_000, durationMs);
   const current = challengeCooldownByScope.get(key) ?? 0;
   challengeCooldownByScope.set(key, Math.max(current, until));
+}
+
+function computeAdaptiveCooldownMs(retryAfterHeader: string | null): number {
+  const retryAfterMs = Math.min(parseRetryAfterMs(retryAfterHeader), MAX_RETRY_AFTER_MS);
+  return Math.min(CHALLENGE_COOLDOWN_MS, Math.max(3_000, retryAfterMs + 1_000));
 }
 
 function isLikelyStatute(title: string, snippet: string): boolean {
@@ -277,13 +282,11 @@ async function fetchWithRateLimitHandling(
     max429Retries?: number;
     maxRetryAfterMs?: number;
     cooldownScope?: string;
-    applyCooldownOn429?: boolean;
   },
 ): Promise<Response> {
   const fetchTimeoutMs = Math.max(1_500, Math.min(options?.fetchTimeoutMs ?? FETCH_TIMEOUT_MS, 15_000));
   const max429Retries = Math.max(0, Math.min(options?.max429Retries ?? MAX_429_RETRIES, 3));
   const maxRetryAfterMs = Math.max(500, Math.min(options?.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS, 5_000));
-  const applyCooldownOn429 = options?.applyCooldownOn429 ?? true;
   const maxAttempts = max429Retries + 1;
   let lastResponse: Response | null = null;
 
@@ -311,11 +314,6 @@ async function fetchWithRateLimitHandling(
       clearTimeout(timeout);
     }
     lastResponse = response;
-
-    if (response.status === 429 && applyCooldownOn429) {
-      const retryAfterMs = Math.min(parseRetryAfterMs(response.headers.get("retry-after")), maxRetryAfterMs);
-      setChallengeCooldown(options?.cooldownScope, retryAfterMs + 1_000);
-    }
 
     if (response.status !== 429 || attempt === maxAttempts) {
       return response;
@@ -422,7 +420,6 @@ async function crawlSearchPages(
         max429Retries: options.max429Retries,
         maxRetryAfterMs: options.maxRetryAfterMs,
         cooldownScope,
-        applyCooldownOn429: true,
       });
     } catch (error) {
       if (error instanceof FetchTimeoutError) {
@@ -470,11 +467,12 @@ async function crawlSearchPages(
       anyCloudflareDetected ||
       (res.headers.get("server") ?? "").toLowerCase().includes("cloudflare") ||
       (res.headers.get("cf-ray") ?? "").length > 0;
+    const adaptiveCooldownMs = computeAdaptiveCooldownMs(res.headers.get("retry-after"));
     const parsedPage = parseIndianKanoonSearchPage(html);
     const challengePage = parsedPage.challenge;
     anyChallengeDetected = anyChallengeDetected || challengePage;
     if (challengePage) {
-      setChallengeCooldown(cooldownScope, CHALLENGE_COOLDOWN_MS);
+      setChallengeCooldown(cooldownScope, adaptiveCooldownMs);
     }
     const noMatchPage = parsedPage.noMatch;
     const docLinkSignals = parsedPage.docLinkSignals;
@@ -573,14 +571,15 @@ async function crawlSearchPages(
 
   if (!finalOk) {
     if (debug.status === 429) {
-      setChallengeCooldown(cooldownScope, CHALLENGE_COOLDOWN_MS);
+      const adaptiveCooldownMs = computeAdaptiveCooldownMs(null);
+      setChallengeCooldown(cooldownScope, adaptiveCooldownMs);
       debug.blockedType = "rate_limit";
       debug.retryAfterMs = Math.max(1_000, challengeCooldownRemainingMs(cooldownScope));
     }
     throw new IndianKanoonFetchError(`Indian Kanoon returned ${debug.status}`, debug);
   }
   if (debug.challengeDetected && parsed.length === 0) {
-    setChallengeCooldown(cooldownScope, CHALLENGE_COOLDOWN_MS);
+    setChallengeCooldown(cooldownScope, computeAdaptiveCooldownMs(null));
     debug.blockedType = "cloudflare_challenge";
     debug.retryAfterMs = Math.max(1_000, challengeCooldownRemainingMs(cooldownScope));
     throw new IndianKanoonFetchError("Cloudflare challenge detected", debug);
@@ -666,10 +665,7 @@ export async function fetchIndianKanoonCaseDetail(
     cooldownScope?: string;
   },
 ): Promise<string> {
-  const res = await fetchWithRateLimitHandling(url, {
-    ...options,
-    applyCooldownOn429: false,
-  });
+  const res = await fetchWithRateLimitHandling(url, options);
 
   if (!res.ok) {
     throw new Error(`Case page returned ${res.status}`);

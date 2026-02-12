@@ -215,7 +215,7 @@ export async function runRetrievalSchedule(input: {
 
       const elapsedBeforeAttempt = Date.now() - startedAt;
       const remainingBeforeAttempt = Math.max(0, config.maxElapsedMs - elapsedBeforeAttempt);
-      if (remainingBeforeAttempt < 900) {
+      if (remainingBeforeAttempt < 1_000) {
         stopReason = "budget_exhausted";
         blockedReason = `time_budget_exhausted:${config.maxElapsedMs}`;
         return buildResult({
@@ -234,16 +234,16 @@ export async function runRetrievalSchedule(input: {
       }
 
       const perAttemptTimeoutMs = Math.max(
-        1_500,
+        700,
         Math.min(
           config.fetchTimeoutMs ?? 8_000,
           ATTEMPT_FETCH_TIMEOUT_CAP_MS,
-          remainingBeforeAttempt - 350,
+          remainingBeforeAttempt - 250,
         ),
       );
       const perAttemptCrawlBudgetMs = Math.max(
-        1_800,
-        Math.min(remainingBeforeAttempt - 150, perAttemptTimeoutMs + 800),
+        perAttemptTimeoutMs,
+        Math.min(remainingBeforeAttempt - 100, perAttemptTimeoutMs + 400),
       );
       const dynamicMax429Retries =
         remainingBeforeAttempt < perAttemptTimeoutMs + 3_000 ? 0 : (config.max429Retries ?? 1);
