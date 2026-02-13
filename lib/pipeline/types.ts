@@ -12,6 +12,14 @@ export type QueryPhase = "primary" | "fallback" | "rescue" | "micro" | "revolvin
 export type CourtScope = "SC" | "HC" | "ANY";
 export type QueryStrictness = "strict" | "relaxed";
 
+export type QueryProviderHints = {
+  compiledQuery?: string;
+  serperQuotedTerms?: string[];
+  serperCoreTerms?: string[];
+  canonicalOrderTerms?: string[];
+  excludeTerms?: string[];
+};
+
 export type QueryVariant = {
   id: string;
   phrase: string;
@@ -20,6 +28,11 @@ export type QueryVariant = {
   courtScope: CourtScope;
   strictness: QueryStrictness;
   tokens: string[];
+  canonicalKey?: string;
+  priority?: number;
+  mustIncludeTokens?: string[];
+  mustExcludeTokens?: string[];
+  providerHints?: QueryProviderHints;
 };
 
 export type IntentProfile = {
@@ -63,11 +76,16 @@ export type RetrievalAttempt = {
   phase: QueryPhase;
   courtScope?: CourtScope;
   variantId: string;
+  canonicalKey?: string;
+  variantPriority?: number;
   phrase: string;
   searchQuery?: string;
   status: number;
   ok: boolean;
   parsedCount: number;
+  utilityScore?: number;
+  caseLikeRatio?: number;
+  statuteLikeRatio?: number;
   parserMode?: string;
   pagesScanned?: number;
   pageCaseCounts?: number[];
@@ -101,6 +119,27 @@ export type SchedulerConfig = {
   maxRetryAfterMs?: number;
 };
 
+export type VariantUtilitySnapshot = {
+  attempts: number;
+  meanUtility: number;
+  caseLikeRate: number;
+  statuteLikeRate: number;
+  challengeRate: number;
+  timeoutRate: number;
+  lastStatus?: number;
+  updatedAtMs: number;
+};
+
+export type CandidateProvenance = {
+  variantIds: string[];
+  canonicalKeys: string[];
+  phases: QueryPhase[];
+  bestUtility: number;
+  strictHits: number;
+  relaxedHits: number;
+  highPriorityHits: number;
+};
+
 export type SchedulerCarryState = {
   startedAtMs: number;
   seenSignatures: string[];
@@ -110,6 +149,8 @@ export type SchedulerCarryState = {
   blockedReason?: string;
   blockedKind?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
   retryAfterMs?: number;
+  variantUtility?: Record<string, VariantUtilitySnapshot>;
+  candidateProvenance?: Record<string, CandidateProvenance>;
   attempts: RetrievalAttempt[];
   candidates: CaseCandidate[];
 };
@@ -122,6 +163,8 @@ export type SchedulerResult = {
   blockedReason?: string;
   blockedKind?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
   retryAfterMs?: number;
+  variantUtility?: Record<string, VariantUtilitySnapshot>;
+  candidateProvenance?: Record<string, CandidateProvenance>;
   candidates: CaseCandidate[];
   carryState: SchedulerCarryState;
 };

@@ -2,6 +2,12 @@
 
 import { NearMissCase } from "@/lib/types";
 
+function tierLabel(item: NearMissCase): string {
+  if (item.retrievalTier === "exact_strict") return "Strict Exact";
+  if (item.retrievalTier === "exact_provisional") return "Provisional Exact";
+  return "Exploratory";
+}
+
 export function NearMissPanel(props: {
   items: NearMissCase[];
   openByDefault?: boolean;
@@ -12,9 +18,9 @@ export function NearMissPanel(props: {
   return (
     <section className="surface-panel near-miss-panel reveal-up">
       <details open={openByDefault}>
-        <summary>Closest matches ({items.length})</summary>
+        <summary>Best-available matches ({items.length})</summary>
         <p className="near-miss-note">
-          These are contextually close but failed one or more mandatory proposition requirements.
+          These are exploratory matches. They are contextually close but may miss one or more mandatory proposition requirements.
         </p>
         <div className="result-list">
           {items.map((item) => (
@@ -22,8 +28,11 @@ export function NearMissPanel(props: {
               <header className="result-card-header">
                 <span className={`court-tag court-${item.court.toLowerCase()}`}>{item.court}</span>
                 <div className="badge-row">
+                  <span className={`tier-pill tier-${(item.retrievalTier ?? "exploratory").toLowerCase()}`}>
+                    {tierLabel(item)}
+                  </span>
                   <span className={`confidence-pill confidence-${(item.confidenceBand ?? "LOW").toLowerCase()}`}>
-                    Near miss
+                    {item.confidenceBand ?? "LOW"}
                   </span>
                   <span className={`verify-pill ${item.verification.detailChecked ? "verified" : "snippet"}`}>
                     {item.verification.detailChecked ? "Detail verified" : "Snippet-backed"}
@@ -32,8 +41,14 @@ export function NearMissPanel(props: {
               </header>
               <h3>{item.title}</h3>
               <p className="selection-summary">{item.selectionSummary}</p>
+              <p className="tier-warning">
+                Exploratory tier result
+                {item.fallbackReason === "stale_cache" ? " (served from stale cache due to source throttling)." : "."}
+              </p>
               <p className="snippet-text">{item.snippet || "No snippet extracted from source."}</p>
-              <p className="inline-detail">Missing elements: {item.missingElements.join(", ")}</p>
+              <p className="inline-detail">
+                Missing elements: {(item.gapSummary ?? item.missingElements).join(", ")}
+              </p>
               <a className="case-link" href={item.url} target="_blank" rel="noopener noreferrer">
                 Open case
               </a>

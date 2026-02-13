@@ -20,7 +20,7 @@ export function ResearchSummary(props: {
       <h2>Research summary</h2>
       <div className="summary-grid">
         <article className="summary-card">
-          <h3>Matches ranked</h3>
+          <h3>Matches shown</h3>
           <p>{exactCount}</p>
         </article>
         <article className="summary-card">

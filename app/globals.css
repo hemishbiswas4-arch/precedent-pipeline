@@ -589,6 +589,7 @@ input:focus-visible {
 }
 
 .court-tag,
+.tier-pill,
 .confidence-pill,
 .verify-pill {
   border-radius: 999px;
@@ -597,6 +598,30 @@ input:focus-visible {
   font-weight: 700;
   letter-spacing: 0.03em;
   text-transform: uppercase;
+}
+
+.tier-pill {
+  border: 1px solid var(--border);
+  background: color-mix(in oklab, var(--surface-2) 78%, var(--surface));
+  color: var(--text-muted);
+}
+
+.tier-exact_strict {
+  border-color: color-mix(in oklab, var(--success) 55%, var(--border));
+  color: var(--success);
+  background: color-mix(in oklab, var(--success) 14%, transparent);
+}
+
+.tier-exact_provisional {
+  border-color: color-mix(in oklab, var(--warn) 55%, var(--border));
+  color: var(--warn);
+  background: color-mix(in oklab, var(--warn) 12%, transparent);
+}
+
+.tier-exploratory {
+  border-color: color-mix(in oklab, var(--danger) 55%, var(--border));
+  color: var(--danger);
+  background: color-mix(in oklab, var(--danger) 12%, transparent);
 }
 
 .court-sc {
@@ -659,6 +684,13 @@ input:focus-visible {
   margin: 0;
   color: var(--text-muted);
   font-size: 0.88rem;
+}
+
+.tier-warning {
+  margin: 0;
+  color: var(--warn);
+  font-size: 0.84rem;
+  font-weight: 620;
 }
 
 .confidence-track {

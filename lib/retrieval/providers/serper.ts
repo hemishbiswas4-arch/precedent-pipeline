@@ -61,11 +61,75 @@ function parseRetryAfterMs(value: string | null): number | undefined {
   return undefined;
 }
 
+function normalizeQueryTerm(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/["']/g, " ")
+    .replace(/[^a-z0-9\s()/-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function uniqueTerms(values: string[], limit: number): string[] {
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizeQueryTerm(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    output.push(normalized);
+    if (output.length >= limit) break;
+  }
+  return output;
+}
+
+function quoteTerm(value: string): string {
+  const normalized = normalizeQueryTerm(value);
+  if (!normalized) return "";
+  return `"${normalized}"`;
+}
+
 function buildSerperQuery(input: RetrievalSearchInput): string {
-  const terms = ["site:indiankanoon.org/doc", input.phrase.trim()];
+  if (input.compiledQuery?.trim()) {
+    return input.compiledQuery.replace(/\s+/g, " ").trim();
+  }
+
+  const quotedTerms = uniqueTerms(
+    [
+      ...(input.providerHints?.serperQuotedTerms ?? []),
+      ...(input.includeTokens ?? []).filter((token) => token.includes(" ")),
+    ],
+    4,
+  );
+  const coreTerms = uniqueTerms(
+    [
+      input.phrase.trim(),
+      ...(input.providerHints?.serperCoreTerms ?? []),
+      ...(input.includeTokens ?? []),
+    ],
+    6,
+  );
+  const excludeTerms = uniqueTerms(
+    [
+      ...(input.excludeTokens ?? []),
+      ...(input.providerHints?.excludeTerms ?? []),
+    ],
+    4,
+  );
+
+  const terms = [
+    "site:indiankanoon.org/doc",
+    ...quotedTerms.map(quoteTerm).filter(Boolean),
+    ...coreTerms,
+    ...excludeTerms.map((term) => `-"${term}"`),
+  ];
   if (input.courtScope === "SC") terms.push("supreme court");
   if (input.courtScope === "HC") terms.push("high court");
   return terms.filter((term) => term.length > 0).join(" ").replace(/\s+/g, " ").trim();
+}
+
+export function buildSerperQueryForTest(input: RetrievalSearchInput): string {
+  return buildSerperQuery(input);
 }
 
 function toSerperCacheKey(query: string): string {

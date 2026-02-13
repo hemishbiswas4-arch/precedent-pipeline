@@ -132,13 +132,43 @@ function buildSelectionSummary(reasons: string[], court: string): string {
   return `${court} case selected because ${joined.toLowerCase()}.`;
 }
 
+type CanonicalLexicalProfile = {
+  mustIncludeTokens?: string[];
+  strictVariantTokens?: string[];
+  checklistTokens?: string[];
+  contradictionTokens?: string[];
+};
+
+type CandidateProvenanceProfile = {
+  bestUtility: number;
+  strictHits: number;
+  relaxedHits: number;
+  highPriorityHits?: number;
+};
+
 export function scoreCases(
   originalQuery: string,
   context: ContextProfile,
   cases: CaseCandidate[],
-  options?: { checklist?: PropositionChecklist },
+  options?: {
+    checklist?: PropositionChecklist;
+    canonicalLexicalProfile?: CanonicalLexicalProfile;
+    candidateProvenance?: Record<string, CandidateProvenanceProfile>;
+  },
 ): ScoredCase[] {
-  const queryTokens = new Set(normalizeTokens(originalQuery));
+  const rawQueryTokens = new Set(normalizeTokens(originalQuery));
+  const mustIncludeTokens = new Set(
+    normalizeTokens((options?.canonicalLexicalProfile?.mustIncludeTokens ?? []).join(" ")),
+  );
+  const strictVariantTokens = new Set(
+    normalizeTokens((options?.canonicalLexicalProfile?.strictVariantTokens ?? []).join(" ")),
+  );
+  const checklistTokens = new Set(
+    normalizeTokens((options?.canonicalLexicalProfile?.checklistTokens ?? []).join(" ")),
+  );
+  const contradictionTokens = unique(
+    normalizeTokens((options?.canonicalLexicalProfile?.contradictionTokens ?? []).join(" ")),
+  );
 
   return cases
     .map((candidate) => {
@@ -146,9 +176,15 @@ export function scoreCases(
       const bodyText = candidate.detailArtifact?.bodyExcerpt?.join(" ") ?? candidate.detailText ?? "";
       const corpus = `${candidate.title} ${candidate.snippet} ${bodyText}`;
       const corpusTokens = new Set(normalizeTokens(corpus));
-      const overlap = overlapRatio(queryTokens, corpusTokens);
+      const rawOverlap = overlapRatio(rawQueryTokens, corpusTokens);
+      const mustIncludeOverlap = overlapRatio(mustIncludeTokens, corpusTokens);
+      const strictOverlap = overlapRatio(strictVariantTokens, corpusTokens);
+      const checklistOverlap = overlapRatio(checklistTokens, corpusTokens);
+      const blendedOverlap =
+        rawOverlap * 0.2 + mustIncludeOverlap * 0.35 + strictOverlap * 0.25 + checklistOverlap * 0.2;
       const detailChecked = Boolean(candidate.detailText || candidate.detailArtifact?.evidenceWindows?.length);
       const detailWeight = detailChecked ? 1 : 0.62;
+      const provenance = options?.candidateProvenance?.[candidate.url];
 
       const anchorsMatched = countMatches(corpus, context.anchors);
       const issuesMatched = countMatches(corpus, context.issues);
@@ -156,12 +192,22 @@ export function scoreCases(
       const statutesMatched = countMatches(corpus, context.statutesOrSections);
       const proposition = evaluateChecklistCoverage({ text: corpus, evidenceText }, options?.checklist);
 
-      const lexicalScore = overlap * 0.38;
+      const lexicalScore =
+        blendedOverlap * 0.34 +
+        mustIncludeOverlap * 0.12 +
+        strictOverlap * 0.08 +
+        checklistOverlap * 0.06;
       let rawScore = lexicalScore;
       const reasons: string[] = [];
 
-      if (overlap > 0.18) {
-        reasons.push(`Token overlap ${(overlap * 100).toFixed(0)}%`);
+      if (blendedOverlap > 0.16) {
+        reasons.push(`Token overlap ${(blendedOverlap * 100).toFixed(0)}%`);
+      }
+      if (mustIncludeOverlap > 0.2) {
+        reasons.push(`Canonical term overlap ${(mustIncludeOverlap * 100).toFixed(0)}%`);
+      }
+      if (strictOverlap > 0.2) {
+        reasons.push(`Strict-query overlap ${(strictOverlap * 100).toFixed(0)}%`);
       }
       if (anchorsMatched > 0) {
         rawScore += Math.min(anchorsMatched * 0.02, 0.14);
@@ -228,12 +274,33 @@ export function scoreCases(
         }
       }
 
+      const contradictionMatches = contradictionTokens.length > 0 ? countMatches(corpus, contradictionTokens) : 0;
+      if (
+        contradictionMatches > 0 &&
+        proposition.requiredCoverage < 0.4 &&
+        proposition.coreCoverage < 0.4 &&
+        !proposition.outcomePolaritySatisfied
+      ) {
+        rawScore -= Math.min(0.22, contradictionMatches * 0.06);
+        reasons.push(`Contradiction-only lexical drift (${contradictionMatches})`);
+      }
+
       if (detailChecked) {
         rawScore += 0.03;
         reasons.push("Detail verified evidence");
       } else {
         rawScore -= 0.09;
         reasons.push("Detail not verified (down-ranked)");
+      }
+
+      if (provenance) {
+        if (detailChecked && provenance.strictHits > 0 && provenance.bestUtility >= 0.55) {
+          rawScore += 0.06;
+          reasons.push("High-utility strict retrieval provenance");
+        } else if (!detailChecked && provenance.strictHits === 0 && provenance.bestUtility < 0.25) {
+          rawScore -= 0.08;
+          reasons.push("Broad-only low-utility provenance penalty");
+        }
       }
 
       if (candidate.court === "SC") {
@@ -252,6 +319,19 @@ export function scoreCases(
       const centered = (rawScore - 0.45) * 3.1;
       let rankingScore = clamp01(sigmoid(centered));
       rankingScore = Math.min(rankingScore, 0.92);
+      if (
+        provenance &&
+        provenance.strictHits === 0 &&
+        provenance.relaxedHits > 0 &&
+        provenance.bestUtility < 0.25 &&
+        !detailChecked
+      ) {
+        rankingScore = Math.min(rankingScore, 0.68);
+        reasons.push("Confidence capped: broad-only low-utility retrieval");
+      }
+      if (provenance && provenance.strictHits > 0 && provenance.bestUtility >= 0.55 && detailChecked) {
+        rankingScore = Math.min(0.94, rankingScore + 0.03);
+      }
 
       if (reasons.length === 0) {
         reasons.push("Weak semantic proximity");

@@ -8,7 +8,7 @@ function modeText(mode: ResultMode, nearMissCount: number): string {
   }
   if (mode === "best_available") {
     return nearMissCount > 0
-      ? `No exact verified match yet. Showing ${nearMissCount} closest matches with clear gaps.`
+      ? `No exact verified match yet. Showing ${nearMissCount} exploratory best-available matches with explicit gaps.`
       : "No exact verified match yet. Try refining actor, proceeding, or outcome details.";
   }
   if (mode === "blocked") {

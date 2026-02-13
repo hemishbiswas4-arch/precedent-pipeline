@@ -11,6 +11,16 @@ export type RetrievalSearchInput = {
   fromDate?: string;
   toDate?: string;
   sortByMostRecent?: boolean;
+  compiledQuery?: string;
+  includeTokens?: string[];
+  excludeTokens?: string[];
+  providerHints?: {
+    serperQuotedTerms?: string[];
+    serperCoreTerms?: string[];
+    canonicalOrderTerms?: string[];
+    excludeTerms?: string[];
+  };
+  variantPriority?: number;
   maxResultsPerPhrase: number;
   maxPages: number;
   crawlMaxElapsedMs: number;

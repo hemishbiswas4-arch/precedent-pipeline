@@ -3,12 +3,14 @@ import { hasRetrievalDebug } from "@/lib/retrieval/providers/types";
 import type { RetrievalProvider } from "@/lib/retrieval/providers/types";
 import { classifyCandidate } from "@/lib/pipeline/classifier";
 import {
+  CandidateProvenance,
   IntentProfile,
   QueryPhase,
   QueryVariant,
   SchedulerCarryState,
   SchedulerConfig,
   SchedulerResult,
+  VariantUtilitySnapshot,
 } from "@/lib/pipeline/types";
 import { CaseCandidate } from "@/lib/types";
 
@@ -17,6 +19,10 @@ const ATTEMPT_FETCH_TIMEOUT_CAP_MS = Math.max(
   Number(process.env.ATTEMPT_FETCH_TIMEOUT_CAP_MS ?? "3500"),
 );
 const PRIMARY_MAX_PAGES = Math.max(1, Math.min(Number(process.env.PRIMARY_MAX_PAGES ?? "1"), 2));
+const ADAPTIVE_VARIANT_SCHEDULER_ENABLED = (() => {
+  const raw = (process.env.ADAPTIVE_VARIANT_SCHEDULER ?? "1").trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(raw);
+})();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -51,6 +57,156 @@ function querySignature(
   toDate: string | undefined,
 ): string {
   return [phase, phrase.toLowerCase(), courtType ?? "", fromDate ?? "", toDate ?? ""].join("|");
+}
+
+function canonicalVariantKey(variant: QueryVariant): string {
+  const explicit = variant.canonicalKey?.trim().toLowerCase();
+  if (explicit) return explicit;
+  return `${variant.phase}:${variant.strictness}:${variant.phrase.toLowerCase()}`;
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function computeAttemptUtility(input: {
+  cases: CaseCandidate[];
+  parsedCount: number;
+  challengeDetected: boolean;
+  timedOut: boolean;
+  status: number;
+}): {
+  score: number;
+  caseLikeRatio: number;
+  statuteLikeRatio: number;
+} {
+  if (input.parsedCount <= 0 || input.cases.length === 0) {
+    const hardPenalty = input.challengeDetected || input.status === 429 ? 0.02 : input.timedOut ? 0.08 : 0.14;
+    return {
+      score: hardPenalty,
+      caseLikeRatio: 0,
+      statuteLikeRatio: 0,
+    };
+  }
+  let caseLike = 0;
+  let statuteLike = 0;
+  for (const candidate of input.cases) {
+    const kind = classifyCandidate(candidate).kind;
+    if (kind === "case" || kind === "unknown") caseLike += 1;
+    if (kind === "statute") statuteLike += 1;
+  }
+  const total = Math.max(1, input.cases.length);
+  const caseLikeRatio = caseLike / total;
+  const statuteLikeRatio = statuteLike / total;
+  const parsedSignal = Math.min(input.parsedCount, 16) / 16;
+  const challengePenalty = input.challengeDetected || input.status === 429 ? 0.22 : 0;
+  const timeoutPenalty = input.timedOut ? 0.1 : 0;
+  const rawScore = parsedSignal * 0.4 + caseLikeRatio * 0.45 - statuteLikeRatio * 0.18 - challengePenalty - timeoutPenalty;
+  return {
+    score: clamp01(rawScore),
+    caseLikeRatio,
+    statuteLikeRatio,
+  };
+}
+
+function toSortedPhaseVariants(
+  variants: QueryVariant[],
+  utilityByKey: Record<string, VariantUtilitySnapshot>,
+): QueryVariant[] {
+  return [...variants].sort((left, right) => {
+    const leftKey = canonicalVariantKey(left);
+    const rightKey = canonicalVariantKey(right);
+    const leftUtility = utilityByKey[leftKey];
+    const rightUtility = utilityByKey[rightKey];
+    const leftScore =
+      (left.priority ?? 0) +
+      (leftUtility?.meanUtility ?? 0) * 40 +
+      (leftUtility?.caseLikeRate ?? 0) * 18 -
+      (leftUtility?.challengeRate ?? 0) * 14 -
+      (leftUtility?.timeoutRate ?? 0) * 8;
+    const rightScore =
+      (right.priority ?? 0) +
+      (rightUtility?.meanUtility ?? 0) * 40 +
+      (rightUtility?.caseLikeRate ?? 0) * 18 -
+      (rightUtility?.challengeRate ?? 0) * 14 -
+      (rightUtility?.timeoutRate ?? 0) * 8;
+    if (rightScore !== leftScore) return rightScore - leftScore;
+    return (right.priority ?? 0) - (left.priority ?? 0);
+  });
+}
+
+function updateVariantUtility(
+  map: Record<string, VariantUtilitySnapshot>,
+  input: {
+    key: string;
+    score: number;
+    caseLikeRatio: number;
+    statuteLikeRatio: number;
+    challengeDetected: boolean;
+    timedOut: boolean;
+    status: number;
+  },
+): VariantUtilitySnapshot {
+  const existing = map[input.key];
+  const nextAttempts = (existing?.attempts ?? 0) + 1;
+  const meanUtility =
+    ((existing?.meanUtility ?? 0) * (nextAttempts - 1) + input.score) / nextAttempts;
+  const caseLikeRate =
+    ((existing?.caseLikeRate ?? 0) * (nextAttempts - 1) + input.caseLikeRatio) / nextAttempts;
+  const statuteLikeRate =
+    ((existing?.statuteLikeRate ?? 0) * (nextAttempts - 1) + input.statuteLikeRatio) /
+    nextAttempts;
+  const challengeRate =
+    ((existing?.challengeRate ?? 0) * (nextAttempts - 1) + (input.challengeDetected ? 1 : 0)) /
+    nextAttempts;
+  const timeoutRate =
+    ((existing?.timeoutRate ?? 0) * (nextAttempts - 1) + (input.timedOut ? 1 : 0)) / nextAttempts;
+
+  const snapshot: VariantUtilitySnapshot = {
+    attempts: nextAttempts,
+    meanUtility: Number(meanUtility.toFixed(4)),
+    caseLikeRate: Number(caseLikeRate.toFixed(4)),
+    statuteLikeRate: Number(statuteLikeRate.toFixed(4)),
+    challengeRate: Number(challengeRate.toFixed(4)),
+    timeoutRate: Number(timeoutRate.toFixed(4)),
+    lastStatus: input.status,
+    updatedAtMs: Date.now(),
+  };
+  map[input.key] = snapshot;
+  return snapshot;
+}
+
+function updateCandidateProvenance(
+  map: Record<string, CandidateProvenance>,
+  input: {
+    candidates: CaseCandidate[];
+    variant: QueryVariant;
+    utilityScore: number;
+  },
+): void {
+  const canonicalKey = canonicalVariantKey(input.variant);
+  for (const candidate of input.candidates) {
+    const existing = map[candidate.url];
+    if (!existing) {
+      map[candidate.url] = {
+        variantIds: [input.variant.id],
+        canonicalKeys: [canonicalKey],
+        phases: [input.variant.phase],
+        bestUtility: input.utilityScore,
+        strictHits: input.variant.strictness === "strict" ? 1 : 0,
+        relaxedHits: input.variant.strictness === "relaxed" ? 1 : 0,
+        highPriorityHits: (input.variant.priority ?? 0) >= 80 ? 1 : 0,
+      };
+      continue;
+    }
+    if (!existing.variantIds.includes(input.variant.id)) existing.variantIds.push(input.variant.id);
+    if (!existing.canonicalKeys.includes(canonicalKey)) existing.canonicalKeys.push(canonicalKey);
+    if (!existing.phases.includes(input.variant.phase)) existing.phases.push(input.variant.phase);
+    existing.bestUtility = Math.max(existing.bestUtility, input.utilityScore);
+    if (input.variant.strictness === "strict") existing.strictHits += 1;
+    if (input.variant.strictness === "relaxed") existing.relaxedHits += 1;
+    if ((input.variant.priority ?? 0) >= 80) existing.highPriorityHits += 1;
+  }
 }
 
 function candidateQualityScore(candidate: CaseCandidate): number {
@@ -122,6 +278,8 @@ function buildCarryState(input: {
   blockedReason?: string;
   blockedKind?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
   retryAfterMs?: number;
+  variantUtility?: Record<string, VariantUtilitySnapshot>;
+  candidateProvenance?: Record<string, CandidateProvenance>;
   attempts: SchedulerResult["attempts"];
   candidates: CaseCandidate[];
 }): SchedulerCarryState {
@@ -134,6 +292,8 @@ function buildCarryState(input: {
     blockedReason: input.blockedReason,
     blockedKind: input.blockedKind,
     retryAfterMs: input.retryAfterMs,
+    variantUtility: input.variantUtility,
+    candidateProvenance: input.candidateProvenance,
     attempts: input.attempts,
     candidates: dedupeCases(input.candidates),
   };
@@ -148,6 +308,8 @@ function buildResult(input: {
   blockedReason?: string;
   blockedKind?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
   retryAfterMs?: number;
+  variantUtility?: Record<string, VariantUtilitySnapshot>;
+  candidateProvenance?: Record<string, CandidateProvenance>;
   attempts: SchedulerResult["attempts"];
   candidates: CaseCandidate[];
   stopReason: SchedulerResult["stopReason"];
@@ -161,6 +323,8 @@ function buildResult(input: {
     blockedReason: input.blockedReason,
     blockedKind: input.blockedKind,
     retryAfterMs: input.retryAfterMs,
+    variantUtility: input.variantUtility,
+    candidateProvenance: input.candidateProvenance,
     candidates: deduped,
     carryState: buildCarryState({
       startedAtMs: input.startedAtMs,
@@ -171,6 +335,8 @@ function buildResult(input: {
       blockedReason: input.blockedReason,
       blockedKind: input.blockedKind,
       retryAfterMs: input.retryAfterMs,
+      variantUtility: input.variantUtility,
+      candidateProvenance: input.candidateProvenance,
       attempts: input.attempts,
       candidates: deduped,
     }),
@@ -189,6 +355,20 @@ export async function runRetrievalSchedule(input: {
   const seenSignatures = new Set<string>(carryState?.seenSignatures ?? []);
   const attempts: SchedulerResult["attempts"] = [...(carryState?.attempts ?? [])];
   const allCandidates: CaseCandidate[] = [...(carryState?.candidates ?? [])];
+  const variantUtility: Record<string, VariantUtilitySnapshot> = {
+    ...(carryState?.variantUtility ?? {}),
+  };
+  const candidateProvenance: Record<string, CandidateProvenance> = Object.fromEntries(
+    Object.entries(carryState?.candidateProvenance ?? {}).map(([url, provenance]) => [
+      url,
+      {
+        ...provenance,
+        variantIds: [...provenance.variantIds],
+        canonicalKeys: [...provenance.canonicalKeys],
+        phases: [...provenance.phases],
+      },
+    ]),
+  );
   let skippedDuplicates = carryState?.skippedDuplicates ?? 0;
   let blockedCount = carryState?.blockedCount ?? 0;
   let blockedReason = carryState?.blockedReason;
@@ -208,8 +388,19 @@ export async function runRetrievalSchedule(input: {
 
   const orderedPhases: QueryPhase[] = ["primary", "fallback", "rescue", "micro", "revolving", "browse"];
   for (const phase of orderedPhases) {
-    const phaseVariants = variantsByPhase[phase].slice(0, config.phaseLimits[phase] ?? PHASE_LIMITS[phase]);
-    for (const variant of phaseVariants) {
+    const phaseBudget = config.phaseLimits[phase] ?? PHASE_LIMITS[phase];
+    const phaseVariants = variantsByPhase[phase].slice(0, phaseBudget);
+    let remainingVariants = ADAPTIVE_VARIANT_SCHEDULER_ENABLED
+      ? toSortedPhaseVariants(phaseVariants, variantUtility)
+      : [...phaseVariants];
+
+    while (remainingVariants.length > 0) {
+      if (ADAPTIVE_VARIANT_SCHEDULER_ENABLED && remainingVariants.length > 1) {
+        remainingVariants = toSortedPhaseVariants(remainingVariants, variantUtility);
+      }
+      const variant = remainingVariants.shift();
+      if (!variant) continue;
+
       if (Date.now() - startedAt >= config.maxElapsedMs) {
         stopReason = "budget_exhausted";
         blockedReason = `time_budget_exhausted:${config.maxElapsedMs}`;
@@ -222,6 +413,8 @@ export async function runRetrievalSchedule(input: {
           blockedReason,
           blockedKind,
           retryAfterMs,
+          variantUtility,
+          candidateProvenance,
           candidates: allCandidates,
           seenSignatures,
           attemptsUsed,
@@ -239,6 +432,8 @@ export async function runRetrievalSchedule(input: {
           blockedReason,
           blockedKind,
           retryAfterMs,
+          variantUtility,
+          candidateProvenance,
           candidates: allCandidates,
           seenSignatures,
           attemptsUsed,
@@ -277,6 +472,8 @@ export async function runRetrievalSchedule(input: {
           blockedReason,
           blockedKind,
           retryAfterMs,
+          variantUtility,
+          candidateProvenance,
           candidates: allCandidates,
           seenSignatures,
           attemptsUsed,
@@ -297,13 +494,20 @@ export async function runRetrievalSchedule(input: {
       );
       const dynamicMax429Retries =
         remainingBeforeAttempt < perAttemptTimeoutMs + 3_000 ? 0 : (config.max429Retries ?? 1);
+      const successfulAttemptsSoFar = attempts.some((attempt) => attempt.ok && attempt.parsedCount > 0);
+      const allowLateExtraPage =
+        (phase === "rescue" || phase === "browse") &&
+        remainingBeforeAttempt > 3_500 &&
+        !successfulAttemptsSoFar;
+      const maxPages = phase === "primary" ? PRIMARY_MAX_PAGES : allowLateExtraPage ? 2 : 1;
       let delayMs = 80 + Math.floor(Math.random() * 80);
+      const canonicalKey = canonicalVariantKey(variant);
       try {
         const result = await provider.search({
           phrase,
           courtScope: variant.courtScope,
           maxResultsPerPhrase: 14,
-          maxPages: phase === "primary" ? PRIMARY_MAX_PAGES : 1,
+          maxPages,
           courtType,
           fromDate,
           toDate,
@@ -313,6 +517,27 @@ export async function runRetrievalSchedule(input: {
           max429Retries: dynamicMax429Retries,
           maxRetryAfterMs: config.maxRetryAfterMs,
           cooldownScope,
+          compiledQuery: variant.providerHints?.compiledQuery,
+          includeTokens: variant.mustIncludeTokens,
+          excludeTokens: variant.mustExcludeTokens,
+          providerHints: variant.providerHints,
+          variantPriority: variant.priority,
+        });
+        const utilityStats = computeAttemptUtility({
+          cases: result.cases,
+          parsedCount: result.debug.parsedCount,
+          challengeDetected: result.debug.challengeDetected,
+          timedOut: Boolean(result.debug.timedOut),
+          status: result.debug.status,
+        });
+        const utilitySnapshot = updateVariantUtility(variantUtility, {
+          key: canonicalKey,
+          score: utilityStats.score,
+          caseLikeRatio: utilityStats.caseLikeRatio,
+          statuteLikeRatio: utilityStats.statuteLikeRatio,
+          challengeDetected: result.debug.challengeDetected || result.debug.status === 429,
+          timedOut: Boolean(result.debug.timedOut),
+          status: result.debug.status,
         });
 
         attempts.push({
@@ -320,11 +545,16 @@ export async function runRetrievalSchedule(input: {
           phase,
           courtScope: variant.courtScope,
           variantId: variant.id,
+          canonicalKey,
+          variantPriority: variant.priority,
           phrase: variant.phrase,
           searchQuery: result.debug.searchQuery,
           status: result.debug.status,
           ok: result.debug.ok,
           parsedCount: result.debug.parsedCount,
+          utilityScore: utilitySnapshot.meanUtility,
+          caseLikeRatio: utilityStats.caseLikeRatio,
+          statuteLikeRatio: utilityStats.statuteLikeRatio,
           parserMode: result.debug.parserMode,
           pagesScanned: result.debug.pagesScanned,
           pageCaseCounts: result.debug.pageCaseCounts,
@@ -344,6 +574,11 @@ export async function runRetrievalSchedule(input: {
         });
 
         allCandidates.push(...result.cases);
+        updateCandidateProvenance(candidateProvenance, {
+          candidates: result.cases,
+          variant,
+          utilityScore: utilitySnapshot.meanUtility,
+        });
         if (result.debug.blockedType === "local_cooldown") {
           stopReason = "blocked";
           blockedKind = "local_cooldown";
@@ -361,6 +596,8 @@ export async function runRetrievalSchedule(input: {
             blockedReason,
             blockedKind,
             retryAfterMs,
+            variantUtility,
+            candidateProvenance,
             candidates: allCandidates,
             seenSignatures,
             attemptsUsed,
@@ -382,16 +619,37 @@ export async function runRetrievalSchedule(input: {
           const debug = error.debug;
           const errorMessage =
             error instanceof Error ? error.message : "retrieval_provider_error";
+          const utilityStats = computeAttemptUtility({
+            cases: [],
+            parsedCount: debug.parsedCount,
+            challengeDetected: debug.challengeDetected || debug.status === 429,
+            timedOut: Boolean(debug.timedOut),
+            status: debug.status,
+          });
+          const utilitySnapshot = updateVariantUtility(variantUtility, {
+            key: canonicalKey,
+            score: utilityStats.score,
+            caseLikeRatio: utilityStats.caseLikeRatio,
+            statuteLikeRatio: utilityStats.statuteLikeRatio,
+            challengeDetected: debug.challengeDetected || debug.status === 429,
+            timedOut: Boolean(debug.timedOut),
+            status: debug.status,
+          });
           attempts.push({
             providerId: provider.id,
             phase,
             courtScope: variant.courtScope,
             variantId: variant.id,
+            canonicalKey,
+            variantPriority: variant.priority,
             phrase: variant.phrase,
             searchQuery: debug.searchQuery,
             status: debug.status,
             ok: debug.ok,
             parsedCount: debug.parsedCount,
+            utilityScore: utilitySnapshot.meanUtility,
+            caseLikeRatio: utilityStats.caseLikeRatio,
+            statuteLikeRatio: utilityStats.statuteLikeRatio,
             parserMode: debug.parserMode,
             pagesScanned: debug.pagesScanned,
             pageCaseCounts: debug.pageCaseCounts,
@@ -426,6 +684,8 @@ export async function runRetrievalSchedule(input: {
               blockedReason,
               blockedKind,
               retryAfterMs,
+              variantUtility,
+              candidateProvenance,
               candidates: allCandidates,
               seenSignatures,
               attemptsUsed,
@@ -447,15 +707,36 @@ export async function runRetrievalSchedule(input: {
             retryAfterMs = undefined;
           }
         } else {
+          const utilityStats = computeAttemptUtility({
+            cases: [],
+            parsedCount: 0,
+            challengeDetected: false,
+            timedOut: false,
+            status: 500,
+          });
+          const utilitySnapshot = updateVariantUtility(variantUtility, {
+            key: canonicalKey,
+            score: utilityStats.score,
+            caseLikeRatio: utilityStats.caseLikeRatio,
+            statuteLikeRatio: utilityStats.statuteLikeRatio,
+            challengeDetected: false,
+            timedOut: false,
+            status: 500,
+          });
           attempts.push({
             providerId: provider.id,
             phase,
             courtScope: variant.courtScope,
             variantId: variant.id,
+            canonicalKey,
+            variantPriority: variant.priority,
             phrase: variant.phrase,
             status: 500,
             ok: false,
             parsedCount: 0,
+            utilityScore: utilitySnapshot.meanUtility,
+            caseLikeRatio: utilityStats.caseLikeRatio,
+            statuteLikeRatio: utilityStats.statuteLikeRatio,
             cloudflareDetected: false,
             challengeDetected: false,
             error: error instanceof Error ? error.message : "Unknown source error",
@@ -475,6 +756,8 @@ export async function runRetrievalSchedule(input: {
             blockedReason,
             blockedKind,
             retryAfterMs,
+            variantUtility,
+            candidateProvenance,
             candidates: allCandidates,
             seenSignatures,
             attemptsUsed,
@@ -498,6 +781,8 @@ export async function runRetrievalSchedule(input: {
           blockedReason,
           blockedKind,
           retryAfterMs,
+          variantUtility,
+          candidateProvenance,
           candidates: deduped,
           seenSignatures,
           attemptsUsed,
@@ -517,6 +802,8 @@ export async function runRetrievalSchedule(input: {
           blockedReason,
           blockedKind,
           retryAfterMs,
+          variantUtility,
+          candidateProvenance,
           candidates: allCandidates,
           seenSignatures,
           attemptsUsed,
@@ -536,6 +823,8 @@ export async function runRetrievalSchedule(input: {
           blockedReason,
           blockedKind,
           retryAfterMs,
+          variantUtility,
+          candidateProvenance,
           candidates: allCandidates,
           seenSignatures,
           attemptsUsed,
@@ -557,8 +846,16 @@ export async function runRetrievalSchedule(input: {
     blockedReason,
     blockedKind,
     retryAfterMs,
+    variantUtility,
+    candidateProvenance,
     candidates: allCandidates,
     seenSignatures,
     attemptsUsed,
   });
 }
+
+export const schedulerTestUtils = {
+  computeAttemptUtility,
+  toSortedPhaseVariants,
+  canonicalVariantKey,
+};

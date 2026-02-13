@@ -12,6 +12,41 @@ type HookGroupPlan = {
   required: boolean;
 };
 
+const HIGH_IMPACT_OUTCOME_SYNONYMS: Array<{ match: RegExp; expansions: string[] }> = [
+  {
+    match: /\b(?:delay\s+not\s+condoned|condonation(?:\s+of\s+delay)?\s+(?:refused|rejected|denied|declined)|refused)\b/i,
+    expansions: [
+      "condonation of delay refused",
+      "application for condonation rejected",
+      "delay condonation denied",
+    ],
+  },
+  {
+    match: /\b(?:time\s*barred|barred by limitation|appeal dismissed as time barred|dismissed)\b/i,
+    expansions: [
+      "appeal dismissed as time barred",
+      "barred by limitation",
+      "dismissed on limitation",
+    ],
+  },
+  {
+    match: /\b(?:sanction\s+required|mandatory sanction|required)\b/i,
+    expansions: [
+      "prior sanction mandatory",
+      "previous sanction required",
+      "sanction required for prosecution",
+    ],
+  },
+  {
+    match: /\b(?:sanction\s+not\s+required|without\s+sanction|no\s+sanction\s+required|not required)\b/i,
+    expansions: [
+      "sanction not required",
+      "without prior sanction",
+      "no sanction required",
+    ],
+  },
+];
+
 function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
@@ -54,6 +89,22 @@ function withCourtSuffix(phrase: string, court: "supreme court" | "high court"):
   return normalizePhrase(`${normalized} ${court}`);
 }
 
+function defaultVariantPriority(
+  phase: QueryVariant["phase"],
+  strictness: QueryVariant["strictness"],
+): number {
+  const phaseBase: Record<QueryVariant["phase"], number> = {
+    primary: 92,
+    fallback: 78,
+    rescue: 62,
+    micro: 56,
+    revolving: 48,
+    browse: 42,
+  };
+  const strictBonus = strictness === "strict" ? 12 : 0;
+  return phaseBase[phase] + strictBonus;
+}
+
 function inferExplicitCourtScope(value: string): QueryVariant["courtScope"] {
   const normalized = normalizePhrase(value);
   const hasSc = /\bsupreme court\b|\bsc\b/.test(normalized);
@@ -79,17 +130,33 @@ function buildVariant(
   idx: number,
   courtScope: QueryVariant["courtScope"],
   strictness: QueryVariant["strictness"],
+  metadata?: {
+    canonicalKey?: string;
+    priority?: number;
+    mustIncludeTokens?: string[];
+    mustExcludeTokens?: string[];
+    providerHints?: QueryVariant["providerHints"];
+  },
 ): QueryVariant {
   const cleaned = normalizePhrase(phrase);
   const tokens = tokenizePhrase(cleaned).slice(0, phase === "primary" ? 12 : 10);
+  const normalizedPhrase = tokens.join(" ");
+  const canonicalKey =
+    metadata?.canonicalKey?.trim().toLowerCase() ||
+    `${phase}:${strictness}:${normalizePhrase(`${purpose} ${normalizedPhrase}`)}`;
   return {
     id: `${phase}_${idx}_${Math.abs(hashString(cleaned)).toString(36)}`,
-    phrase: tokens.join(" "),
+    phrase: normalizedPhrase,
     phase,
     purpose,
     courtScope,
     strictness,
     tokens,
+    canonicalKey,
+    priority: metadata?.priority ?? defaultVariantPriority(phase, strictness),
+    mustIncludeTokens: metadata?.mustIncludeTokens,
+    mustExcludeTokens: metadata?.mustExcludeTokens,
+    providerHints: metadata?.providerHints,
   };
 }
 
@@ -209,6 +276,17 @@ function filterPolarityCues(
   return cues;
 }
 
+function expandOutcomeSynonyms(values: string[]): string[] {
+  const normalized = unique(values.map((value) => normalizePhrase(value)).filter(Boolean));
+  const bag = normalizePhrase(normalized.join(" "));
+  const expanded = [...normalized];
+  for (const entry of HIGH_IMPACT_OUTCOME_SYNONYMS) {
+    if (!entry.match.test(bag)) continue;
+    expanded.push(...entry.expansions);
+  }
+  return unique(expanded.map((value) => normalizePhrase(value)).filter(Boolean)).slice(0, 16);
+}
+
 function requiredPolarityTokens(intent: IntentProfile, reasonerPlan?: ReasonerPlan): string[] {
   const rawCues = inferOutcomePolarityCue(
     intent.cleanedQuery,
@@ -219,7 +297,7 @@ function requiredPolarityTokens(intent: IntentProfile, reasonerPlan?: ReasonerPl
     reasonerPlan?.proposition.outcome_required ?? intent.issues,
     reasonerPlan,
   );
-  const cues = filterPolarityCues(rawCues, expectedPolarity);
+  const cues = expandOutcomeSynonyms(filterPolarityCues(rawCues, expectedPolarity));
   return unique(cues.flatMap((cue) => tokenizePhrase(cue))).slice(0, 4);
 }
 
@@ -272,6 +350,14 @@ function representativeHooks(requiredHookGroups: HookGroupPlan[]): string[] {
     .filter(Boolean)
     .map((value) => sanitizeTokens(tokenizePhrase(value), 5))
     .filter((value) => value.length > 2);
+}
+
+function doctrinalHookTokenSet(requiredHookGroups: HookGroupPlan[]): Set<string> {
+  const tokens = requiredHookGroups
+    .flatMap((group) => group.terms)
+    .flatMap((value) => tokenizePhrase(value))
+    .filter((value) => value.length > 1);
+  return new Set(unique(tokens).slice(0, 24));
 }
 
 function hasMinimumLegalSignal(tokens: string[], legalSignalTokens: Set<string>): boolean {
@@ -347,7 +433,9 @@ function buildPropositionStrategy(input: {
     [],
   );
   const expectedPolarity = inferExpectedPolarity(intent.cleanedQuery, outcomes, reasonerPlan);
-  const polarityCues = filterPolarityCues(inferOutcomePolarityCue(intent.cleanedQuery, outcomes), expectedPolarity);
+  const polarityCues = expandOutcomeSynonyms(
+    filterPolarityCues(inferOutcomePolarityCue(intent.cleanedQuery, outcomes), expectedPolarity),
+  );
   const polarityCueTokens = polarityCues.flatMap((cue) => tokenizePhrase(cue));
 
   const strict: string[] = [];
@@ -468,7 +556,8 @@ function appendPhaseVariants(input: {
   legalSignalTokens: Set<string>;
   requiredHookGroups?: HookGroupPlan[];
   enforceAllGroups?: boolean;
-  requiredTokens?: string[];
+  polarityTokens?: string[];
+  doctrinalHookTokens?: Set<string>;
   strictAxisRequirement?: StrictAxisRequirement;
 }): void {
   const {
@@ -483,7 +572,8 @@ function appendPhaseVariants(input: {
     legalSignalTokens,
     requiredHookGroups = [],
     enforceAllGroups = false,
-    requiredTokens = [],
+    polarityTokens = [],
+    doctrinalHookTokens = new Set<string>(),
     strictAxisRequirement,
   } = input;
 
@@ -512,10 +602,17 @@ function appendPhaseVariants(input: {
       if ((phase === "primary" || phase === "fallback") && !hasMinimumLegalSignal(tokens, legalSignalTokens)) {
         continue;
       }
-      if (requiredTokens.length > 0 && strictness === "strict") {
+      if (polarityTokens.length > 0 && strictness === "strict") {
         const tokenSet = new Set(tokens);
-        const hasAllRequired = requiredTokens.every((token) => tokenSet.has(token));
-        if (!hasAllRequired) continue;
+        const enforcePolarityAndHook = enforceAllGroups && doctrinalHookTokens.size > 0;
+        if (enforcePolarityAndHook) {
+          const hasPolarityCue = polarityTokens.some((token) => tokenSet.has(token));
+          const hasDoctrinalHook = Array.from(doctrinalHookTokens).some((token) => tokenSet.has(token));
+          if (!hasPolarityCue || !hasDoctrinalHook) continue;
+        } else {
+          const hasAllRequired = polarityTokens.every((token) => tokenSet.has(token));
+          if (!hasAllRequired) continue;
+        }
       }
       if (strictness === "strict" && strictAxisRequirement?.enabled) {
         const tokenSet = new Set(tokens);
@@ -558,6 +655,9 @@ function appendPhaseVariants(input: {
           idx,
           explicitScope === "ANY" ? courtScope : explicitScope,
           strictness,
+          {
+            canonicalKey: `${purpose}:${phase}:${phrase}`,
+          },
         ),
       );
       idx += 1;
@@ -577,6 +677,7 @@ function buildVariantsFromKeywordPack(input: {
   const propositionStrategy = buildPropositionStrategy({ intent, reasonerPlan, keywordPack });
   const legalSignalTokens = buildLegalSignalTokenSet(intent, reasonerPlan);
   const requiredHookGroups = buildRequiredHookGroups(intent, reasonerPlan);
+  const doctrinalHookTokens = doctrinalHookTokenSet(requiredHookGroups);
   const polarityTokens = requiredPolarityTokens(intent, reasonerPlan);
   const expectedPolarity = inferExpectedPolarity(
     intent.cleanedQuery,
@@ -584,9 +685,11 @@ function buildVariantsFromKeywordPack(input: {
     reasonerPlan,
   );
   const outcomePhrases = unique([
-    ...filterPolarityCues(
-      inferOutcomePolarityCue(intent.cleanedQuery, reasonerPlan?.proposition.outcome_required ?? intent.issues),
-      expectedPolarity,
+    ...expandOutcomeSynonyms(
+      filterPolarityCues(
+        inferOutcomePolarityCue(intent.cleanedQuery, reasonerPlan?.proposition.outcome_required ?? intent.issues),
+        expectedPolarity,
+      ),
     ),
     ...(reasonerPlan?.proposition.outcome_required ?? []),
     ...intent.issues,
@@ -611,7 +714,8 @@ function buildVariantsFromKeywordPack(input: {
     legalSignalTokens,
     requiredHookGroups,
     enforceAllGroups: true,
-    requiredTokens: polarityTokens,
+    polarityTokens,
+    doctrinalHookTokens,
     strictAxisRequirement,
   });
 
@@ -627,7 +731,8 @@ function buildVariantsFromKeywordPack(input: {
     legalSignalTokens,
     requiredHookGroups,
     enforceAllGroups: true,
-    requiredTokens: polarityTokens,
+    polarityTokens,
+    doctrinalHookTokens,
     strictAxisRequirement,
   });
 
@@ -660,7 +765,8 @@ function buildVariantsFromKeywordPack(input: {
       legalSignalTokens,
       requiredHookGroups,
       enforceAllGroups: true,
-      requiredTokens: [],
+      polarityTokens: [],
+      doctrinalHookTokens,
       strictAxisRequirement,
     });
   }
@@ -719,15 +825,18 @@ export function buildReasonerQueryVariants(input: {
   const { intent, plan } = input;
   const legalSignalTokens = buildLegalSignalTokenSet(intent, plan);
   const requiredHookGroups = buildRequiredHookGroups(intent, plan);
+  const doctrinalHookTokens = doctrinalHookTokenSet(requiredHookGroups);
   const polarityTokens = requiredPolarityTokens(intent, plan);
   const expectedPolarity = inferExpectedPolarity(
     intent.cleanedQuery,
     plan.proposition.outcome_required.length > 0 ? plan.proposition.outcome_required : intent.issues,
     plan,
   );
-  const filteredPlanCues = filterPolarityCues(
-    inferOutcomePolarityCue(intent.cleanedQuery, plan.proposition.outcome_required),
-    expectedPolarity,
+  const filteredPlanCues = expandOutcomeSynonyms(
+    filterPolarityCues(
+      inferOutcomePolarityCue(intent.cleanedQuery, plan.proposition.outcome_required),
+      expectedPolarity,
+    ),
   );
   const strictAxisRequirement: StrictAxisRequirement = {
     enabled: requiredHookGroups.length === 0,
@@ -784,7 +893,8 @@ export function buildReasonerQueryVariants(input: {
     legalSignalTokens,
     requiredHookGroups,
     enforceAllGroups: true,
-    requiredTokens: polarityTokens,
+    polarityTokens,
+    doctrinalHookTokens,
     strictAxisRequirement,
   });
   appendPhaseVariants({
@@ -799,7 +909,8 @@ export function buildReasonerQueryVariants(input: {
     legalSignalTokens,
     requiredHookGroups,
     enforceAllGroups: true,
-    requiredTokens: polarityTokens,
+    polarityTokens,
+    doctrinalHookTokens,
     strictAxisRequirement,
   });
   appendPhaseVariants({
@@ -846,6 +957,34 @@ export async function planAIFailoverQueryVariants(
   });
 }
 
+export function buildGuaranteeBackfillVariants(input: {
+  intent: IntentProfile;
+  phrases: string[];
+  reasonerPlan?: ReasonerPlan;
+  maxVariants?: number;
+}): QueryVariant[] {
+  const { intent, phrases, reasonerPlan } = input;
+  const maxVariants = Math.max(1, Math.min(input.maxVariants ?? 6, 12));
+  const legalSignalTokens = buildLegalSignalTokenSet(intent, reasonerPlan);
+  const variants: QueryVariant[] = [];
+  const seen = new Set<string>();
+  const courtScope = resolveCourtScope(intent.courtHint, reasonerPlan?.proposition.jurisdiction_hint);
+
+  appendPhaseVariants({
+    output: variants,
+    seen,
+    phase: "browse",
+    purpose: "guarantee-backfill",
+    phrases: unique(phrases).slice(0, maxVariants * 2),
+    courtScope,
+    strictness: "relaxed",
+    courted: false,
+    legalSignalTokens,
+  });
+
+  return variants.slice(0, maxVariants);
+}
+
 function titleTraceSeed(title: string): string {
   const cleaned = normalizePhrase(title).replace(/\bon\s+\d{1,2}\s+[a-z]+\s+\d{4}\b/g, " ");
   const tokens = tokenizePhrase(cleaned).filter((token) => token.length > 2).slice(0, 6);
@@ -880,12 +1019,64 @@ export function buildTraceQueryVariants(input: {
       if (!phrase || seen.has(phrase)) continue;
       seen.add(phrase);
       if (!hasMinimumLegalSignal(tokenizePhrase(phrase), legalSignalTokens)) continue;
-      output.push(buildVariant("browse", "precedent-trace", phrase, idx, courtScope, "relaxed"));
+      output.push(
+        buildVariant("browse", "precedent-trace", phrase, idx, courtScope, "relaxed", {
+          canonicalKey: `precedent-trace:${phrase}`,
+          priority: 44,
+        }),
+      );
       idx += 1;
       if (output.length >= maxVariants) return output;
     }
   }
   return output;
+}
+
+export function mergeCanonicalRewriteVariants(input: {
+  plannerVariants: QueryVariant[];
+  rewriteVariants: QueryVariant[];
+}): QueryVariant[] {
+  const merged = new Map<string, QueryVariant>();
+
+  const upsert = (candidate: QueryVariant) => {
+    const key = `${candidate.phase}|${candidate.phrase.toLowerCase()}`;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, candidate);
+      return;
+    }
+    const existingPriority = existing.priority ?? 0;
+    const candidatePriority = candidate.priority ?? 0;
+    if (candidatePriority > existingPriority) {
+      merged.set(key, {
+        ...candidate,
+        mustIncludeTokens:
+          candidate.mustIncludeTokens && existing.mustIncludeTokens
+            ? unique([...candidate.mustIncludeTokens, ...existing.mustIncludeTokens]).slice(0, 24)
+            : candidate.mustIncludeTokens ?? existing.mustIncludeTokens,
+        mustExcludeTokens:
+          candidate.mustExcludeTokens && existing.mustExcludeTokens
+            ? unique([...candidate.mustExcludeTokens, ...existing.mustExcludeTokens]).slice(0, 16)
+            : candidate.mustExcludeTokens ?? existing.mustExcludeTokens,
+      });
+      return;
+    }
+    merged.set(key, {
+      ...existing,
+      mustIncludeTokens:
+        candidate.mustIncludeTokens && existing.mustIncludeTokens
+          ? unique([...existing.mustIncludeTokens, ...candidate.mustIncludeTokens]).slice(0, 24)
+          : existing.mustIncludeTokens ?? candidate.mustIncludeTokens,
+      mustExcludeTokens:
+        candidate.mustExcludeTokens && existing.mustExcludeTokens
+          ? unique([...existing.mustExcludeTokens, ...candidate.mustExcludeTokens]).slice(0, 16)
+          : existing.mustExcludeTokens ?? candidate.mustExcludeTokens,
+    });
+  };
+
+  for (const variant of input.rewriteVariants) upsert(variant);
+  for (const variant of input.plannerVariants) upsert(variant);
+  return Array.from(merged.values());
 }
 
 export async function planQueryVariants(

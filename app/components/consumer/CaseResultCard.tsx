@@ -7,16 +7,37 @@ function confidenceLabel(item: ScoredCase): string {
   return band.replace(/_/g, " ");
 }
 
+function tierLabel(item: ScoredCase): string {
+  if (item.retrievalTier === "exact_strict") return "Strict Exact";
+  if (item.retrievalTier === "exact_provisional") return "Provisional Exact";
+  if (item.retrievalTier === "exploratory") return "Exploratory";
+  if (item.exactnessType === "strict") return "Strict Exact";
+  if (item.exactnessType === "provisional") return "Provisional Exact";
+  return "Ranked";
+}
+
+function tierClassName(item: ScoredCase): string {
+  if (item.retrievalTier) return item.retrievalTier.toLowerCase();
+  if (item.exactnessType === "strict") return "exact_strict";
+  if (item.exactnessType === "provisional") return "exact_provisional";
+  return "exploratory";
+}
+
 export function CaseResultCard(props: { item: ScoredCase }) {
   const { item } = props;
   const confidence = item.confidenceScore ?? item.score;
   const detailVerified = item.verification.detailChecked;
+  const isExploratory = item.retrievalTier === "exploratory";
+  const isStaleFallback = item.fallbackReason === "stale_cache";
 
   return (
     <article className="result-card">
       <header className="result-card-header">
         <span className={`court-tag court-${item.court.toLowerCase()}`}>{item.court}</span>
         <div className="badge-row">
+          <span className={`tier-pill tier-${tierClassName(item)}`}>
+            {tierLabel(item)}
+          </span>
           <span className={`confidence-pill confidence-${(item.confidenceBand ?? "LOW").toLowerCase()}`}>
             {confidenceLabel(item)}
           </span>
@@ -28,6 +49,12 @@ export function CaseResultCard(props: { item: ScoredCase }) {
 
       <h3>{item.title}</h3>
       <p className="selection-summary">{item.selectionSummary}</p>
+      {isExploratory && (
+        <p className="tier-warning">
+          Exploratory match: useful for direction, but not an exact doctrinal fit.
+          {isStaleFallback ? " Served from recent cache due to source blocking." : ""}
+        </p>
+      )}
       <p className="snippet-text">{item.snippet || "No snippet extracted from source."}</p>
 
       <div className="confidence-track" aria-hidden="true">

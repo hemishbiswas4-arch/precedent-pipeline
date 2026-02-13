@@ -194,24 +194,26 @@ export default function Home() {
       setDebugData(enableDebugDiagnostics ? responsePayload.debug ?? null : null);
 
       const exactCasesForRun = responsePayload.casesExact ?? responsePayload.cases;
+      const exploratoryForRun = responsePayload.casesExploratory ?? responsePayload.casesNearMiss ?? [];
+      const summaryCasesForRun = exactCasesForRun.length > 0 ? exactCasesForRun : exploratoryForRun;
       const blockedRun = responsePayload.status === "blocked";
       const partialRun = Boolean(responsePayload.pipelineTrace?.scheduler.partialDueToLatency || responsePayload.partialRun);
       const retryAfterMs = responsePayload.retryAfterMs ?? responsePayload.pipelineTrace?.scheduler.retryAfterMs;
 
       const avgConfidence =
-        exactCasesForRun.length > 0
-          ? exactCasesForRun.reduce((sum, item) => sum + (item.confidenceScore ?? item.score), 0) /
-            exactCasesForRun.length
+        summaryCasesForRun.length > 0
+          ? summaryCasesForRun.reduce((sum, item) => sum + (item.confidenceScore ?? item.score), 0) /
+            summaryCasesForRun.length
           : 0;
-      const scCount = exactCasesForRun.filter((item) => item.court === "SC").length;
-      const hcCount = exactCasesForRun.filter((item) => item.court === "HC").length;
+      const scCount = summaryCasesForRun.filter((item) => item.court === "SC").length;
+      const hcCount = summaryCasesForRun.filter((item) => item.court === "HC").length;
 
       const nextRuns = saveSessionRun({
         timestamp: Date.now(),
         requestId: responsePayload.requestId,
         totalFetched: responsePayload.totalFetched,
         filteredCount: responsePayload.filteredCount,
-        casesCount: exactCasesForRun.length,
+        casesCount: summaryCasesForRun.length,
         averageScore: avgConfidence,
         scCount,
         hcCount,
@@ -229,6 +231,8 @@ export default function Home() {
         setRequestStatus("Search completed with partial results due to runtime budget.");
       } else if (responsePayload.status === "no_match" && (responsePayload.casesNearMiss?.length ?? 0) > 0) {
         setRequestStatus("No exact proposition matches were verified; showing best available matches below.");
+      } else if (exactCasesForRun.length === 0 && exploratoryForRun.length > 0) {
+        setRequestStatus("No exact proposition matches were verified; showing exploratory best-available matches.");
       } else if (responsePayload.status === "no_match") {
         setRequestStatus("No exact proposition matches were verified for this run.");
       } else {
@@ -272,20 +276,25 @@ export default function Home() {
 
   const nearMissCases = useMemo(() => {
     if (!data) return [];
-    return data.casesNearMiss ?? [];
+    return data.casesExploratory ?? data.casesNearMiss ?? [];
   }, [data]);
+
+  const summaryCases = useMemo(() => {
+    if (exactCases.length > 0) return exactCases;
+    return nearMissCases;
+  }, [exactCases, nearMissCases]);
 
   const runStats = useMemo<ResearchSummaryStats | null>(() => {
     if (!data) return null;
-    const scCount = exactCases.filter((item) => item.court === "SC").length;
-    const hcCount = exactCases.filter((item) => item.court === "HC").length;
+    const scCount = summaryCases.filter((item) => item.court === "SC").length;
+    const hcCount = summaryCases.filter((item) => item.court === "HC").length;
     const avgConfidence =
-      exactCases.length > 0
-        ? exactCases.reduce((sum, item) => sum + (item.confidenceScore ?? item.score), 0) / exactCases.length
+      summaryCases.length > 0
+        ? summaryCases.reduce((sum, item) => sum + (item.confidenceScore ?? item.score), 0) / summaryCases.length
         : 0;
     const detailCoverage =
-      exactCases.length > 0
-        ? exactCases.filter((item) => item.verification.detailChecked).length / exactCases.length
+      summaryCases.length > 0
+        ? summaryCases.filter((item) => item.verification.detailChecked).length / summaryCases.length
         : 0;
     const retrievalEfficiency = data.totalFetched > 0 ? data.filteredCount / data.totalFetched : 0;
 
@@ -298,7 +307,7 @@ export default function Home() {
       partialRun: Boolean(data.pipelineTrace?.scheduler.partialDueToLatency || data.partialRun),
       elapsedMs: data.pipelineTrace?.scheduler.elapsedMs ?? 0,
     };
-  }, [data, exactCases]);
+  }, [data, summaryCases]);
 
   const resultMode = useMemo(
     () => deriveResultMode(data, exactCases, nearMissCases),
@@ -332,7 +341,7 @@ export default function Home() {
 
       {data && !isLoading && runStats && (
         <>
-          <ResearchSummary exactCount={exactCases.length} stats={runStats} executionPath={data.executionPath} />
+          <ResearchSummary exactCount={summaryCases.length} stats={runStats} executionPath={data.executionPath} />
 
           <ResultModeBanner mode={resultMode} nearMissCount={nearMissCases.length} />
 

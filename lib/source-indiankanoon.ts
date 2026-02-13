@@ -57,6 +57,10 @@ export type IndianKanoonSearchOptions = {
   fromDate?: string;
   toDate?: string;
   sortByMostRecent?: boolean;
+  compiledQuery?: string;
+  includeTokens?: string[];
+  excludeTokens?: string[];
+  canonicalOrderTerms?: string[];
   maxPages?: number;
   crawlMaxElapsedMs?: number;
   fetchTimeoutMs?: number;
@@ -358,6 +362,49 @@ async function fetchWithRateLimitHandling(
 }
 
 function buildSearchQuery(phrase: string, options: IndianKanoonSearchOptions): string {
+  const normalizeTerm = (value: string): string =>
+    value
+      .toLowerCase()
+      .replace(/\b(?:doctypes|sortby|fromdate|todate):\S+/g, " ")
+      .replace(/["']/g, " ")
+      .replace(/[^a-z0-9\s()/-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const uniqueTerms = (values: string[], limit: number): string[] => {
+    const output: string[] = [];
+    const seen = new Set<string>();
+    for (const value of values) {
+      const normalized = normalizeTerm(value);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      output.push(normalized);
+      if (output.length >= limit) break;
+    }
+    return output;
+  };
+
+  const orderedTerms = uniqueTerms(
+    [
+      ...(options.canonicalOrderTerms ?? []),
+      ...(options.includeTokens ?? []),
+      options.compiledQuery ?? "",
+      phrase,
+    ],
+    18,
+  );
+  const excluded = new Set(
+    uniqueTerms([...(options.excludeTokens ?? [])], 18)
+      .flatMap((value) => value.split(/\s+/))
+      .filter((token) => token.length > 1),
+  );
+  const canonicalPhrase = orderedTerms
+    .flatMap((value) => value.split(/\s+/))
+    .filter((token) => token.length > 1 && !excluded.has(token))
+    .slice(0, 18)
+    .join(" ")
+    .trim();
+
   const parts: string[] = [];
   if (options.courtType) {
     parts.push(`doctypes:${options.courtType}`);
@@ -371,8 +418,15 @@ function buildSearchQuery(phrase: string, options: IndianKanoonSearchOptions): s
   if (options.sortByMostRecent === true) {
     parts.push("sortby:mostrecent");
   }
-  parts.push(phrase.trim());
+  parts.push((canonicalPhrase || normalizeTerm(phrase)).trim());
   return parts.filter((v) => v.length > 0).join(" ").replace(/\s+/g, " ").trim();
+}
+
+export function buildIndianKanoonSearchQueryForTest(
+  phrase: string,
+  options: IndianKanoonSearchOptions = {},
+): string {
+  return buildSearchQuery(phrase, options);
 }
 
 async function crawlSearchPages(

@@ -46,6 +46,41 @@ const CONNECTOR_NOISE = new Set([
   "found",
 ]);
 
+const HIGH_IMPACT_SYNONYM_RULES: Array<{ match: RegExp; expansions: string[] }> = [
+  {
+    match: /\b(?:delay\s+not\s+condon(?:ed|able)|condonation(?:\s+of\s+delay)?\s+(?:refused|rejected|denied|declined)|refused)\b/i,
+    expansions: [
+      "condonation of delay refused",
+      "application for condonation rejected",
+      "delay condonation denied",
+    ],
+  },
+  {
+    match: /\b(?:time[-\s]*barred|barred by limitation|dismissed as time barred|limitation)\b/i,
+    expansions: [
+      "appeal dismissed as time barred",
+      "barred by limitation",
+      "dismissed on limitation",
+    ],
+  },
+  {
+    match: /\b(?:sanction\s+required|prior sanction|mandatory sanction|required)\b/i,
+    expansions: [
+      "sanction required for prosecution",
+      "prior sanction mandatory",
+      "previous sanction required",
+    ],
+  },
+  {
+    match: /\b(?:sanction\s+not\s+required|without\s+sanction|no\s+sanction\s+required|not required)\b/i,
+    expansions: [
+      "sanction not required",
+      "without prior sanction",
+      "no sanction required",
+    ],
+  },
+];
+
 function normalize(input: string): string {
   return input.toLowerCase().replace(/\s+/g, " ").trim();
 }
@@ -71,6 +106,17 @@ function sanitizePhrase(input: string, maxWords = 12): string {
     .trim();
   if (!normalized) return "";
   return normalized.split(/\s+/).slice(0, maxWords).join(" ");
+}
+
+function expandHighImpactSynonyms(values: string[]): string[] {
+  const normalized = unique(values.map((value) => sanitizePhrase(value, 12)).filter(Boolean));
+  const bag = normalize(normalized.join(" "));
+  const expanded = [...normalized];
+  for (const rule of HIGH_IMPACT_SYNONYM_RULES) {
+    if (!rule.match.test(bag)) continue;
+    expanded.push(...rule.expansions.map((value) => sanitizePhrase(value, 12)));
+  }
+  return unique(expanded.filter((value) => value.length >= 6)).slice(0, 16);
 }
 
 function buildNgramWindows(query: string): string[] {
@@ -187,6 +233,12 @@ export function buildKeywordPack(query: string, context: ContextProfile): Keywor
   const queryTokens = tokenize(query);
   const windows = buildNgramWindows(query);
   const concepts = propositionConcepts(context);
+  const highImpactSynonyms = expandHighImpactSynonyms([
+    query,
+    ...context.issues,
+    ...context.procedures,
+    ...context.statutesOrSections,
+  ]);
   const coreHooks = context.statutesOrSections
     .map((hook) => sanitizePhrase(hook, 8))
     .filter((hook) => hook.length > 2)
@@ -206,6 +258,7 @@ export function buildKeywordPack(query: string, context: ContextProfile): Keywor
 
   const rawSearchPhrases = unique([
     ...hookIntersections,
+    ...highImpactSynonyms,
     ...axisPhrases.slice(0, 10),
     ...concepts.slice(0, 8),
     ...axisPhrases.slice(0, 4).flatMap((phrase) => addCourtVariants(phrase)),
@@ -228,6 +281,7 @@ export function buildKeywordPack(query: string, context: ContextProfile): Keywor
 
   const rawPrimary = unique([
     ...concepts,
+    ...highImpactSynonyms,
     ...queryTokens,
     ...legalSignals,
     ...windows,

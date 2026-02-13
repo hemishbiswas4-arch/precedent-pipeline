@@ -29,6 +29,10 @@ export const indianKanoonHtmlProvider: RetrievalProvider = {
         max429Retries: input.max429Retries,
         maxRetryAfterMs: input.maxRetryAfterMs,
         cooldownScope: input.cooldownScope,
+        compiledQuery: input.compiledQuery,
+        includeTokens: input.includeTokens,
+        excludeTokens: input.excludeTokens,
+        canonicalOrderTerms: input.providerHints?.canonicalOrderTerms,
       });
 
       return {

@@ -6,17 +6,31 @@ import {
   PHASE_LIMITS,
   PHASE_ORDER,
 } from "@/lib/kb/query-templates";
+import { ontologyTemplatesForContext } from "@/lib/kb/legal-ontology";
 import { runOpusReasoner } from "@/lib/llm-reasoner";
 import { classificationCounts, classifyCandidates } from "@/lib/pipeline/classifier";
 import { buildIntentProfile } from "@/lib/pipeline/intent";
 import {
+  buildGuaranteeBackfillVariants,
   buildTraceQueryVariants,
   buildReasonerQueryVariants,
+  mergeCanonicalRewriteVariants,
+  planAIFailoverQueryVariants,
   planDeterministicQueryVariants,
 } from "@/lib/pipeline/planner";
 import { runRetrievalSchedule } from "@/lib/pipeline/scheduler";
 import { QueryVariant, SchedulerConfig, SchedulerResult } from "@/lib/pipeline/types";
+import { buildCanonicalIntent, CanonicalIntent, synthesizeRetrievalQueries } from "@/lib/pipeline/query-rewrite";
+import {
+  buildSyntheticAdvisoryNearMiss,
+  shouldInjectSyntheticFallback,
+  syntheticFallbackStatus,
+} from "@/lib/pipeline/always-return";
 import { verifyCandidates } from "@/lib/pipeline/verifier";
+import {
+  lookupFallbackRecallEntry,
+  saveFallbackRecallEntry,
+} from "@/lib/cache/fallback-recall-cache";
 import { pickRetrievalProvider } from "@/lib/retrieval/provider";
 import type { RetrievalProvider } from "@/lib/retrieval/providers/types";
 import { groundReasonerPlanToIntent } from "@/lib/reasoner-schema";
@@ -100,6 +114,25 @@ const SUPREME_COURT_PREFERENCE_BONUS = Math.min(
   0.08,
   Math.max(Number(process.env.SUPREME_COURT_PREFERENCE_BONUS ?? "0.025"), 0),
 );
+const ALWAYS_RETURN_V1_ENABLED = parseBooleanEnv(process.env.ALWAYS_RETURN_V1, true);
+const ALWAYS_RETURN_SYNTHETIC_FALLBACK_ENABLED = parseBooleanEnv(
+  process.env.ALWAYS_RETURN_SYNTHETIC_FALLBACK,
+  true,
+);
+const STALE_FALLBACK_ENABLED = parseBooleanEnv(process.env.STALE_FALLBACK_ENABLED, true);
+const GUARANTEE_MIN_RESULTS = Math.max(1, Number(process.env.GUARANTEE_MIN_RESULTS ?? "3"));
+const GUARANTEE_EXTRA_ATTEMPTS = Math.max(1, Number(process.env.GUARANTEE_EXTRA_ATTEMPTS ?? "2"));
+const GUARANTEE_MIN_REMAINING_MS = Math.max(
+  1_000,
+  Number(process.env.GUARANTEE_MIN_REMAINING_MS ?? "1500"),
+);
+const STALE_FALLBACK_MIN_SIMILARITY = Math.min(
+  0.95,
+  Math.max(Number(process.env.STALE_FALLBACK_MIN_SIMILARITY ?? "0.55"), 0.3),
+);
+const ADAPTIVE_VARIANT_SCHEDULER_ENABLED = parseBooleanEnv(process.env.ADAPTIVE_VARIANT_SCHEDULER, true);
+const QUERY_REWRITE_V2_ENABLED = parseBooleanEnv(process.env.QUERY_REWRITE_V2, true);
+const CANONICAL_LEXICAL_SCORING_ENABLED = parseBooleanEnv(process.env.CANONICAL_LEXICAL_SCORING, true);
 
 type ReasonerHealthStatus =
   | "ok"
@@ -215,6 +248,17 @@ function uniqueLimit(values: string[], limit: number): string[] {
     seen.add(normalized);
     output.push(normalized);
     if (output.length >= limit) break;
+  }
+  return output;
+}
+
+function dedupeByUrl<T extends { url: string }>(values: T[]): T[] {
+  const seen = new Set<string>();
+  const output: T[] = [];
+  for (const value of values) {
+    if (seen.has(value.url)) continue;
+    seen.add(value.url);
+    output.push(value);
   }
   return output;
 }
@@ -355,6 +399,13 @@ type PhaseRunResult = {
   propositionSplit: ReturnType<typeof splitByProposition>;
 };
 
+type CanonicalLexicalProfile = {
+  mustIncludeTokens: string[];
+  strictVariantTokens: string[];
+  checklistTokens: string[];
+  contradictionTokens: string[];
+};
+
 async function evaluateCandidates(input: {
   query: string;
   maxResults: number;
@@ -363,6 +414,8 @@ async function evaluateCandidates(input: {
   context: ReturnType<typeof buildIntentProfile>["context"];
   checklist: PropositionChecklist;
   candidates: CaseCandidate[];
+  canonicalLexicalProfile?: CanonicalLexicalProfile;
+  candidateProvenance?: SchedulerResult["carryState"]["candidateProvenance"];
 }): Promise<CandidateEvaluation> {
   const classified = classifyCandidates(input.candidates);
   const verified = await verifyCandidates(classified, input.verifyLimit, {
@@ -372,7 +425,10 @@ async function evaluateCandidates(input: {
   const counts = classificationCounts(postVerify);
 
   const rejectionReasons = postVerify
-    .filter((item) => item.classification.kind !== "case")
+    .filter(
+      (item) =>
+        item.classification.kind === "statute" || item.classification.kind === "noise",
+    )
     .flatMap((item) => item.classification.reasons)
     .reduce<Record<string, number>>((acc, reason) => {
       acc[reason] = (acc[reason] ?? 0) + 1;
@@ -380,7 +436,10 @@ async function evaluateCandidates(input: {
     }, {});
 
   const caseCandidates = postVerify
-    .filter((item) => item.classification.kind === "case")
+    .filter(
+      (item) =>
+        item.classification.kind === "case" || item.classification.kind === "unknown",
+    )
     .map((item) => {
       const { classification, ...candidate } = item;
       void classification;
@@ -391,6 +450,8 @@ async function evaluateCandidates(input: {
   const scoredInput = courtFiltered.length > 0 ? courtFiltered : caseCandidates;
   const scored = scoreCases(input.query, input.context, scoredInput, {
     checklist: input.checklist,
+    canonicalLexicalProfile: input.canonicalLexicalProfile,
+    candidateProvenance: input.candidateProvenance,
   });
   const prioritized = applySupremeCourtPreference(scored);
   const relevant = prioritized.filter(isRelevantCase);
@@ -430,6 +491,7 @@ async function runQualityAwarePhases(input: {
   config: SchedulerConfig;
   provider: RetrievalProvider;
   allowNetworkFetch: boolean;
+  canonicalLexicalProfile?: CanonicalLexicalProfile;
   carryState?: SchedulerResult["carryState"];
   cooldownScope?: string;
   strictStopTarget: number;
@@ -463,6 +525,8 @@ async function runQualityAwarePhases(input: {
     context: input.intent.context,
     checklist: input.checklist,
     candidates: scheduler.candidates,
+    canonicalLexicalProfile: input.canonicalLexicalProfile,
+    candidateProvenance: scheduler.carryState.candidateProvenance,
   });
   let propositionSplit = splitByProposition(evaluation.rankedPool, input.checklist);
   let lastCandidateSignature = `${scheduler.candidates.length}|${scheduler.candidates
@@ -494,6 +558,8 @@ async function runQualityAwarePhases(input: {
         context: input.intent.context,
         checklist: input.checklist,
         candidates: scheduler.candidates,
+        canonicalLexicalProfile: input.canonicalLexicalProfile,
+        candidateProvenance: scheduler.carryState.candidateProvenance,
       });
       propositionSplit = splitByProposition(evaluation.rankedPool, input.checklist);
       lastCandidateSignature = currentCandidateSignature;
@@ -534,14 +600,61 @@ async function runQualityAwarePhases(input: {
   };
 }
 
-function mergeVariants<T extends { phase: string; phrase: string }>(variants: T[]): T[] {
-  const seen = new Set<string>();
-  return variants.filter((variant) => {
+function mergeVariantTokenLists(values: string[] | undefined, fallback: string[] | undefined, max = 24): string[] | undefined {
+  if (!values && !fallback) return undefined;
+  return uniqueLimit([...(values ?? []), ...(fallback ?? [])], max);
+}
+
+function mergeVariants(variants: QueryVariant[]): QueryVariant[] {
+  const merged = new Map<string, QueryVariant>();
+  for (const variant of variants) {
     const key = `${variant.phase}|${variant.phrase.toLowerCase()}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, variant);
+      continue;
+    }
+    const existingPriority = existing.priority ?? 0;
+    const incomingPriority = variant.priority ?? 0;
+    const keepIncoming =
+      incomingPriority > existingPriority ||
+      (incomingPriority === existingPriority &&
+        variant.strictness === "strict" &&
+        existing.strictness !== "strict");
+    const preferred = keepIncoming ? variant : existing;
+    const secondary = keepIncoming ? existing : variant;
+    merged.set(key, {
+      ...preferred,
+      canonicalKey: preferred.canonicalKey ?? secondary.canonicalKey,
+      mustIncludeTokens: mergeVariantTokenLists(preferred.mustIncludeTokens, secondary.mustIncludeTokens, 24),
+      mustExcludeTokens: mergeVariantTokenLists(preferred.mustExcludeTokens, secondary.mustExcludeTokens, 16),
+      providerHints: {
+        compiledQuery:
+          preferred.providerHints?.compiledQuery ?? secondary.providerHints?.compiledQuery,
+        serperQuotedTerms: mergeVariantTokenLists(
+          preferred.providerHints?.serperQuotedTerms,
+          secondary.providerHints?.serperQuotedTerms,
+          6,
+        ),
+        serperCoreTerms: mergeVariantTokenLists(
+          preferred.providerHints?.serperCoreTerms,
+          secondary.providerHints?.serperCoreTerms,
+          8,
+        ),
+        canonicalOrderTerms: mergeVariantTokenLists(
+          preferred.providerHints?.canonicalOrderTerms,
+          secondary.providerHints?.canonicalOrderTerms,
+          18,
+        ),
+        excludeTerms: mergeVariantTokenLists(
+          preferred.providerHints?.excludeTerms,
+          secondary.providerHints?.excludeTerms,
+          12,
+        ),
+      },
+    });
+  }
+  return Array.from(merged.values());
 }
 
 function buildPass2Snippets(cases: ScoredCase[]): string[] {
@@ -580,6 +693,11 @@ export async function runPipelineSearch(input: {
     source: Array<{
       phrase: string;
       searchQuery?: string;
+      canonicalKey?: string;
+      variantPriority?: number;
+      utilityScore?: number;
+      caseLikeRatio?: number;
+      statuteLikeRatio?: number;
       status: number;
       ok: boolean;
       phase: string;
@@ -621,6 +739,9 @@ export async function runPipelineSearch(input: {
       blockedKind?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
       retryAfterMs?: number;
       skippedDuplicates: number;
+      alwaysReturnFallbackUsed?: boolean;
+      alwaysReturnFallbackType?: "none" | "stale_cache" | "synthetic_advisory";
+      alwaysReturnFallbackReason?: string;
       rejectionReasons: Record<string, number>;
     };
   };
@@ -706,11 +827,33 @@ export async function runPipelineSearch(input: {
   const deterministicPlanner = await planDeterministicQueryVariants(intent, activeReasonerPlan);
   let pass2Variants: ReturnType<typeof buildReasonerQueryVariants> = [];
   let traceVariantsUsed: ReturnType<typeof buildTraceQueryVariants> = [];
+  let rewriteVariantsUsed: QueryVariant[] = [];
+  let canonicalIntent: CanonicalIntent | undefined;
+  let queryRewriteApplied = false;
+  let queryRewriteError: string | undefined;
 
   const initialReasonerVariants = activeReasonerPlan
     ? buildReasonerQueryVariants({ intent, plan: activeReasonerPlan })
     : [];
-  const initialVariants = mergeVariants([...initialReasonerVariants, ...deterministicPlanner.variants]);
+  try {
+    if (QUERY_REWRITE_V2_ENABLED) {
+      canonicalIntent = buildCanonicalIntent(intent, activeReasonerPlan);
+      rewriteVariantsUsed = synthesizeRetrievalQueries({
+        canonicalIntent,
+        deterministicPlanner,
+        reasonerVariants: initialReasonerVariants,
+      });
+      queryRewriteApplied = rewriteVariantsUsed.length > 0;
+    }
+  } catch (error) {
+    queryRewriteError = error instanceof Error ? error.message : "query_rewrite_failed";
+    rewriteVariantsUsed = [];
+  }
+  const initialPlannerVariants = mergeVariants([...initialReasonerVariants, ...deterministicPlanner.variants]);
+  const initialVariants = mergeCanonicalRewriteVariants({
+    plannerVariants: initialPlannerVariants,
+    rewriteVariants: rewriteVariantsUsed,
+  });
   let checklist = applyPropositionMode(
     buildPropositionChecklist({
       context: intent.context,
@@ -718,12 +861,35 @@ export async function runPipelineSearch(input: {
       reasonerPlan: activeReasonerPlan,
     }),
   );
+  let canonicalLexicalProfile: CanonicalLexicalProfile | undefined =
+    CANONICAL_LEXICAL_SCORING_ENABLED && canonicalIntent
+      ? {
+          mustIncludeTokens: canonicalIntent.mustIncludeTokens,
+          strictVariantTokens: uniqueLimit(
+            initialVariants
+              .filter((variant) => variant.strictness === "strict")
+              .flatMap((variant) => variant.tokens),
+            64,
+          ),
+          checklistTokens: uniqueLimit(
+            [...checklist.requiredElements, ...checklist.optionalElements].flatMap((value) =>
+              value.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((token) => token.length > 1),
+            ),
+            48,
+          ),
+          contradictionTokens: uniqueLimit(
+            [...checklist.contradictionTerms, ...canonicalIntent.contradictionTerms],
+            24,
+          ),
+        }
+      : undefined;
   let phaseRun = await runQualityAwarePhases({
     variants: initialVariants,
     intent,
     config,
     provider: retrievalProvider,
     allowNetworkFetch,
+    canonicalLexicalProfile,
     cooldownScope: input.cooldownScope,
     strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
     bestEffortStopTarget: PROPOSITION_BEST_EFFORT_STOP_TARGET,
@@ -759,6 +925,7 @@ export async function runPipelineSearch(input: {
           config,
           provider: retrievalProvider,
           allowNetworkFetch,
+          canonicalLexicalProfile,
           carryState: scheduler.carryState,
           cooldownScope: input.cooldownScope,
           strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
@@ -838,16 +1005,61 @@ export async function runPipelineSearch(input: {
           reasonerPlan: activeReasonerPlan,
         }),
       );
-      pass2Variants = buildReasonerQueryVariants({
+      const pass2ReasonerVariants = buildReasonerQueryVariants({
         intent,
         plan: activeReasonerPlan,
       });
+      pass2Variants = pass2ReasonerVariants;
+      if (QUERY_REWRITE_V2_ENABLED) {
+        try {
+          canonicalIntent = buildCanonicalIntent(intent, activeReasonerPlan);
+          const pass2RewriteVariants = synthesizeRetrievalQueries({
+            canonicalIntent,
+            deterministicPlanner,
+            reasonerVariants: pass2ReasonerVariants,
+          });
+          if (pass2RewriteVariants.length > 0) {
+            rewriteVariantsUsed = mergeVariants([...rewriteVariantsUsed, ...pass2RewriteVariants]);
+            pass2Variants = mergeCanonicalRewriteVariants({
+              plannerVariants: pass2Variants,
+              rewriteVariants: pass2RewriteVariants,
+            });
+            queryRewriteApplied = true;
+          }
+        } catch (error) {
+          if (!queryRewriteError) {
+            queryRewriteError = error instanceof Error ? error.message : "query_rewrite_pass2_failed";
+          }
+        }
+      }
+      if (CANONICAL_LEXICAL_SCORING_ENABLED && canonicalIntent) {
+        canonicalLexicalProfile = {
+          mustIncludeTokens: canonicalIntent.mustIncludeTokens,
+          strictVariantTokens: uniqueLimit(
+            pass2Variants
+              .filter((variant) => variant.strictness === "strict")
+              .flatMap((variant) => variant.tokens),
+            64,
+          ),
+          checklistTokens: uniqueLimit(
+            [...checklist.requiredElements, ...checklist.optionalElements].flatMap((value) =>
+              value.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((token) => token.length > 1),
+            ),
+            48,
+          ),
+          contradictionTokens: uniqueLimit(
+            [...checklist.contradictionTerms, ...canonicalIntent.contradictionTerms],
+            24,
+          ),
+        };
+      }
       phaseRun = await runQualityAwarePhases({
         variants: mergeVariants(pass2Variants),
         intent,
         config,
         provider: retrievalProvider,
         allowNetworkFetch,
+        canonicalLexicalProfile,
         carryState: scheduler.carryState,
         cooldownScope: input.cooldownScope,
         strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
@@ -866,6 +1078,99 @@ export async function runPipelineSearch(input: {
     }
   }
 
+  let guaranteeTriggered = false;
+  let guaranteeAttemptsUsed = 0;
+  let guaranteeSource: "live" | "stale_cache" | "synthetic" | "none" = "none";
+  let guaranteeUsed = false;
+  let staleFallbackUsed = false;
+  let staleFallbackSignatureLevel: "exact" | "full" | "medium" | "broad" | undefined;
+  let syntheticFallbackUsed = false;
+  let syntheticFallbackReason: string | undefined;
+  let syntheticFallbackBuildError: string | undefined;
+  let alwaysReturnFallbackType: "none" | "stale_cache" | "synthetic_advisory" = "none";
+  let alwaysReturnFallbackReason: string | undefined;
+  let guaranteeBackfillVariantsUsed: QueryVariant[] = [];
+
+  if (ALWAYS_RETURN_V1_ENABLED && scheduler.stopReason !== "blocked") {
+    const provisionalExactStrict = PROPOSITION_V41_ENABLED
+      ? propositionSplit.exactStrict.slice(0, input.maxResults)
+      : propositionSplit.exact.slice(0, input.maxResults);
+    const provisionalExactProvisional = PROPOSITION_V41_ENABLED
+      ? propositionSplit.exactProvisional.slice(0, input.maxResults)
+      : [];
+    const provisionalExploratory = propositionSplit.nearMiss.slice(0, NEAR_MISS_MAX_RESULTS);
+    const provisionalTotal =
+      provisionalExactStrict.length + provisionalExactProvisional.length + provisionalExploratory.length;
+    const remainingMsForGuarantee = Math.max(
+      0,
+      config.maxElapsedMs - (Date.now() - scheduler.carryState.startedAtMs),
+    );
+
+    if (provisionalTotal < GUARANTEE_MIN_RESULTS && remainingMsForGuarantee >= GUARANTEE_MIN_REMAINING_MS) {
+      guaranteeTriggered = true;
+      guaranteeUsed = true;
+      guaranteeSource = "live";
+
+      const attemptsBeforeGuarantee = scheduler.carryState.attemptsUsed;
+      const guaranteePhrases = uniqueLimit(
+        [
+          ...(
+            await planAIFailoverQueryVariants(intent, deterministicPlanner.keywordPack, activeReasonerPlan)
+          ).variants
+            .filter((variant) => variant.strictness === "relaxed")
+            .map((variant) => variant.phrase),
+          ...deterministicPlanner.variants
+            .filter((variant) => variant.strictness === "relaxed")
+            .map((variant) => variant.phrase),
+          ...ontologyTemplatesForContext(intent.context),
+          ...(activeReasonerPlan?.query_variants_broad ?? []),
+          ...(activeReasonerPlan?.case_anchors ?? []),
+          ...intent.issues,
+          ...intent.procedures,
+          ...intent.statutes,
+        ],
+        32,
+      );
+
+      const guaranteeVariants = buildGuaranteeBackfillVariants({
+        intent,
+        phrases: guaranteePhrases,
+        reasonerPlan: activeReasonerPlan,
+        maxVariants: Math.min(6, GUARANTEE_EXTRA_ATTEMPTS * 3),
+      });
+
+      if (guaranteeVariants.length > 0) {
+        guaranteeBackfillVariantsUsed = mergeVariants(guaranteeVariants);
+        const guaranteeConfig: SchedulerConfig = {
+          ...config,
+          globalBudget: Math.max(config.globalBudget, attemptsBeforeGuarantee + GUARANTEE_EXTRA_ATTEMPTS),
+        };
+        phaseRun = await runQualityAwarePhases({
+          variants: guaranteeBackfillVariantsUsed,
+          intent,
+          config: guaranteeConfig,
+          provider: retrievalProvider,
+          allowNetworkFetch,
+          canonicalLexicalProfile,
+          carryState: scheduler.carryState,
+          cooldownScope: input.cooldownScope,
+          strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
+          bestEffortStopTarget: PROPOSITION_BEST_EFFORT_STOP_TARGET,
+          query: input.query,
+          maxResults: input.maxResults,
+          checklist,
+        });
+        scheduler = phaseRun.scheduler;
+        evaluation = phaseRun.evaluation;
+        propositionSplit = phaseRun.propositionSplit;
+        qualifiedProvisionals = qualifiedProvisionalCount(propositionSplit.exactProvisional);
+        qualifiedExactTotal = propositionSplit.strictExactCount + qualifiedProvisionals;
+        config = guaranteeConfig;
+      }
+      guaranteeAttemptsUsed = Math.max(0, scheduler.carryState.attemptsUsed - attemptsBeforeGuarantee);
+    }
+  }
+
   const casesExactStrict = PROPOSITION_V41_ENABLED
     ? propositionSplit.exactStrict.slice(0, input.maxResults)
     : propositionSplit.exact.slice(0, input.maxResults);
@@ -875,10 +1180,107 @@ export async function runPipelineSearch(input: {
   const casesExact = PROPOSITION_V41_ENABLED
     ? [...casesExactStrict, ...casesExactProvisional].slice(0, input.maxResults)
     : propositionSplit.exact.slice(0, input.maxResults);
-  const casesNearMiss: NearMissCase[] = PROPOSITION_V41_ENABLED
-    ? propositionSplit.nearMiss.slice(0, NEAR_MISS_MAX_RESULTS)
-    : propositionSplit.nearMiss.slice(0, NEAR_MISS_MAX_RESULTS);
-  const allVariants = mergeVariants([...initialVariants, ...pass2Variants, ...traceVariantsUsed]);
+  let casesExploratory: NearMissCase[] = propositionSplit.nearMiss.slice(0, NEAR_MISS_MAX_RESULTS);
+  let casesNearMiss: NearMissCase[] = [...casesExploratory];
+
+  if (guaranteeTriggered && guaranteeSource === "live" && casesExploratory.length > 0) {
+    casesExploratory = casesExploratory.map((item) => ({
+      ...item,
+      retrievalTier: "exploratory",
+      fallbackReason: "guarantee_backfill",
+      gapSummary: item.gapSummary ?? item.missingElements,
+    }));
+    casesNearMiss = [...casesExploratory];
+  }
+
+  if (
+    ALWAYS_RETURN_V1_ENABLED &&
+    STALE_FALLBACK_ENABLED &&
+    (scheduler.stopReason === "blocked" || (casesExact.length === 0 && casesExploratory.length === 0))
+  ) {
+    const staleRecall = await lookupFallbackRecallEntry({
+      query: input.query,
+      actors: intent.actors,
+      procedures: intent.procedures,
+      statutes: intent.statutes,
+      issues: intent.issues,
+      domains: intent.domains,
+      maxCases: GUARANTEE_MIN_RESULTS,
+      minSimilarity: STALE_FALLBACK_MIN_SIMILARITY,
+    });
+    if (staleRecall && staleRecall.cases.length > 0) {
+      staleFallbackUsed = true;
+      staleFallbackSignatureLevel = staleRecall.signatureLevel;
+      casesExploratory = staleRecall.cases.slice(0, NEAR_MISS_MAX_RESULTS);
+      casesNearMiss = [...casesExploratory];
+      guaranteeUsed = true;
+      guaranteeSource = "stale_cache";
+      alwaysReturnFallbackType = "stale_cache";
+      alwaysReturnFallbackReason = `stale_cache_similarity:${staleRecall.signatureLevel}`;
+    }
+  }
+
+  const shouldInjectSynthetic = shouldInjectSyntheticFallback({
+    alwaysReturnEnabled: ALWAYS_RETURN_V1_ENABLED,
+    syntheticFallbackEnabled: ALWAYS_RETURN_SYNTHETIC_FALLBACK_ENABLED,
+    casesExactCount: casesExact.length,
+    casesExploratoryCount: casesExploratory.length,
+  });
+  if (shouldInjectSynthetic) {
+    try {
+      const synthetic = buildSyntheticAdvisoryNearMiss({
+        query: input.query,
+        intent,
+        checklist,
+        schedulerStopReason: scheduler.stopReason,
+        blockedKind: scheduler.blockedKind,
+        queryRewrite: {
+          applied: queryRewriteApplied,
+          error: queryRewriteError,
+          canonicalMustIncludeTokens: canonicalIntent?.mustIncludeTokens.slice(0, 8),
+          strictVariantPhrases: rewriteVariantsUsed
+            .filter((variant) => variant.strictness === "strict")
+            .map((variant) => variant.phrase)
+            .slice(0, 3),
+        },
+      });
+      syntheticFallbackUsed = true;
+      syntheticFallbackReason = synthetic.reason;
+      alwaysReturnFallbackType = "synthetic_advisory";
+      alwaysReturnFallbackReason = synthetic.reason;
+      casesExploratory = [synthetic.item];
+      casesNearMiss = [synthetic.item];
+      guaranteeUsed = true;
+      guaranteeSource = "synthetic";
+    } catch (error) {
+      syntheticFallbackBuildError = error instanceof Error ? error.message : "synthetic_fallback_build_failed";
+    }
+  }
+
+  const tierCounts = {
+    exactStrict: casesExactStrict.length,
+    exactProvisional: casesExactProvisional.length,
+    exploratory: casesExploratory.length,
+  };
+  const guaranteeMet =
+    tierCounts.exactStrict + tierCounts.exactProvisional + tierCounts.exploratory >= GUARANTEE_MIN_RESULTS;
+
+  const allVariants = mergeVariants([
+    ...initialVariants,
+    ...pass2Variants,
+    ...traceVariantsUsed,
+    ...guaranteeBackfillVariantsUsed,
+  ]);
+  const rewriteStrictCount = rewriteVariantsUsed.filter((variant) => variant.strictness === "strict").length;
+  const rewriteBroadCount = Math.max(0, rewriteVariantsUsed.length - rewriteStrictCount);
+  const variantUtilityEntries = Object.entries(scheduler.carryState.variantUtility ?? {});
+  const variantUtilityTop = variantUtilityEntries
+    .map(([canonicalKey, snapshot]) => ({
+      canonicalKey,
+      ...snapshot,
+    }))
+    .sort((left, right) => right.meanUtility - left.meanUtility)
+    .slice(0, 6);
   const variantLookup = new Map(allVariants.map((variant) => [variant.id, variant]));
   const selectedVariants = scheduler.attempts
     .map((attempt) => {
@@ -993,6 +1395,24 @@ export async function runPipelineSearch(input: {
       `Reasoner timeout recovery used ${timeoutRecoveryMode} with expanded deterministic budget (+${EXTENDED_DETERMINISTIC_BUDGET_BONUS}).`,
     );
   }
+  if (QUERY_REWRITE_V2_ENABLED) {
+    if (queryRewriteApplied) {
+      notes.push(
+        `Canonical query rewrite V2 generated ${rewriteVariantsUsed.length} variants (${rewriteStrictCount} strict, ${rewriteBroadCount} broad).`,
+      );
+    } else if (queryRewriteError) {
+      notes.push(`Canonical query rewrite degraded to planner defaults (${queryRewriteError}).`);
+    } else {
+      notes.push("Canonical query rewrite V2 enabled with zero additional variants for this query.");
+    }
+  } else {
+    notes.push("Canonical query rewrite V2 disabled via QUERY_REWRITE_V2=0.");
+  }
+  if (CANONICAL_LEXICAL_SCORING_ENABLED) {
+    notes.push("Canonical lexical scoring blend is active.");
+  } else {
+    notes.push("Canonical lexical scoring blend disabled via CANONICAL_LEXICAL_SCORING=0.");
+  }
 
   if (pass2Invoked) {
     if (reasonerPass2Error) {
@@ -1000,6 +1420,14 @@ export async function runPipelineSearch(input: {
     } else {
       notes.push("Conditional Opus pass-2 refinement executed to tighten proposition matching.");
     }
+  }
+  if (guaranteeTriggered) {
+    notes.push(
+      `Always-return guarantee pass triggered (extra attempts used: ${guaranteeAttemptsUsed}).`,
+    );
+  }
+  if (syntheticFallbackBuildError) {
+    notes.push(`Synthetic always-return fallback generation failed (${syntheticFallbackBuildError}).`);
   }
 
   if (scheduler.stopReason === "blocked") {
@@ -1033,7 +1461,15 @@ export async function runPipelineSearch(input: {
       `Best-effort exact mode retained ${casesExactProvisional.length} provisional matches (confidence-capped to MEDIUM by policy).`,
     );
   }
-  if (casesExact.length === 0 && casesNearMiss.length > 0) {
+  if (staleFallbackUsed) {
+    notes.push(
+      `Served stale exploratory fallback from similarity-matched cache (${staleFallbackSignatureLevel ?? "unknown"} signature).`,
+    );
+  } else if (syntheticFallbackUsed) {
+    notes.push(
+      `Served synthetic advisory fallback because ${syntheticFallbackReason ?? "retrieval returned no verifiable candidates"}.`,
+    );
+  } else if (casesExact.length === 0 && casesNearMiss.length > 0) {
     notes.push("No exact proposition matches were found; near misses are shown separately with missing elements.");
   } else if (casesExact.length === 0 && scheduler.stopReason !== "blocked") {
     notes.push("No court-filtered exact matches found. Refine facts or add legal sections in the query.");
@@ -1049,6 +1485,18 @@ export async function runPipelineSearch(input: {
         propositionSplit.exactProvisional,
       )}).`,
     );
+  }
+  if (ALWAYS_RETURN_V1_ENABLED) {
+    if (guaranteeMet) {
+      notes.push(`Tiered guarantee met (target=${GUARANTEE_MIN_RESULTS}).`);
+    } else if (guaranteeUsed) {
+      notes.push(`Tiered guarantee attempted but below target (target=${GUARANTEE_MIN_RESULTS}).`);
+    }
+    if (ALWAYS_RETURN_SYNTHETIC_FALLBACK_ENABLED && syntheticFallbackUsed) {
+      notes.push("Synthetic always-return fallback injected one advisory exploratory result.");
+    } else if (!ALWAYS_RETURN_SYNTHETIC_FALLBACK_ENABLED) {
+      notes.push("Synthetic always-return fallback disabled via ALWAYS_RETURN_SYNTHETIC_FALLBACK=0.");
+    }
   }
 
   const phaseCounts = allVariants.reduce<Record<string, number>>((acc, variant) => {
@@ -1073,14 +1521,21 @@ export async function runPipelineSearch(input: {
   const cooldownSkipCount = scheduler.attempts.filter((attempt) => attempt.cooldownActive === true).length;
   const noMatchCount = scheduler.attempts.filter((attempt) => /no matching results/i.test(attempt.htmlPreview ?? "")).length;
   const successCount = successfulAttemptsCount;
-  const effectiveBlockedState = scheduler.stopReason === "blocked" && successCount === 0;
-  const responseStatus: SearchResponse["status"] = effectiveBlockedState
+  const effectiveBlockedState = scheduler.stopReason === "blocked" && successCount === 0 && !staleFallbackUsed;
+  const responseStatus: SearchResponse["status"] = staleFallbackUsed
+    ? "partial"
+    : syntheticFallbackUsed
+      ? syntheticFallbackStatus(scheduler.stopReason)
+    : effectiveBlockedState
     ? "blocked"
     : partialDueToLatency || (scheduler.stopReason === "blocked" && successCount > 0)
       ? "partial"
-      : casesExact.length === 0
+      : casesExact.length === 0 && casesExploratory.length === 0
         ? "no_match"
         : "completed";
+  const partialRun =
+    partialDueToLatency || (scheduler.stopReason === "blocked" && successCount > 0) || staleFallbackUsed;
+  const insightsCases = casesExact.length > 0 ? casesExact : casesExploratory;
 
   const response: SearchResponse = {
     requestId: input.requestId,
@@ -1090,7 +1545,7 @@ export async function runPipelineSearch(input: {
     executionPath: "server_only",
     clientDirectAttempted: false,
     clientDirectSucceeded: false,
-    partialRun: partialDueToLatency || (scheduler.stopReason === "blocked" && successCount > 0),
+    partialRun,
     query: input.query,
     context: intent.context,
     proposition: {
@@ -1143,6 +1598,14 @@ export async function runPipelineSearch(input: {
     casesExactStrict,
     casesExactProvisional,
     casesNearMiss,
+    casesExploratory,
+    tierCounts,
+    guarantee: {
+      target: ALWAYS_RETURN_V1_ENABLED ? GUARANTEE_MIN_RESULTS : 0,
+      met: ALWAYS_RETURN_V1_ENABLED ? guaranteeMet : false,
+      used: ALWAYS_RETURN_V1_ENABLED ? guaranteeUsed : false,
+      source: ALWAYS_RETURN_V1_ENABLED && guaranteeUsed ? guaranteeSource : "none",
+    },
     reasoning: {
       mode: reasonerPass1.telemetry.mode,
       cacheHit: reasonerPass1.telemetry.cacheHit,
@@ -1151,7 +1614,7 @@ export async function runPipelineSearch(input: {
     },
     insights: buildSearchInsights({
       context: intent.context,
-      cases: casesExact,
+      cases: insightsCases,
       totalFetched: scheduler.candidates.length,
       filteredCount: evaluation.courtFilteredCount,
     }),
@@ -1191,6 +1654,16 @@ export async function runPipelineSearch(input: {
         strictVariantsPreservedAllGroups: deterministicPlanner.strictVariantsPreservedAllGroups,
         timeoutRecoveryMode,
         extendedDeterministicUsed,
+        queryRewrite: {
+          enabled: QUERY_REWRITE_V2_ENABLED,
+          applied: queryRewriteApplied,
+          error: queryRewriteError,
+          variantCount: rewriteVariantsUsed.length,
+          strictVariantCount: rewriteStrictCount,
+          broadVariantCount: rewriteBroadCount,
+          canonicalMustIncludeCount: canonicalIntent?.mustIncludeTokens.length ?? 0,
+          canonicalMustExcludeCount: canonicalIntent?.mustExcludeTokens.length ?? 0,
+        },
         variantCount: allVariants.length,
         phaseCounts,
         proposition: {
@@ -1212,6 +1685,10 @@ export async function runPipelineSearch(input: {
         retryAfterMs: scheduler.retryAfterMs,
         partialDueToLatency,
         elapsedMs,
+        adaptiveVariantSchedulerEnabled: ADAPTIVE_VARIANT_SCHEDULER_ENABLED,
+        guaranteeTriggered,
+        guaranteeAttemptsUsed,
+        guaranteeMet,
       },
       retrieval: {
         providerId: retrievalProvider.id,
@@ -1224,6 +1701,15 @@ export async function runPipelineSearch(input: {
         cooldownSkipCount,
         timeoutCount,
         fetchTimeoutMsUsed,
+        variantUtility: {
+          trackedKeys: variantUtilityEntries.length,
+          topKeys: variantUtilityTop,
+        },
+        staleFallbackUsed,
+        staleFallbackSignatureLevel,
+        alwaysReturnFallbackUsed: staleFallbackUsed || syntheticFallbackUsed,
+        alwaysReturnFallbackType,
+        alwaysReturnFallbackReason,
       },
       classification: {
         counts: evaluation.counts,
@@ -1235,7 +1721,7 @@ export async function runPipelineSearch(input: {
         highConfidenceEligibleCount: propositionSplit.highConfidenceEligibleCount,
         strictOnlyHighConfidence: true,
         cacheReplayGuardApplied: false,
-        nearMissCount: propositionSplit.nearMissCount,
+        nearMissCount: casesExploratory.length,
         missingElementBreakdown: propositionSplit.missingElementBreakdown,
         coreFailureBreakdown: propositionSplit.coreFailureBreakdown,
         chainMandatoryFailureBreakdown: propositionSplit.chainMandatoryFailureBreakdown,
@@ -1265,6 +1751,37 @@ export async function runPipelineSearch(input: {
     },
   };
 
+  if (
+    ALWAYS_RETURN_V1_ENABLED &&
+    STALE_FALLBACK_ENABLED &&
+    !staleFallbackUsed &&
+    !syntheticFallbackUsed &&
+    responseStatus !== "blocked" &&
+    (tierCounts.exactStrict + tierCounts.exactProvisional + tierCounts.exploratory > 0)
+  ) {
+    try {
+      await saveFallbackRecallEntry({
+        query: input.query,
+        actors: intent.actors,
+        procedures: intent.procedures,
+        statutes: intent.statutes,
+        issues: intent.issues,
+        domains: intent.domains,
+        cases: dedupeByUrl([
+          ...casesExactStrict,
+          ...casesExactProvisional,
+          ...casesExploratory,
+        ]),
+        tierCounts,
+      });
+    } catch (error) {
+      console.warn(
+        `[search:${input.requestId}] fallback_recall_cache_write_failed`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
   if (!input.debugEnabled) {
     return { response };
   }
@@ -1292,6 +1809,11 @@ export async function runPipelineSearch(input: {
       source: scheduler.attempts.map((attempt) => ({
         phrase: attempt.phrase,
         searchQuery: attempt.searchQuery,
+        canonicalKey: attempt.canonicalKey,
+        variantPriority: attempt.variantPriority,
+        utilityScore: attempt.utilityScore,
+        caseLikeRatio: attempt.caseLikeRatio,
+        statuteLikeRatio: attempt.statuteLikeRatio,
         status: attempt.status,
         ok: attempt.ok,
         phase: attempt.phase,
@@ -1333,6 +1855,9 @@ export async function runPipelineSearch(input: {
         blockedKind: scheduler.blockedKind,
         retryAfterMs: scheduler.retryAfterMs,
         skippedDuplicates: scheduler.skippedDuplicates,
+        alwaysReturnFallbackUsed: staleFallbackUsed || syntheticFallbackUsed,
+        alwaysReturnFallbackType,
+        alwaysReturnFallbackReason,
         rejectionReasons: evaluation.rejectionReasons,
       },
     },

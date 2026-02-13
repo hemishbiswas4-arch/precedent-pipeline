@@ -7,6 +7,7 @@ export type PipelineStopReason =
   | "completed";
 
 export type ConfidenceBand = "VERY_HIGH" | "HIGH" | "MEDIUM" | "LOW";
+export type RetrievalTier = "exact_strict" | "exact_provisional" | "exploratory";
 
 export type SearchInsights = {
   summary: string;
@@ -97,6 +98,9 @@ export type ScoredCase = CaseCandidate & {
   rankingScore?: number;
   confidenceScore?: number;
   confidenceBand?: ConfidenceBand;
+  retrievalTier?: RetrievalTier;
+  fallbackReason?: "guarantee_backfill" | "stale_cache" | "synthetic_advisory" | "none";
+  gapSummary?: string[];
   exactnessType?: "strict" | "provisional";
   missingCoreElements?: string[];
   missingMandatorySteps?: string[];
@@ -175,6 +179,18 @@ export type SearchResponse = {
   casesExactStrict?: ScoredCase[];
   casesExactProvisional?: ScoredCase[];
   casesNearMiss?: NearMissCase[];
+  casesExploratory?: NearMissCase[];
+  tierCounts?: {
+    exactStrict: number;
+    exactProvisional: number;
+    exploratory: number;
+  };
+  guarantee?: {
+    target: number;
+    met: boolean;
+    used: boolean;
+    source: "live" | "stale_cache" | "synthetic" | "none";
+  };
   reasoning?: SearchReasoning;
   insights?: SearchInsights;
   notes: string[];
@@ -225,6 +241,16 @@ export type SearchResponse = {
       strictVariantsPreservedAllGroups?: boolean;
       timeoutRecoveryMode?: string;
       extendedDeterministicUsed?: boolean;
+      queryRewrite?: {
+        enabled: boolean;
+        applied: boolean;
+        error?: string;
+        variantCount: number;
+        strictVariantCount: number;
+        broadVariantCount: number;
+        canonicalMustIncludeCount: number;
+        canonicalMustExcludeCount: number;
+      };
       variantCount: number;
       phaseCounts: Record<string, number>;
       proposition?: {
@@ -253,6 +279,10 @@ export type SearchResponse = {
       retryAfterMs?: number;
       partialDueToLatency?: boolean;
       elapsedMs?: number;
+      adaptiveVariantSchedulerEnabled?: boolean;
+      guaranteeTriggered?: boolean;
+      guaranteeAttemptsUsed?: number;
+      guaranteeMet?: boolean;
     };
     retrieval: {
       providerId?: "indiankanoon_html" | "serper";
@@ -265,6 +295,25 @@ export type SearchResponse = {
       cooldownSkipCount?: number;
       timeoutCount?: number;
       fetchTimeoutMsUsed?: number;
+      variantUtility?: {
+        trackedKeys: number;
+        topKeys: Array<{
+          canonicalKey: string;
+          attempts: number;
+          meanUtility: number;
+          caseLikeRate: number;
+          statuteLikeRate: number;
+          challengeRate: number;
+          timeoutRate: number;
+          lastStatus?: number;
+          updatedAtMs: number;
+        }>;
+      };
+      staleFallbackUsed?: boolean;
+      staleFallbackSignatureLevel?: "exact" | "full" | "medium" | "broad";
+      alwaysReturnFallbackUsed?: boolean;
+      alwaysReturnFallbackType?: "none" | "stale_cache" | "synthetic_advisory";
+      alwaysReturnFallbackReason?: string;
     };
       classification: {
         counts: Record<CandidateKind, number>;

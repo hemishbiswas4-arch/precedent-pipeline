@@ -274,9 +274,12 @@ const PROVISIONAL_CONFIDENCE_CAP = Math.min(
   0.8,
   Math.max(Number(process.env.PROVISIONAL_CONFIDENCE_CAP ?? "0.70"), 0.45),
 );
-const NEARMISS_CONFIDENCE_CAP = Math.min(
-  0.65,
-  Math.max(Number(process.env.NEARMISS_CONFIDENCE_CAP ?? "0.50"), 0.3),
+const EXPLORATORY_CONFIDENCE_CAP = Math.min(
+  0.55,
+  Math.max(
+    Number(process.env.EXPLORATORY_CONFIDENCE_CAP ?? process.env.NEARMISS_CONFIDENCE_CAP ?? "0.45"),
+    0.3,
+  ),
 );
 
 function unique(values: string[]): string[] {
@@ -736,6 +739,10 @@ function confidenceBand(score: number): "VERY_HIGH" | "HIGH" | "MEDIUM" | "LOW" 
   return "LOW";
 }
 
+function exploratoryConfidenceBand(score: number): "MEDIUM" | "LOW" {
+  return score >= 0.4 ? "MEDIUM" : "LOW";
+}
+
 function isStrictHighConfidenceEligible(input: { caseItem: ScoredCase; result: PropositionGateResult }): boolean {
   return (
     input.result.match === "exact_strict" &&
@@ -786,7 +793,7 @@ function calibrateConfidence(input: {
       : input.result.match === "exact_provisional"
         ? PROVISIONAL_CONFIDENCE_CAP
         : input.result.match === "near_miss"
-          ? NEARMISS_CONFIDENCE_CAP
+          ? EXPLORATORY_CONFIDENCE_CAP
           : 0.5;
   const highEligible = isStrictHighConfidenceEligible(input);
   if (STRICT_HIGH_CONFIDENCE_ONLY && !highEligible) {
@@ -800,6 +807,34 @@ function calibrateConfidence(input: {
     score: Number(capped.toFixed(3)),
     saturationPrevented: confidence > cap,
   };
+}
+
+function hasMinimumExploratorySignal(input: {
+  caseItem: ScoredCase;
+  result: PropositionGateResult;
+}): boolean {
+  const relevanceMatched =
+    input.caseItem.verification.issuesMatched +
+      input.caseItem.verification.proceduresMatched +
+      input.caseItem.verification.anchorsMatched >=
+    2;
+  return (
+    input.result.requiredCoverage >= 0.25 ||
+    input.result.coreCoverage >= 0.25 ||
+    relevanceMatched
+  );
+}
+
+function isExploratoryEligible(input: {
+  caseItem: ScoredCase;
+  result: PropositionGateResult;
+}): boolean {
+  return (
+    !input.result.contradiction &&
+    !input.result.polarityMismatch &&
+    (input.caseItem.court === "SC" || input.caseItem.court === "HC") &&
+    hasMinimumExploratorySignal(input)
+  );
 }
 
 function buildUnverifiedChecklist(checklist: PropositionChecklist): PropositionChecklist {
@@ -1319,11 +1354,13 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
   for (const item of rankedCases) {
     const result = gateCandidateAgainstProposition(item, checklist);
     const calibrated = calibrateConfidence({ caseItem: item, result });
+    const exploratoryScore = Math.min(calibrated.score, EXPLORATORY_CONFIDENCE_CAP);
     const enriched = {
       ...item,
       score: calibrated.score,
       confidenceScore: calibrated.score,
       confidenceBand: confidenceBand(calibrated.score),
+      fallbackReason: "none" as const,
       exactnessType:
         result.match === "exact_strict"
           ? ("strict" as const)
@@ -1353,10 +1390,12 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
       exactStrict.push({
         ...enriched,
         exactnessType: "strict",
+        retrievalTier: "exact_strict",
       });
       exact.push({
         ...enriched,
         exactnessType: "strict",
+        retrievalTier: "exact_strict",
       });
       continue;
     }
@@ -1365,22 +1404,29 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
       exactProvisional.push({
         ...enriched,
         exactnessType: "provisional",
+        retrievalTier: "exact_provisional",
       });
       exact.push({
         ...enriched,
         exactnessType: "provisional",
+        retrievalTier: "exact_provisional",
       });
       continue;
     }
 
-    if (result.match === "near_miss") {
+    if (result.match === "near_miss" && isExploratoryEligible({ caseItem: item, result })) {
       nearMiss.push({
         ...enriched,
+        score: exploratoryScore,
+        confidenceScore: exploratoryScore,
+        confidenceBand: exploratoryConfidenceBand(exploratoryScore),
+        retrievalTier: "exploratory",
         missingElements: result.missingElements,
         missingCoreElements: result.missingCoreElements,
+        gapSummary: result.missingElements,
       });
     } else if (
-      !result.contradiction &&
+      isExploratoryEligible({ caseItem: item, result }) &&
       !item.verification.detailChecked &&
       (result.requiredCoverage >= 0.25 ||
         result.coreCoverage >= 0.2 ||
@@ -1434,8 +1480,15 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
       .slice(0, Math.min(8, rankedCases.length))
       .map((entry) => ({
         ...entry.enriched,
+        score: Math.min(entry.enriched.confidenceScore ?? entry.enriched.score, EXPLORATORY_CONFIDENCE_CAP),
+        confidenceScore: Math.min(entry.enriched.confidenceScore ?? entry.enriched.score, EXPLORATORY_CONFIDENCE_CAP),
+        confidenceBand: exploratoryConfidenceBand(
+          Math.min(entry.enriched.confidenceScore ?? entry.enriched.score, EXPLORATORY_CONFIDENCE_CAP),
+        ),
+        retrievalTier: "exploratory" as const,
         missingElements: entry.missingElements,
         missingCoreElements: entry.missingCoreElements,
+        gapSummary: entry.missingElements,
       }));
 
     nearMiss.push(...fallbackNearMisses);

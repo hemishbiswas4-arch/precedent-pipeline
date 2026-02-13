@@ -1,0 +1,42 @@
+[
+  {
+    "id": "q1_condonation_refused_state_appeal",
+    "query": "State criminal appeal dismissed as time barred after delay condonation was refused under Section 5 of the Limitation Act.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": ["section 5 limitation act"]
+    }
+  },
+  {
+    "id": "q2_sanction_interaction",
+    "query": "Whether prosecution for disproportionate assets requires sanction under Section 197 CrPC read with Section 19 of the Prevention of Corruption Act.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": ["section 197 crpc", "section 19 prevention of corruption act"]
+    }
+  },
+  {
+    "id": "q3_sanction_not_required",
+    "query": "Find cases where prior sanction under Section 197 CrPC was held not required for prosecution under the PC Act.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": ["section 197 crpc", "pc act"]
+    }
+  },
+  {
+    "id": "q4_quash",
+    "query": "Can criminal proceedings be quashed under Section 482 CrPC when allegations are purely civil in nature?",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": ["section 482 crpc"]
+    }
+  },
+  {
+    "id": "q5_limitation_barred",
+    "query": "Appeal by the prosecution rejected as barred by limitation because condonation of delay application failed.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": ["limitation act"]
+    }
+  }
+]
