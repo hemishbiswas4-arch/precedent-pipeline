@@ -213,6 +213,10 @@ export type SearchResponse = {
       reasonerStage?: "sketch" | "expand" | "pass2" | "skipped";
       reasonerStageLatencyMs?: Record<string, number>;
       reasonerPlanSource?: "llm_sketch+deterministic_expand" | "deterministic_only";
+      reasonerGroundingApplied?: boolean;
+      reasonerGroundingDroppedOutcome?: boolean;
+      reasonerGroundingDroppedHooks?: number;
+      reasonerGroundingVariantPrunedCount?: number;
       pass1Invoked?: boolean;
       pass2Invoked?: boolean;
       pass2Reason?: string;

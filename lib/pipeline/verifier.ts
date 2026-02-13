@@ -25,6 +25,14 @@ const VERIFY_DETAIL_CACHE_TTL_MS = Math.max(
   60_000,
   Math.min(Number(process.env.VERIFY_DETAIL_CACHE_TTL_MS ?? "300000"), 1_800_000),
 );
+const VERIFY_DETAIL_TRANSIENT_RETRIES = Math.max(
+  0,
+  Math.min(Number(process.env.VERIFY_DETAIL_TRANSIENT_RETRIES ?? "1"), 2),
+);
+const VERIFY_DETAIL_TRANSIENT_RETRY_BACKOFF_MS = Math.max(
+  120,
+  Math.min(Number(process.env.VERIFY_DETAIL_TRANSIENT_RETRY_BACKOFF_MS ?? "260"), 1_200),
+);
 const DETAIL_HYBRID_FALLBACK_ENABLED = (process.env.DETAIL_HYBRID_FALLBACK_ENABLED ?? "1") !== "0";
 const DETAIL_HYBRID_FALLBACK_TOP_N = Math.max(
   1,
@@ -88,6 +96,10 @@ const detailCacheByUrl = new Map<string, CachedDetail>();
 const detailCacheByDocId = new Map<string, CachedDetail>();
 const detailFailureCacheByUrl = new Map<string, CachedDetailFailure>();
 const detailFailureCacheByDocId = new Map<string, CachedDetailFailure>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function extractDocIdFromUrl(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -207,6 +219,14 @@ function mapDetailFetchErrorCode(error: unknown): DetailHydrationErrorCode {
   if (/detail_parse_empty|empty detail|no evidence windows/.test(message)) return "parse_empty";
   if (/network|fetch failed|econn|enotfound|socket|dns/.test(message)) return "network";
   return "unknown";
+}
+
+function isTransientDetailErrorCode(code: DetailHydrationErrorCode): boolean {
+  return code === "timeout" || code === "network";
+}
+
+function isCacheableDetailFailure(code: DetailHydrationErrorCode): boolean {
+  return code === "http_403" || code === "http_429" || code === "parse_empty";
 }
 
 function preferKnownCourt(primary: CourtLevel | undefined, fallback: CourtLevel): CourtLevel {
@@ -421,6 +441,9 @@ function cacheDetailFailure(
   attemptedUrls: string[],
   errorCode: DetailHydrationErrorCode,
 ): void {
+  if (!isCacheableDetailFailure(errorCode)) {
+    return;
+  }
   const entry: CachedDetailFailure = {
     errorCode,
     fetchedAt: Date.now(),
@@ -627,24 +650,40 @@ export async function verifyCandidates(
               const detailUrls = detailFetchUrls(candidate);
               for (const detailUrl of detailUrls) {
                 attemptedUrls.push(detailUrl);
-                try {
-                  const artifact = await fetchIndianKanoonCaseDetail(detailUrl, {
-                    fetchTimeoutMs: VERIFY_DETAIL_TIMEOUT_MS,
-                    max429Retries: VERIFY_DETAIL_MAX_429_RETRIES,
-                    maxRetryAfterMs: VERIFY_DETAIL_MAX_RETRY_AFTER_MS,
-                  });
-                  const detailText = detailArtifactToText(artifact);
-                  if (!hasUsableDetail(detailText, artifact)) {
-                    throw new Error("detail_parse_empty");
+                const maxAttempts = 1 + VERIFY_DETAIL_TRANSIENT_RETRIES;
+                let resolved = false;
+                for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                  try {
+                    const artifact = await fetchIndianKanoonCaseDetail(detailUrl, {
+                      fetchTimeoutMs: VERIFY_DETAIL_TIMEOUT_MS,
+                      max429Retries: VERIFY_DETAIL_MAX_429_RETRIES,
+                      maxRetryAfterMs: VERIFY_DETAIL_MAX_RETRY_AFTER_MS,
+                    });
+                    const detailText = detailArtifactToText(artifact);
+                    if (!hasUsableDetail(detailText, artifact)) {
+                      throw new Error("detail_parse_empty");
+                    }
+                    successfulDirect = { artifact, detailText, url: detailUrl };
+                    resolved = true;
+                    break;
+                  } catch (error) {
+                    const code = mapDetailFetchErrorCode(error);
+                    const isTransient = isTransientDetailErrorCode(code);
+                    if (isTransient && attempt < maxAttempts) {
+                      const waitMs = VERIFY_DETAIL_TRANSIENT_RETRY_BACKOFF_MS * attempt;
+                      await sleep(waitMs);
+                      continue;
+                    }
+                    candidateErrors.push({
+                      code,
+                      message: detailErrorMessage(error),
+                      url: detailUrl,
+                    });
+                    break;
                   }
-                  successfulDirect = { artifact, detailText, url: detailUrl };
+                }
+                if (resolved) {
                   break;
-                } catch (error) {
-                  candidateErrors.push({
-                    code: mapDetailFetchErrorCode(error),
-                    message: detailErrorMessage(error),
-                    url: detailUrl,
-                  });
                 }
               }
             }

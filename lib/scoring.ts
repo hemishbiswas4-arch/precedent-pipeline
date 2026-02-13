@@ -147,6 +147,8 @@ export function scoreCases(
       const corpus = `${candidate.title} ${candidate.snippet} ${bodyText}`;
       const corpusTokens = new Set(normalizeTokens(corpus));
       const overlap = overlapRatio(queryTokens, corpusTokens);
+      const detailChecked = Boolean(candidate.detailText || candidate.detailArtifact?.evidenceWindows?.length);
+      const detailWeight = detailChecked ? 1 : 0.62;
 
       const anchorsMatched = countMatches(corpus, context.anchors);
       const issuesMatched = countMatches(corpus, context.issues);
@@ -180,27 +182,27 @@ export function scoreCases(
 
       if (options?.checklist) {
         if (proposition.requiredCoverage > 0) {
-          rawScore += proposition.requiredCoverage * 0.2;
+          rawScore += proposition.requiredCoverage * 0.2 * detailWeight;
           reasons.push(`Proposition coverage ${(proposition.requiredCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.coreCoverage > 0) {
-          rawScore += proposition.coreCoverage * 0.2;
+          rawScore += proposition.coreCoverage * 0.2 * detailWeight;
           reasons.push(`Core coverage ${(proposition.coreCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.peripheralCoverage > 0) {
-          rawScore += proposition.peripheralCoverage * 0.08;
+          rawScore += proposition.peripheralCoverage * 0.08 * detailWeight;
           reasons.push(`Peripheral coverage ${(proposition.peripheralCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.hookGroupCoverage > 0) {
-          rawScore += proposition.hookGroupCoverage * 0.16;
+          rawScore += proposition.hookGroupCoverage * 0.16 * detailWeight;
           reasons.push(`Hook-group coverage ${(proposition.hookGroupCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.relationSatisfied && options.checklist.relations.some((relation) => relation.required)) {
-          rawScore += 0.06;
+          rawScore += 0.06 * detailWeight;
           reasons.push("Required hook interaction satisfied");
         }
         if (proposition.outcomePolaritySatisfied && options.checklist.outcomeConstraint.required) {
-          rawScore += 0.07;
+          rawScore += 0.07 * detailWeight;
           reasons.push(`Outcome polarity matched (${options.checklist.outcomeConstraint.polarity})`);
         }
         if (proposition.matchedLabels.length > 0) {
@@ -224,6 +226,14 @@ export function scoreCases(
         if (proposition.hookGroupCoverage < 1) {
           rawScore -= 0.08;
         }
+      }
+
+      if (detailChecked) {
+        rawScore += 0.03;
+        reasons.push("Detail verified evidence");
+      } else {
+        rawScore -= 0.09;
+        reasons.push("Detail not verified (down-ranked)");
       }
 
       if (candidate.court === "SC") {
@@ -262,7 +272,7 @@ export function scoreCases(
           anchorsMatched,
           issuesMatched,
           proceduresMatched,
-          detailChecked: Boolean(candidate.detailText),
+          detailChecked,
           hasRoleSentence: candidate.evidenceQuality?.hasRoleSentence,
           hasChainSentence: candidate.evidenceQuality?.hasChainSentence,
           hasRelationSentence: candidate.evidenceQuality?.hasRelationSentence,

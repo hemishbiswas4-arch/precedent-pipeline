@@ -34,13 +34,25 @@ function outcomeTermsFromPolarity(polarity: ReasonerOutcomePolarity): string[] {
   return [];
 }
 
-function deriveRoleTarget(cleanedQuery: string, context: ContextProfile): PropositionRoleTarget {
+function deriveRoleTarget(
+  cleanedQuery: string,
+  context: ContextProfile,
+): { target: PropositionRoleTarget; explicit: boolean } {
   const q = normalizeText(cleanedQuery);
-  if (/\brespondent\b/.test(q)) return "respondent";
-  if (/\bprosecution\b/.test(q) && !/\bappeal\b/.test(q)) return "prosecution";
-  if (/\bappellant\b/.test(q)) return "appellant";
-  if (context.procedures.some((item) => /\bappeal\b/i.test(item)) && context.actors.length > 0) return "appellant";
-  return "none";
+  if (/\brespondent\b/.test(q)) return { target: "respondent", explicit: true };
+  if (/\bprosecution\b/.test(q) && !/\bappeal\b/.test(q)) return { target: "prosecution", explicit: true };
+
+  const explicitAppellantCue =
+    /\bappellant\b/.test(q) ||
+    /\b(?:filed|preferred|instituted|brought)\s+(?:an?\s+)?(?:criminal\s+)?appeal\b/.test(q) ||
+    /\bappeal\s+by\b/.test(q);
+  if (explicitAppellantCue) return { target: "appellant", explicit: true };
+
+  if (context.procedures.some((item) => /\bappeal\b/i.test(item)) && /\bappellant\b/.test(q)) {
+    return { target: "appellant", explicit: true };
+  }
+
+  return { target: "none", explicit: false };
 }
 
 function actorLexemes(actor: string): string[] {
@@ -127,7 +139,8 @@ export function compilePropositionGraph(input: {
   hookGroupCount: number;
 }): PropositionGraph {
   const q = normalizeText(input.cleanedQuery);
-  const roleTarget = deriveRoleTarget(input.cleanedQuery, input.context);
+  const roleSignal = deriveRoleTarget(input.cleanedQuery, input.context);
+  const roleTarget = roleSignal.target;
   const actorTokens = unique(
     (input.actorTerms.length > 0 ? input.actorTerms : input.context.actors).flatMap((actor) => actorLexemes(actor)),
   );
@@ -144,7 +157,8 @@ export function compilePropositionGraph(input: {
   ]);
 
   const noHookMode = input.hookGroupCount === 0;
-  const roleConstraintRequired = noHookMode && roleTarget !== "none" && actorTokens.length > 0;
+  const roleConstraintRequired =
+    noHookMode && roleSignal.explicit && roleTarget !== "none" && actorTokens.length > 0;
   const roleConstraints: PropositionRoleConstraint[] = roleConstraintRequired
     ? [
         {
@@ -193,9 +207,13 @@ export function compilePropositionGraph(input: {
     );
   }
 
-  const hasCondonation = /condonation|delay condonation|section 5 limitation/.test(q) || proceedingTokens.some((token) => /condonation/.test(token));
+  const hasCondonation =
+    /\b(condonation|delay condonation|section 5 limitation)\b/.test(q) ||
+    proceedingTokens.some((token) => /condonation/.test(token));
   const refusalPolarity = input.outcomePolarity === "refused" || input.outcomePolarity === "dismissed";
-  if (noHookMode && hasCondonation && refusalPolarity) {
+  const hasExplicitRefusalCue =
+    /\b(not condoned|refused|rejected|denied|declined|dismissed|time barred|barred by limitation)\b/.test(q);
+  if (noHookMode && hasCondonation && refusalPolarity && hasExplicitRefusalCue) {
     const leftTerms = unique(
       [
         "condonation of delay",

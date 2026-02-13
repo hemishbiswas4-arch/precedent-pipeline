@@ -718,6 +718,13 @@ function nearMissThreshold(requiredCount: number): number {
 const STRICT_PERIPHERAL_COVERAGE_MIN = 0.6;
 const NEAR_MISS_CORE_THRESHOLD = 0.65;
 
+function hasDoctrinalNearMissSignals(checklist: PropositionChecklist): boolean {
+  const hasRequiredHooks = checklist.hookGroups.some((group) => group.required);
+  const hasRequiredRelations = checklist.relations.some((relation) => relation.required) || checklist.interactionRequired;
+  const hasRequiredOutcome = checklist.outcomeConstraint.required;
+  return hasRequiredHooks || hasRequiredRelations || hasRequiredOutcome;
+}
+
 function clamp(value: number, min = 0, max = 1): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -1150,6 +1157,7 @@ export function gateCandidateAgainstProposition(
   const requiredCount = signal.requiredComponentCount;
   const threshold = nearMissThreshold(requiredCount);
   const coreThreshold = Math.max(NEAR_MISS_CORE_THRESHOLD, nearMissThreshold(coreRequiredCount));
+  const doctrinalNearMissEligible = hasDoctrinalNearMissSignals(checklist);
 
   const exactStrict =
     candidate.verification.detailChecked &&
@@ -1225,6 +1233,7 @@ export function gateCandidateAgainstProposition(
   }
 
   const nearMiss =
+    doctrinalNearMissEligible &&
     !signal.contradiction &&
     signal.coreCoverage >= coreThreshold &&
     signal.requiredCoverage >= threshold &&
@@ -1305,6 +1314,7 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
   const hookCoverageValues: number[] = [];
   const chainCoverageValues: number[] = [];
   const confidenceValues: number[] = [];
+  const doctrinalNearMissEligible = hasDoctrinalNearMissSignals(checklist);
 
   for (const item of rankedCases) {
     const result = gateCandidateAgainstProposition(item, checklist);
@@ -1408,7 +1418,7 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
     }
   }
 
-  if (exact.length === 0 && nearMiss.length === 0 && unverifiedRejectBackfill.length > 0) {
+  if (doctrinalNearMissEligible && exact.length === 0 && nearMiss.length === 0 && unverifiedRejectBackfill.length > 0) {
     const seenUrls = new Set<string>();
     const fallbackNearMisses = [...unverifiedRejectBackfill]
       .sort((a, b) => {

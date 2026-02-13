@@ -1,3 +1,5 @@
+import { ContextProfile } from "@/lib/types";
+
 export type ReasonerCourtHint = "SC" | "HC" | "ANY";
 export type ReasonerOutcomePolarity =
   | "required"
@@ -71,6 +73,13 @@ export type ReasonerSketch = {
 export type ReasonerSketchValidationResult = {
   sketch: ReasonerSketch;
   warnings: string[];
+};
+
+export type ReasonerGroundingTelemetry = {
+  applied: boolean;
+  droppedOutcome: boolean;
+  droppedHooks: number;
+  variantPrunedCount: number;
 };
 
 function asTextList(value: unknown, maxItems: number, maxTokenLength = 120): string[] {
@@ -501,4 +510,229 @@ export function validateReasonerPlan(raw: unknown): ReasonerValidationResult {
 
 export function isUsableReasonerPlan(plan: ReasonerPlan): boolean {
   return plan.query_variants_strict.length > 0 || plan.query_variants_broad.length > 0;
+}
+
+function normalizeForGrounding(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s()/-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeForGrounding(value: string): string[] {
+  return normalizeForGrounding(value)
+    .split(/\s+/)
+    .filter((token) => token.length > 1);
+}
+
+function hasOutcomePolarityEvidence(input: { cleanedQuery: string; context: ContextProfile }): boolean {
+  const q = normalizeForGrounding(input.cleanedQuery);
+  const contextIssues = input.context.issues.map((issue) => normalizeForGrounding(issue));
+  if (contextIssues.length > 0) return true;
+  return /\b(refused|rejected|dismissed|allowed|quashed|denied|required|not required|time barred|barred by limitation|not condoned|condoned)\b/.test(
+    q,
+  );
+}
+
+function buildLegalSignalTokenSet(input: { cleanedQuery: string; context: ContextProfile }): Set<string> {
+  const signals = new Set<string>();
+  const sourceTerms = [...input.context.statutesOrSections, input.cleanedQuery];
+  for (const term of sourceTerms) {
+    const normalized = normalizeForGrounding(term);
+    if (!normalized) continue;
+    for (const token of tokenizeForGrounding(normalized)) {
+      signals.add(token);
+    }
+    if (/\bpc act\b|\bprevention of corruption\b/.test(normalized)) {
+      ["pc", "prevention", "corruption", "act"].forEach((token) => signals.add(token));
+    }
+    if (/\bcrpc\b|\bcriminal procedure\b/.test(normalized)) {
+      ["crpc", "criminal", "procedure", "code"].forEach((token) => signals.add(token));
+    }
+    if (/\bipc\b|\bindian penal code\b/.test(normalized)) {
+      ["ipc", "indian", "penal", "code"].forEach((token) => signals.add(token));
+    }
+    const sectionMatches = normalized.match(/\d+(?:\([0-9a-z]+\))*/g) ?? [];
+    for (const section of sectionMatches) {
+      signals.add(section);
+      signals.add(section.replace(/[()]/g, ""));
+    }
+  }
+  return signals;
+}
+
+function isSupportedHookTerm(term: string, legalSignals: Set<string>): boolean {
+  const normalized = normalizeForGrounding(term);
+  if (!normalized) return false;
+  const tokens = tokenizeForGrounding(normalized).filter((token) => token !== "section" && token !== "act");
+  if (tokens.length === 0) return false;
+  const numeric = normalized.match(/\d+(?:\([0-9a-z]+\))*/g) ?? [];
+  for (const numberToken of numeric) {
+    if (legalSignals.has(numberToken) || legalSignals.has(numberToken.replace(/[()]/g, ""))) {
+      return true;
+    }
+  }
+  return tokens.some((token) => legalSignals.has(token));
+}
+
+function pruneVariants(variants: string[], blockedTerms: string[]): { kept: string[]; pruned: number } {
+  if (variants.length === 0 || blockedTerms.length === 0) {
+    return { kept: variants, pruned: 0 };
+  }
+  const normalizedBlocked = blockedTerms
+    .map((term) => normalizeForGrounding(term))
+    .filter((term) => term.length > 2);
+  const kept = variants.filter((variant) => {
+    const phrase = normalizeForGrounding(variant);
+    return !normalizedBlocked.some((term) => phrase.includes(term));
+  });
+  return {
+    kept,
+    pruned: Math.max(0, variants.length - kept.length),
+  };
+}
+
+export function groundReasonerPlanToIntent(input: {
+  plan: ReasonerPlan;
+  cleanedQuery: string;
+  context: ContextProfile;
+}): {
+  plan: ReasonerPlan;
+  telemetry: ReasonerGroundingTelemetry;
+} {
+  const basePlan = input.plan;
+  let nextPlan: ReasonerPlan = {
+    ...basePlan,
+    proposition: {
+      ...basePlan.proposition,
+      hook_groups: basePlan.proposition.hook_groups.map((group) => ({ ...group, terms: [...group.terms] })),
+      relations: basePlan.proposition.relations.map((relation) => ({ ...relation })),
+      outcome_constraint: {
+        ...basePlan.proposition.outcome_constraint,
+        terms: [...basePlan.proposition.outcome_constraint.terms],
+        contradiction_terms: [...basePlan.proposition.outcome_constraint.contradiction_terms],
+      },
+    },
+    must_have_terms: [...basePlan.must_have_terms],
+    must_not_have_terms: [...basePlan.must_not_have_terms],
+    query_variants_strict: [...basePlan.query_variants_strict],
+    query_variants_broad: [...basePlan.query_variants_broad],
+    case_anchors: [...basePlan.case_anchors],
+  };
+
+  let droppedOutcome = false;
+  let droppedHooks = 0;
+  let variantPrunedCount = 0;
+
+  const hasOutcomeEvidence = hasOutcomePolarityEvidence({
+    cleanedQuery: input.cleanedQuery,
+    context: input.context,
+  });
+  if (!hasOutcomeEvidence) {
+    droppedOutcome =
+      nextPlan.proposition.outcome_required.length > 0 ||
+      nextPlan.proposition.outcome_negative.length > 0 ||
+      nextPlan.proposition.outcome_constraint.terms.length > 0 ||
+      nextPlan.proposition.outcome_constraint.polarity !== "unknown";
+    if (droppedOutcome) {
+      const droppedTerms = [
+        ...nextPlan.proposition.outcome_required,
+        ...nextPlan.proposition.outcome_negative,
+        ...nextPlan.proposition.outcome_constraint.terms,
+      ];
+      nextPlan = {
+        ...nextPlan,
+        proposition: {
+          ...nextPlan.proposition,
+          outcome_required: [],
+          outcome_negative: [],
+          outcome_constraint: {
+            polarity: "unknown",
+            terms: [],
+            contradiction_terms: [],
+          },
+        },
+        must_not_have_terms: nextPlan.must_not_have_terms.filter(
+          (term) =>
+            !droppedTerms.some((dropped) => normalizeForGrounding(term).includes(normalizeForGrounding(dropped))),
+        ),
+      };
+      const strictPrune = pruneVariants(nextPlan.query_variants_strict, droppedTerms);
+      const broadPrune = pruneVariants(nextPlan.query_variants_broad, droppedTerms);
+      variantPrunedCount += strictPrune.pruned + broadPrune.pruned;
+      nextPlan.query_variants_strict = strictPrune.kept;
+      nextPlan.query_variants_broad = broadPrune.kept;
+    }
+  }
+
+  const legalSignals = buildLegalSignalTokenSet({
+    cleanedQuery: input.cleanedQuery,
+    context: input.context,
+  });
+  const hasLegalSignal = input.context.statutesOrSections.length > 0;
+  if (!hasLegalSignal) {
+    droppedHooks +=
+      nextPlan.proposition.legal_hooks.length +
+      nextPlan.proposition.hook_groups.reduce((sum, group) => sum + group.terms.length, 0);
+    nextPlan.proposition.legal_hooks = [];
+    nextPlan.proposition.hook_groups = [];
+    nextPlan.proposition.relations = [];
+    nextPlan.proposition.interaction_required = false;
+  } else if (nextPlan.proposition.legal_hooks.length > 0 || nextPlan.proposition.hook_groups.length > 0) {
+    const originalHookTerms = [...nextPlan.proposition.legal_hooks];
+    const filteredHooks = nextPlan.proposition.legal_hooks.filter((term) => isSupportedHookTerm(term, legalSignals));
+    droppedHooks += Math.max(0, nextPlan.proposition.legal_hooks.length - filteredHooks.length);
+
+    const groupMap = new Map<string, string>();
+    const filteredGroups = nextPlan.proposition.hook_groups
+      .map((group) => {
+        const terms = group.terms.filter((term) => isSupportedHookTerm(term, legalSignals));
+        if (terms.length === 0) {
+          droppedHooks += group.terms.length;
+          return null;
+        }
+        droppedHooks += Math.max(0, group.terms.length - terms.length);
+        const groupId = sanitizeId(group.group_id) ?? group.group_id;
+        groupMap.set(group.group_id, groupId);
+        return {
+          ...group,
+          group_id: groupId,
+          terms,
+          min_match: Math.max(1, Math.min(group.min_match, terms.length)),
+        };
+      })
+      .filter((group): group is ReasonerHookGroup => Boolean(group));
+
+    const validGroupIds = new Set(filteredGroups.map((group) => group.group_id));
+    const filteredRelations = nextPlan.proposition.relations.filter((relation) => {
+      const left = groupMap.get(relation.left_group_id) ?? relation.left_group_id;
+      const right = groupMap.get(relation.right_group_id) ?? relation.right_group_id;
+      return validGroupIds.has(left) && validGroupIds.has(right);
+    });
+
+    nextPlan.proposition.legal_hooks = filteredHooks;
+    nextPlan.proposition.hook_groups = filteredGroups;
+    nextPlan.proposition.relations = filteredRelations;
+    nextPlan.proposition.interaction_required =
+      nextPlan.proposition.interaction_required && filteredRelations.length > 0;
+
+    const droppedHookTerms = originalHookTerms.filter((term) => !filteredHooks.includes(term));
+    if (droppedHookTerms.length > 0) {
+      const strictPrune = pruneVariants(nextPlan.query_variants_strict, droppedHookTerms);
+      const broadPrune = pruneVariants(nextPlan.query_variants_broad, droppedHookTerms);
+      variantPrunedCount += strictPrune.pruned + broadPrune.pruned;
+      nextPlan.query_variants_strict = strictPrune.kept;
+      nextPlan.query_variants_broad = broadPrune.kept;
+    }
+  }
+
+  const telemetry: ReasonerGroundingTelemetry = {
+    applied: droppedOutcome || droppedHooks > 0 || variantPrunedCount > 0,
+    droppedOutcome,
+    droppedHooks,
+    variantPrunedCount,
+  };
+
+  return { plan: nextPlan, telemetry };
 }

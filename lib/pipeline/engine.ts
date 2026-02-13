@@ -19,6 +19,7 @@ import { QueryVariant, SchedulerConfig, SchedulerResult } from "@/lib/pipeline/t
 import { verifyCandidates } from "@/lib/pipeline/verifier";
 import { pickRetrievalProvider } from "@/lib/retrieval/provider";
 import type { RetrievalProvider } from "@/lib/retrieval/providers/types";
+import { groundReasonerPlanToIntent } from "@/lib/reasoner-schema";
 import {
   buildPropositionChecklist,
   PropositionChecklist,
@@ -91,6 +92,14 @@ const SERPER_STOP_ON_CANDIDATE_TARGET = parseBooleanEnv(
   false,
 );
 const NEAR_MISS_MAX_RESULTS = Math.max(1, Number(process.env.NEAR_MISS_MAX_RESULTS ?? "12"));
+const SUPREME_COURT_PREFERENCE_ENABLED = parseBooleanEnv(
+  process.env.SUPREME_COURT_PREFERENCE_ENABLED,
+  true,
+);
+const SUPREME_COURT_PREFERENCE_BONUS = Math.min(
+  0.08,
+  Math.max(Number(process.env.SUPREME_COURT_PREFERENCE_BONUS ?? "0.025"), 0),
+);
 
 type ReasonerHealthStatus =
   | "ok"
@@ -210,6 +219,15 @@ function uniqueLimit(values: string[], limit: number): string[] {
   return output;
 }
 
+function isSparseIntent(intent: ReturnType<typeof buildIntentProfile>): boolean {
+  return (
+    intent.statutes.length === 0 &&
+    intent.issues.length === 0 &&
+    intent.anchors.length <= 8 &&
+    intent.cleanedQuery.split(/\s+/).filter((token) => token.length > 1).length <= 9
+  );
+}
+
 function withExtendedPhaseLimits(phaseLimits: Record<string, number>, bonus: number): Record<string, number> {
   if (bonus <= 0) return phaseLimits;
   const output: Record<string, number> = { ...phaseLimits };
@@ -267,6 +285,31 @@ function isRelevantCase(item: ScoredCase): boolean {
     item.verification.anchorsMatched > 0 ||
     (item.matchEvidence?.length ?? 0) > 0
   );
+}
+
+function applySupremeCourtPreference(cases: ScoredCase[]): ScoredCase[] {
+  if (!SUPREME_COURT_PREFERENCE_ENABLED || cases.length === 0) {
+    return cases;
+  }
+  const hasSc = cases.some((item) => item.court === "SC");
+  const hasHc = cases.some((item) => item.court === "HC");
+  if (!hasSc || !hasHc) {
+    return cases;
+  }
+  const boosted = cases.map((item) => {
+    if (item.court !== "SC") {
+      return item;
+    }
+    const rankingScore = Math.min(1, (item.rankingScore ?? item.score) + SUPREME_COURT_PREFERENCE_BONUS);
+    return {
+      ...item,
+      rankingScore: Number(rankingScore.toFixed(3)),
+      reasons: item.reasons.includes("Supreme Court priority applied")
+        ? item.reasons
+        : [...item.reasons, "Supreme Court priority applied"],
+    };
+  });
+  return boosted.sort((a, b) => (b.rankingScore ?? b.score) - (a.rankingScore ?? a.score));
 }
 
 function qualifiedProvisionalCount(cases: ScoredCase[]): number {
@@ -349,8 +392,9 @@ async function evaluateCandidates(input: {
   const scored = scoreCases(input.query, input.context, scoredInput, {
     checklist: input.checklist,
   });
-  const relevant = scored.filter(isRelevantCase);
-  const pool = relevant.length > 0 ? relevant : scored;
+  const prioritized = applySupremeCourtPreference(scored);
+  const relevant = prioritized.filter(isRelevantCase);
+  const pool = relevant.length > 0 ? relevant : prioritized;
   const diversified = diversifyRankedCases(pool, {
     maxPerFingerprint: 1,
     maxPerCourtDay: 1,
@@ -639,6 +683,26 @@ export async function runPipelineSearch(input: {
   }
 
   let activeReasonerPlan = reasonerPass1.plan;
+  let reasonerGroundingApplied = false;
+  let reasonerGroundingDroppedOutcome = false;
+  let reasonerGroundingDroppedHooks = 0;
+  let reasonerGroundingVariantPrunedCount = 0;
+  if (activeReasonerPlan) {
+    const grounded = groundReasonerPlanToIntent({
+      plan: activeReasonerPlan,
+      cleanedQuery: intent.cleanedQuery,
+      context: intent.context,
+    });
+    activeReasonerPlan = grounded.plan;
+    reasonerGroundingApplied = grounded.telemetry.applied;
+    reasonerGroundingDroppedOutcome = grounded.telemetry.droppedOutcome;
+    reasonerGroundingDroppedHooks = grounded.telemetry.droppedHooks;
+    reasonerGroundingVariantPrunedCount = grounded.telemetry.variantPrunedCount;
+    if (activeReasonerPlan.query_variants_strict.length === 0 && isSparseIntent(intent)) {
+      activeReasonerPlan = undefined;
+      reasonerGroundingApplied = true;
+    }
+  }
   const deterministicPlanner = await planDeterministicQueryVariants(intent, activeReasonerPlan);
   let pass2Variants: ReturnType<typeof buildReasonerQueryVariants> = [];
   let traceVariantsUsed: ReturnType<typeof buildTraceQueryVariants> = [];
@@ -751,7 +815,22 @@ export async function runPipelineSearch(input: {
     pass2LatencyMs = reasonerPass2.telemetry.latencyMs;
 
     if (reasonerPass2.plan) {
-      activeReasonerPlan = reasonerPass2.plan;
+      let pass2Plan = reasonerPass2.plan;
+      const groundedPass2 = groundReasonerPlanToIntent({
+        plan: pass2Plan,
+        cleanedQuery: intent.cleanedQuery,
+        context: intent.context,
+      });
+      pass2Plan = groundedPass2.plan;
+      reasonerGroundingApplied = reasonerGroundingApplied || groundedPass2.telemetry.applied;
+      reasonerGroundingDroppedOutcome =
+        reasonerGroundingDroppedOutcome || groundedPass2.telemetry.droppedOutcome;
+      reasonerGroundingDroppedHooks += groundedPass2.telemetry.droppedHooks;
+      reasonerGroundingVariantPrunedCount += groundedPass2.telemetry.variantPrunedCount;
+      if (pass2Plan.query_variants_strict.length === 0 && isSparseIntent(intent)) {
+        pass2Plan = activeReasonerPlan ?? pass2Plan;
+      }
+      activeReasonerPlan = pass2Plan;
       checklist = applyPropositionMode(
         buildPropositionChecklist({
           context: intent.context,
@@ -761,7 +840,7 @@ export async function runPipelineSearch(input: {
       );
       pass2Variants = buildReasonerQueryVariants({
         intent,
-        plan: reasonerPass2.plan,
+        plan: activeReasonerPlan,
       });
       phaseRun = await runQualityAwarePhases({
         variants: mergeVariants(pass2Variants),
@@ -851,6 +930,16 @@ export async function runPipelineSearch(input: {
     evaluation.verificationSummary.detailFetched === 0
   ) {
     notes.push("Detail verification failed for all shortlisted candidates; ranking stayed snippet-based for this run.");
+  }
+  if (
+    retrievalProvider.supportsDetailFetch &&
+    evaluation.verificationSummary.attempted > 0 &&
+    evaluation.verificationSummary.detailFetched > 0 &&
+    evaluation.verificationSummary.detailFetched < evaluation.verificationSummary.attempted
+  ) {
+    notes.push(
+      `Detail verification informed ranking: ${evaluation.verificationSummary.detailFetched}/${evaluation.verificationSummary.attempted} shortlisted candidates were fully hydrated.`,
+    );
   }
   if ((evaluation.verificationSummary.detailFetchFallbackUsed ?? 0) > 0) {
     notes.push(
@@ -1090,6 +1179,10 @@ export async function runPipelineSearch(input: {
         reasonerStage: reasonerPass1.telemetry.reasonerStage,
         reasonerStageLatencyMs: reasonerPass1.telemetry.reasonerStageLatencyMs,
         reasonerPlanSource: reasonerPass1.telemetry.reasonerPlanSource,
+        reasonerGroundingApplied,
+        reasonerGroundingDroppedOutcome,
+        reasonerGroundingDroppedHooks,
+        reasonerGroundingVariantPrunedCount,
         pass1Invoked,
         pass2Invoked,
         pass2Reason,
