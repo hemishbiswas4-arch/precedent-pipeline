@@ -40,6 +40,12 @@ export type OutcomeConstraint = {
   contradictionTerms: string[];
 };
 
+export type PropositionSignalInput = {
+  text: string;
+  // Evidence windows (ratio-ish sentences) used to scope polarity/contradiction checks to case-specific context.
+  evidenceText?: string;
+};
+
 export type PropositionChecklist = {
   axes: PropositionAxis[];
   requiredElements: string[];
@@ -155,7 +161,6 @@ const PROCEEDING_HINTS = [
   "investigation",
   "section 482 crpc",
   "special leave petition",
-  "prosecution",
 ];
 
 const OUTCOME_HINTS = [
@@ -780,10 +785,30 @@ function calibrateConfidence(input: {
   if (STRICT_HIGH_CONFIDENCE_ONLY && !highEligible) {
     cap = Math.min(cap, PROVISIONAL_CONFIDENCE_CAP);
   }
+  if (!input.caseItem.verification.detailChecked) {
+    cap = Math.min(cap, 0.55);
+  }
   const capped = Math.min(confidence, cap);
   return {
     score: Number(capped.toFixed(3)),
     saturationPrevented: confidence > cap,
+  };
+}
+
+function buildUnverifiedChecklist(checklist: PropositionChecklist): PropositionChecklist {
+  if (!checklist.graph) {
+    return checklist;
+  }
+  return {
+    ...checklist,
+    graph: {
+      ...checklist.graph,
+      mandatorySteps: checklist.graph.mandatorySteps.filter(
+        (step) => step.kind !== "chain" && step.kind !== "role",
+      ),
+      roleConstraints: [],
+      chainConstraints: [],
+    },
   };
 }
 
@@ -899,8 +924,14 @@ export function buildPropositionChecklist(input: {
   };
 }
 
-export function evaluatePropositionSignals(text: string, checklist: PropositionChecklist): PropositionSignalSummary {
-  const normalized = normalizeText(text);
+export function evaluatePropositionSignals(
+  input: string | PropositionSignalInput,
+  checklist: PropositionChecklist,
+): PropositionSignalSummary {
+  const mainText = typeof input === "string" ? input : input.text;
+  const evidenceText = typeof input === "string" ? "" : (input.evidenceText ?? "");
+  const normalized = normalizeText(mainText);
+  const normalizedEvidence = evidenceText ? normalizeText(evidenceText) : normalized;
   const evidence: string[] = [];
 
   const axisResults = checklist.axes.map((axis) => {
@@ -942,7 +973,7 @@ export function evaluatePropositionSignals(text: string, checklist: PropositionC
     const right = hookGroups.find((group) => group.groupId === relation.rightGroupId);
     if (!left || !right) continue;
     const satisfied = relationSatisfiedByProximity({
-      text: normalized,
+      text: normalizedEvidence,
       leftTerms: left.terms,
       rightTerms: right.terms,
       windowChars: 220,
@@ -955,9 +986,11 @@ export function evaluatePropositionSignals(text: string, checklist: PropositionC
   }
   const relationSatisfied = relationFailures.length === 0;
 
-  const matchedOutcomeTerms = checklist.outcomeConstraint.terms.filter((term) => containsTerm(normalized, term));
+  const matchedOutcomeTerms = checklist.outcomeConstraint.terms.filter((term) =>
+    containsTerm(normalizedEvidence, term),
+  );
   const matchedOutcomeContradictions = checklist.outcomeConstraint.contradictionTerms.filter((term) =>
-    containsOutcomeContradictionTerm(normalized, term),
+    containsOutcomeContradictionTerm(normalizedEvidence, term),
   );
   const outcomePolaritySatisfied =
     !checklist.outcomeConstraint.required ||
@@ -968,7 +1001,7 @@ export function evaluatePropositionSignals(text: string, checklist: PropositionC
   }
 
   const contradictionTerms = checklist.contradictionTerms.filter((term) =>
-    containsOutcomeContradictionTerm(normalized, term),
+    containsOutcomeContradictionTerm(normalizedEvidence, term),
   );
   const contradiction = contradictionTerms.length > 0 || matchedOutcomeContradictions.length > 0;
   const contradictionBag = normalizeTerms([...contradictionTerms, ...matchedOutcomeContradictions], 8);
@@ -1105,8 +1138,13 @@ export function gateCandidateAgainstProposition(
   candidate: ScoredCase,
   checklist: PropositionChecklist,
 ): PropositionGateResult {
-  const text = `${candidate.title} ${candidate.snippet} ${candidate.detailText ?? ""}`;
-  const signal = evaluatePropositionSignals(text, checklist);
+  const evidenceText = candidate.detailArtifact?.evidenceWindows?.join(" ") ?? "";
+  const bodyText = candidate.detailArtifact?.bodyExcerpt?.join(" ") ?? candidate.detailText ?? "";
+  const text = `${candidate.title} ${candidate.snippet} ${bodyText}`;
+  const effectiveChecklist = candidate.verification.detailChecked
+    ? checklist
+    : buildUnverifiedChecklist(checklist);
+  const signal = evaluatePropositionSignals({ text, evidenceText }, effectiveChecklist);
 
   const coreRequiredCount = signal.coreComponentCount;
   const requiredCount = signal.requiredComponentCount;
@@ -1114,6 +1152,7 @@ export function gateCandidateAgainstProposition(
   const coreThreshold = Math.max(NEAR_MISS_CORE_THRESHOLD, nearMissThreshold(coreRequiredCount));
 
   const exactStrict =
+    candidate.verification.detailChecked &&
     !signal.contradiction &&
     signal.coreCoverage >= 1 &&
     signal.mandatoryStepCoverage >= 1 &&
@@ -1154,7 +1193,7 @@ export function gateCandidateAgainstProposition(
   const exactProvisional =
     !signal.contradiction &&
     signal.coreCoverage >= 1 &&
-    signal.mandatoryStepCoverage >= 1 &&
+    signal.mandatoryStepCoverage >= (candidate.verification.detailChecked ? 1 : 0.75) &&
     signal.hookGroupCoverage >= 1 &&
     signal.relationSatisfied &&
     signal.outcomePolaritySatisfied;
@@ -1247,6 +1286,12 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
   const exactProvisional: ScoredCase[] = [];
   const exact: ScoredCase[] = [];
   const nearMiss: NearMissCase[] = [];
+  const unverifiedRejectBackfill: Array<{
+    enriched: ScoredCase;
+    missingElements: string[];
+    missingCoreElements: string[];
+    signalStrength: number;
+  }> = [];
   const missingElementBreakdown: Record<string, number> = {};
   const coreFailureBreakdown: Record<string, number> = {};
   const chainMandatoryFailureBreakdown: Record<string, number> = {};
@@ -1324,6 +1369,24 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
         missingElements: result.missingElements,
         missingCoreElements: result.missingCoreElements,
       });
+    } else if (
+      !result.contradiction &&
+      !item.verification.detailChecked &&
+      (result.requiredCoverage >= 0.25 ||
+        result.coreCoverage >= 0.2 ||
+        result.matchedElements.length > 0 ||
+        result.matchedCoreElements.length > 0)
+    ) {
+      unverifiedRejectBackfill.push({
+        enriched,
+        missingElements: result.missingElements,
+        missingCoreElements: result.missingCoreElements,
+        signalStrength:
+          result.requiredCoverage * 0.45 +
+          result.coreCoverage * 0.35 +
+          result.hookGroupCoverage * 0.1 +
+          (result.outcomePolaritySatisfied ? 0.1 : 0),
+      });
     }
 
     if (result.contradiction) contradictionRejectCount += 1;
@@ -1343,6 +1406,29 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
     for (const missing of result.missingElements) {
       missingElementBreakdown[missing] = (missingElementBreakdown[missing] ?? 0) + 1;
     }
+  }
+
+  if (exact.length === 0 && nearMiss.length === 0 && unverifiedRejectBackfill.length > 0) {
+    const seenUrls = new Set<string>();
+    const fallbackNearMisses = [...unverifiedRejectBackfill]
+      .sort((a, b) => {
+        const aScore = a.signalStrength + (a.enriched.confidenceScore ?? a.enriched.score) * 0.4;
+        const bScore = b.signalStrength + (b.enriched.confidenceScore ?? b.enriched.score) * 0.4;
+        return bScore - aScore;
+      })
+      .filter((entry) => {
+        if (seenUrls.has(entry.enriched.url)) return false;
+        seenUrls.add(entry.enriched.url);
+        return true;
+      })
+      .slice(0, Math.min(8, rankedCases.length))
+      .map((entry) => ({
+        ...entry.enriched,
+        missingElements: entry.missingElements,
+        missingCoreElements: entry.missingCoreElements,
+      }));
+
+    nearMiss.push(...fallbackNearMisses);
   }
 
   const requiredElementCoverageAvg =

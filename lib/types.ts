@@ -41,6 +41,34 @@ export type KeywordPack = {
   searchPhrases: string[];
 };
 
+export type IndianKanoonDetailArtifact = {
+  title?: string;
+  courtText?: string;
+  court?: CourtLevel;
+  equivalentCitations?: string;
+  author?: string;
+  bench?: string;
+  citesCount?: number;
+  citedByCount?: number;
+  evidenceWindows: string[];
+  bodyExcerpt: string[];
+};
+
+export type DetailHydrationErrorCode =
+  | "http_403"
+  | "http_429"
+  | "timeout"
+  | "parse_empty"
+  | "network"
+  | "unknown";
+
+export type DetailHydrationOutcome = {
+  status: "success" | "failed" | "fallback_success" | "fallback_failed";
+  errorCode?: DetailHydrationErrorCode;
+  attemptedUrls?: string[];
+  finalUrl?: string;
+};
+
 export type CaseCandidate = {
   source: "indiankanoon";
   title: string;
@@ -53,6 +81,8 @@ export type CaseCandidate = {
   author?: string;
   fullDocumentUrl?: string;
   detailText?: string;
+  detailArtifact?: IndianKanoonDetailArtifact;
+  detailHydration?: DetailHydrationOutcome;
   evidenceQuality?: {
     hasRelationSentence: boolean;
     hasPolaritySentence: boolean;
@@ -107,7 +137,7 @@ export type SearchResponse = {
   status?: "completed" | "blocked" | "partial" | "no_match";
   retryAfterMs?: number;
   blockedKind?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
-  executionPath?: "client_first" | "server_fallback" | "server_only";
+  executionPath?: "server_fallback" | "server_only";
   clientDirectAttempted?: boolean;
   clientDirectSucceeded?: boolean;
   partialRun?: boolean;
@@ -167,6 +197,7 @@ export type SearchResponse = {
       reasonerTimeout?: boolean;
       reasonerDegraded?: boolean;
       reasonerError?: string;
+      reasonerWarnings?: string[];
       reasonerAttempted?: boolean;
       reasonerStatus?:
         | "ok"
@@ -179,6 +210,9 @@ export type SearchResponse = {
         | "disabled"
         | "error";
       reasonerSkipReason?: string;
+      reasonerStage?: "sketch" | "expand" | "pass2" | "skipped";
+      reasonerStageLatencyMs?: Record<string, number>;
+      reasonerPlanSource?: "llm_sketch+deterministic_expand" | "deterministic_only";
       pass1Invoked?: boolean;
       pass2Invoked?: boolean;
       pass2Reason?: string;
@@ -217,6 +251,8 @@ export type SearchResponse = {
       elapsedMs?: number;
     };
     retrieval: {
+      providerId?: "indiankanoon_html" | "serper";
+      providerReason?: string;
       phaseAttempts: Record<string, number>;
       phaseSuccesses: Record<string, number>;
       statusCounts: Record<string, number>;
@@ -255,11 +291,19 @@ export type SearchResponse = {
     verification: {
       attempted: number;
       detailFetched: number;
+      detailFetchFailed?: number;
+      detailFetchFallbackUsed?: number;
+      detailFetchErrorCounts?: Record<string, number>;
+      detailFetchSampleErrors?: string[];
+      hybridFallbackUsed?: number;
+      hybridFallbackSuccesses?: number;
+      detailHydrationCoverage?: number;
       passedCaseGate: number;
       limit: number;
+      networkFetchAllowed?: boolean;
     };
     routing?: {
-      decision: "client_first" | "server_fallback" | "server_only";
+      decision: "server_fallback" | "server_only";
       reason: string;
       clientProbe?: string;
     };

@@ -2,7 +2,7 @@ import { buildKeywordPackWithAI } from "@/lib/ai-keyword-planner";
 import { buildKeywordPack } from "@/lib/keywords";
 import { sanitizeNlqForSearch } from "@/lib/nlq";
 import { IntentProfile, PlannerOutput, QueryVariant } from "@/lib/pipeline/types";
-import { ReasonerPlan } from "@/lib/reasoner-schema";
+import { ReasonerOutcomePolarity, ReasonerPlan } from "@/lib/reasoner-schema";
 import { CaseCandidate, KeywordPack, ScoredCase } from "@/lib/types";
 
 type HookGroupPlan = {
@@ -128,9 +128,14 @@ function expandHookTerms(term: string): string[] {
 
 function inferOutcomePolarityCue(cleanedQuery: string, outcomeTerms: string[]): string[] {
   const q = normalizePhrase(`${cleanedQuery} ${outcomeTerms.join(" ")}`);
+  const cues: string[] = [];
   if (/\bsanction\b/.test(q)) {
-    if (/\b(?:not required|no sanction required|without sanction)\b/.test(q)) return ["sanction not required"];
-    if (/\b(?:required|mandatory|necessary|must)\b/.test(q)) return ["sanction required"];
+    if (/\b(?:not required|no sanction required|without sanction)\b/.test(q)) {
+      cues.push("sanction not required");
+    }
+    if (/\b(?:required|mandatory|necessary|must)\b/.test(q)) {
+      cues.push("sanction required");
+    }
   }
   if (
     /\bdelay\s+(?:has|was|is|had)?\s*not\s+(?:been\s+)?condon(?:ed|able)\b/.test(q) ||
@@ -141,18 +146,80 @@ function inferOutcomePolarityCue(cleanedQuery: string, outcomeTerms: string[]): 
     /\bcondonation(?:\s+of\s+delay)?\s+not\s+granted\b/.test(q) ||
     /\b(?:not condoned|refused|rejected|declined)\b/.test(q)
   ) {
-    return ["delay not condoned"];
+    cues.push("delay not condoned");
   }
-  if (/\b(?:dismissed|time barred|barred by limitation)\b/.test(q)) return ["appeal dismissed as time barred"];
-  if (/\bquashed\b/.test(q)) return ["proceedings quashed"];
-  return [];
+  if (/\b(?:dismissed|time barred|barred by limitation)\b/.test(q)) {
+    cues.push("appeal dismissed as time barred");
+  }
+  if (/\bquashed\b/.test(q)) {
+    cues.push("proceedings quashed");
+  }
+  return unique(cues);
+}
+
+function inferExpectedPolarity(
+  cleanedQuery: string,
+  outcomeTerms: string[],
+  reasonerPlan?: ReasonerPlan,
+): ReasonerOutcomePolarity {
+  const planPolarity = reasonerPlan?.proposition.outcome_constraint.polarity;
+  if (planPolarity && planPolarity !== "unknown") {
+    return planPolarity;
+  }
+  const q = normalizePhrase(`${cleanedQuery} ${outcomeTerms.join(" ")}`);
+  if (/\b(?:appeal\s+dismissed|dismissed\s+as\s+time[-\s]*barred|barred\s+by\s+limitation|time[-\s]*barred)\b/.test(q)) {
+    return "dismissed";
+  }
+  if (
+    /\b(?:delay\s+not\s+condon(?:ed|able)|condonation(?:\s+of\s+delay)?\s+(?:refused|rejected|denied|dismissed|declined)|not\s+condon(?:ed|able))\b/.test(
+      q,
+    )
+  ) {
+    return "refused";
+  }
+  if (/\bquashed\b/.test(q)) {
+    return "quashed";
+  }
+  if (/\b(?:sanction\s+not\s+required|no\s+sanction\s+required|without\s+sanction)\b/.test(q)) {
+    return "not_required";
+  }
+  if (/\b(?:sanction\s+required|mandatory|necessary|must)\b/.test(q)) {
+    return "required";
+  }
+  return "unknown";
+}
+
+function filterPolarityCues(
+  cues: string[],
+  expectedPolarity: ReasonerOutcomePolarity,
+): string[] {
+  if (cues.length === 0) return cues;
+  if (expectedPolarity === "required") {
+    return cues.filter((cue) => cue !== "sanction not required");
+  }
+  if (expectedPolarity === "not_required") {
+    return cues.filter((cue) => cue !== "sanction required");
+  }
+  if (expectedPolarity === "dismissed") {
+    return cues.filter((cue) => cue !== "delay not condoned");
+  }
+  if (expectedPolarity === "refused") {
+    return cues.filter((cue) => cue !== "appeal dismissed as time barred");
+  }
+  return cues;
 }
 
 function requiredPolarityTokens(intent: IntentProfile, reasonerPlan?: ReasonerPlan): string[] {
-  const cues = inferOutcomePolarityCue(
+  const rawCues = inferOutcomePolarityCue(
     intent.cleanedQuery,
     reasonerPlan?.proposition.outcome_required ?? intent.issues,
   );
+  const expectedPolarity = inferExpectedPolarity(
+    intent.cleanedQuery,
+    reasonerPlan?.proposition.outcome_required ?? intent.issues,
+    reasonerPlan,
+  );
+  const cues = filterPolarityCues(rawCues, expectedPolarity);
   return unique(cues.flatMap((cue) => tokenizePhrase(cue))).slice(0, 4);
 }
 
@@ -279,7 +346,8 @@ function buildPropositionStrategy(input: {
     intent.issues,
     [],
   );
-  const polarityCues = inferOutcomePolarityCue(intent.cleanedQuery, outcomes);
+  const expectedPolarity = inferExpectedPolarity(intent.cleanedQuery, outcomes, reasonerPlan);
+  const polarityCues = filterPolarityCues(inferOutcomePolarityCue(intent.cleanedQuery, outcomes), expectedPolarity);
   const polarityCueTokens = polarityCues.flatMap((cue) => tokenizePhrase(cue));
 
   const strict: string[] = [];
@@ -510,6 +578,22 @@ function buildVariantsFromKeywordPack(input: {
   const legalSignalTokens = buildLegalSignalTokenSet(intent, reasonerPlan);
   const requiredHookGroups = buildRequiredHookGroups(intent, reasonerPlan);
   const polarityTokens = requiredPolarityTokens(intent, reasonerPlan);
+  const expectedPolarity = inferExpectedPolarity(
+    intent.cleanedQuery,
+    reasonerPlan?.proposition.outcome_required ?? intent.issues,
+    reasonerPlan,
+  );
+  const outcomePhrases = unique([
+    ...filterPolarityCues(
+      inferOutcomePolarityCue(intent.cleanedQuery, reasonerPlan?.proposition.outcome_required ?? intent.issues),
+      expectedPolarity,
+    ),
+    ...(reasonerPlan?.proposition.outcome_required ?? []),
+    ...intent.issues,
+  ])
+    .map((value) => sanitizeTokens(tokenizePhrase(value), 8))
+    .filter((value) => value.length >= 6)
+    .slice(0, 8);
   const strictAxisRequirement = propositionStrategy.strictAxisRequirement;
   const variants: QueryVariant[] = [];
   const seen = new Set<string>();
@@ -547,12 +631,46 @@ function buildVariantsFromKeywordPack(input: {
     strictAxisRequirement,
   });
 
+  if (!variants.some((variant) => variant.strictness === "strict")) {
+    const actorPool = (reasonerPlan?.proposition.actors?.length ? reasonerPlan.proposition.actors : intent.actors).slice(0, 3);
+    const procedurePool = (
+      reasonerPlan?.proposition.proceeding?.length ? reasonerPlan.proposition.proceeding : intent.procedures
+    ).slice(0, 3);
+    const outcomePool = (
+      reasonerPlan?.proposition.outcome_required?.length ? reasonerPlan.proposition.outcome_required : outcomePhrases
+    ).slice(0, 3);
+    const fallbackStrict: string[] = [];
+    for (const actor of actorPool.length > 0 ? actorPool : ["state"]) {
+      for (const procedure of procedurePool.length > 0 ? procedurePool : ["appeal"]) {
+        for (const outcome of outcomePool.length > 0 ? outcomePool : ["delay not condoned"]) {
+          const phrase = sanitizeTokens(tokenizePhrase(`${actor} ${procedure} ${outcome}`), 12);
+          if (phrase.length >= 10) fallbackStrict.push(phrase);
+        }
+      }
+    }
+    appendPhaseVariants({
+      output: variants,
+      seen,
+      phase: "primary",
+      purpose: "strict-backstop",
+      phrases: unique(fallbackStrict),
+      courtScope,
+      strictness: "strict",
+      courted: true,
+      legalSignalTokens,
+      requiredHookGroups,
+      enforceAllGroups: true,
+      requiredTokens: [],
+      strictAxisRequirement,
+    });
+  }
+
   appendPhaseVariants({
     output: variants,
     seen,
     phase: "rescue",
     purpose: "keyword-rescue",
-    phrases: keywordPack.searchPhrases,
+    phrases: [...propositionStrategy.strict, ...outcomePhrases, ...keywordPack.searchPhrases],
     courtScope,
     strictness: "relaxed",
     courted: false,
@@ -564,7 +682,7 @@ function buildVariantsFromKeywordPack(input: {
     seen,
     phase: "micro",
     purpose: "micro-signals",
-    phrases: [...keywordPack.legalSignals, ...intent.statutes, ...intent.procedures],
+    phrases: [...outcomePhrases, ...keywordPack.legalSignals, ...intent.statutes, ...intent.procedures, ...intent.issues],
     courtScope,
     strictness: "relaxed",
     courted: false,
@@ -576,7 +694,7 @@ function buildVariantsFromKeywordPack(input: {
     seen,
     phase: "revolving",
     purpose: "revolving-broad",
-    phrases: [...keywordPack.primary, ...keywordPack.searchPhrases],
+    phrases: [...outcomePhrases, ...keywordPack.primary, ...keywordPack.searchPhrases, ...intent.issues],
     courtScope,
     strictness: "relaxed",
     courted: false,
@@ -602,6 +720,15 @@ export function buildReasonerQueryVariants(input: {
   const legalSignalTokens = buildLegalSignalTokenSet(intent, plan);
   const requiredHookGroups = buildRequiredHookGroups(intent, plan);
   const polarityTokens = requiredPolarityTokens(intent, plan);
+  const expectedPolarity = inferExpectedPolarity(
+    intent.cleanedQuery,
+    plan.proposition.outcome_required.length > 0 ? plan.proposition.outcome_required : intent.issues,
+    plan,
+  );
+  const filteredPlanCues = filterPolarityCues(
+    inferOutcomePolarityCue(intent.cleanedQuery, plan.proposition.outcome_required),
+    expectedPolarity,
+  );
   const strictAxisRequirement: StrictAxisRequirement = {
     enabled: requiredHookGroups.length === 0,
     actorTokens: new Set((plan.proposition.actors.length > 0 ? plan.proposition.actors : intent.actors).flatMap((value) =>
@@ -613,8 +740,8 @@ export function buildReasonerQueryVariants(input: {
       ),
     ),
     outcomeTokens: new Set(
-      (inferOutcomePolarityCue(intent.cleanedQuery, plan.proposition.outcome_required).length > 0
-        ? inferOutcomePolarityCue(intent.cleanedQuery, plan.proposition.outcome_required)
+      (filteredPlanCues.length > 0
+        ? filteredPlanCues
         : plan.proposition.outcome_required.length > 0
           ? plan.proposition.outcome_required
           : intent.issues

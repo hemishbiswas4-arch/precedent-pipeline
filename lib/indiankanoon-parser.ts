@@ -74,7 +74,16 @@ export function normalizeDocHref(href: string): string | null {
   return `https://indiankanoon.org/doc/${docId}/`;
 }
 
-function inferCourtLevel(text: string): CourtLevel {
+export function canonicalDocHref(href: string): string | null {
+  if (!href) return null;
+  const absolute = normalizeSearchHref(href);
+  if (!absolute) return null;
+  const docId = absolute.match(/\/(?:doc|docfragment)\/(\d+)\/?/i)?.[1];
+  if (!docId) return null;
+  return `https://indiankanoon.org/doc/${docId}/`;
+}
+
+export function inferCourtLevelFromText(text: string): CourtLevel {
   const t = text.toLowerCase();
   if (t.includes("supreme court")) {
     return "SC";
@@ -220,7 +229,7 @@ function parseCandidateFromResultChunk(resultChunk: string): CaseCandidate | nul
     ) ?? resultChunk.match(/<p[^>]*>([\s\S]*?)<\/p>/im);
   const snippet = stripHtmlTags(snippetMatch?.[1] ?? "");
   const metadata = parseResultMetadata(resultChunk);
-  const court = inferCourtLevel(`${metadata.courtText ?? ""} ${title} ${snippet}`);
+  const court = inferCourtLevelFromText(`${metadata.courtText ?? ""} ${title} ${snippet}`);
 
   return {
     source: "indiankanoon",
@@ -271,7 +280,7 @@ export function harvestIndianKanoonDocLinks(html: string): CaseCandidate[] {
       title: title.length > 0 ? title : "Untitled case link",
       url,
       snippet,
-      court: inferCourtLevel(`${title} ${snippet}`),
+      court: inferCourtLevelFromText(`${title} ${snippet}`),
       fullDocumentUrl: url,
     });
     seen.add(url);
@@ -283,11 +292,21 @@ export function harvestIndianKanoonDocLinks(html: string): CaseCandidate[] {
 
 export function detectIndianKanoonChallenge(html: string): boolean {
   const lower = html.toLowerCase();
+  const markers = [
+    "attention required",
+    "just a moment",
+    "cf-chl",
+    "cloudflare",
+    "cdn-cgi/challenge-platform",
+    "__cf_chl",
+    "cf-turnstile",
+    "challenges.cloudflare.com",
+    "cf_clearance",
+    "checking your browser",
+    "verify you are human",
+  ];
   return (
-    lower.includes("attention required") ||
-    lower.includes("just a moment") ||
-    lower.includes("cf-chl") ||
-    lower.includes("cloudflare")
+    markers.some((marker) => lower.includes(marker))
   );
 }
 

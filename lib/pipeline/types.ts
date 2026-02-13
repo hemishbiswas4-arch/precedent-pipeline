@@ -59,7 +59,9 @@ export type ClassifiedCandidate = CaseCandidate & {
 };
 
 export type RetrievalAttempt = {
+  providerId?: string;
   phase: QueryPhase;
+  courtScope?: CourtScope;
   variantId: string;
   phrase: string;
   searchQuery?: string;
@@ -127,6 +129,13 @@ export type SchedulerResult = {
 export type VerificationSummary = {
   attempted: number;
   detailFetched: number;
+  detailFetchFailed?: number;
+  detailFetchFallbackUsed?: number;
+  detailFetchErrorCounts?: Record<string, number>;
+  detailFetchSampleErrors?: string[];
+  hybridFallbackUsed?: number;
+  hybridFallbackSuccesses?: number;
+  detailHydrationCoverage?: number;
   passedCaseGate: number;
 };
 

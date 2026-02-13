@@ -57,6 +57,22 @@ export type ReasonerValidationResult = {
   warnings: string[];
 };
 
+export type ReasonerSketch = {
+  actors: string[];
+  proceeding: string[];
+  outcome: string[];
+  hooks: string[];
+  polarity: ReasonerOutcomePolarity;
+  strict_terms: string[];
+  broad_terms: string[];
+  court_hint: ReasonerCourtHint;
+};
+
+export type ReasonerSketchValidationResult = {
+  sketch: ReasonerSketch;
+  warnings: string[];
+};
+
 function asTextList(value: unknown, maxItems: number, maxTokenLength = 120): string[] {
   if (!Array.isArray(value)) return [];
   const output: string[] = [];
@@ -72,6 +88,24 @@ function asTextList(value: unknown, maxItems: number, maxTokenLength = 120): str
     if (output.includes(normalized)) continue;
     output.push(normalized);
     if (output.length >= maxItems) break;
+  }
+  return output;
+}
+
+function asTextListFlexible(value: unknown, maxItems: number, maxTokenLength = 120): string[] {
+  if (Array.isArray(value)) return asTextList(value, maxItems, maxTokenLength);
+  if (typeof value === "string") return asTextList([value], maxItems, maxTokenLength);
+  return [];
+}
+
+function mergeTextAliases(values: unknown[], maxItems: number, maxTokenLength = 120): string[] {
+  const output: string[] = [];
+  for (const value of values) {
+    for (const token of asTextListFlexible(value, maxItems, maxTokenLength)) {
+      if (output.includes(token)) continue;
+      output.push(token);
+      if (output.length >= maxItems) return output;
+    }
   }
   return output;
 }
@@ -240,6 +274,175 @@ const EMPTY_PLAN: ReasonerPlan = {
   case_anchors: [],
 };
 
+const EMPTY_SKETCH: ReasonerSketch = {
+  actors: [],
+  proceeding: [],
+  outcome: [],
+  hooks: [],
+  polarity: "unknown",
+  strict_terms: [],
+  broad_terms: [],
+  court_hint: "ANY",
+};
+
+function uniqueTerms(values: string[], maxItems: number): string[] {
+  const output: string[] = [];
+  for (const value of values) {
+    if (!value || output.includes(value)) continue;
+    output.push(value);
+    if (output.length >= maxItems) break;
+  }
+  return output;
+}
+
+function makeVariant(terms: string[], maxTokens = 12): string | null {
+  const cleaned = terms
+    .flatMap((entry) => entry.split(/\s+/))
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token.length > 0);
+  if (cleaned.length < 2) return null;
+  return sanitizeVariant(cleaned.slice(0, maxTokens).join(" "));
+}
+
+function defaultContradictionTerms(polarity: ReasonerOutcomePolarity): string[] {
+  if (polarity === "refused") {
+    return ["condoned", "delay condoned", "allowed", "restored"];
+  }
+  if (polarity === "dismissed") {
+    return ["allowed", "set aside", "restored"];
+  }
+  if (polarity === "required") {
+    return ["not required", "without", "dispensed with"];
+  }
+  if (polarity === "not_required") {
+    return ["required", "mandatory", "necessary"];
+  }
+  return [];
+}
+
+export function validateReasonerSketch(raw: unknown): ReasonerSketchValidationResult {
+  const warnings: string[] = [];
+  if (!raw || typeof raw !== "object") {
+    warnings.push("reasoner sketch payload is not an object");
+    return { sketch: EMPTY_SKETCH, warnings };
+  }
+
+  const payload = raw as Record<string, unknown>;
+  const propositionRaw =
+    payload.proposition && typeof payload.proposition === "object"
+      ? (payload.proposition as Record<string, unknown>)
+      : {};
+  const outcomeConstraintRaw =
+    propositionRaw.outcome_constraint && typeof propositionRaw.outcome_constraint === "object"
+      ? (propositionRaw.outcome_constraint as Record<string, unknown>)
+      : {};
+
+  const sketch: ReasonerSketch = {
+    actors: mergeTextAliases(
+      [payload.actors, payload.actor, propositionRaw.actors, propositionRaw.actor, propositionRaw.actor_role],
+      8,
+    ),
+    proceeding: mergeTextAliases(
+      [payload.proceeding, payload.posture, propositionRaw.proceeding, propositionRaw.posture],
+      8,
+    ),
+    outcome: mergeTextAliases(
+      [
+        payload.outcome,
+        payload.outcome_required,
+        payload.required_outcome,
+        propositionRaw.outcome_required,
+        propositionRaw.required_outcome,
+      ],
+      10,
+      160,
+    ),
+    hooks: mergeTextAliases(
+      [payload.hooks, payload.legal_hooks, propositionRaw.legal_hooks, payload.statutes, payload.statutes_or_sections],
+      12,
+      160,
+    ),
+    polarity: normalizeOutcomePolarity(
+      payload.polarity ?? payload.outcome_polarity ?? outcomeConstraintRaw.polarity ?? propositionRaw.outcome_polarity,
+    ),
+    strict_terms: sanitizeVariants(payload.strict_terms ?? payload.query_variants_strict, 12),
+    broad_terms: sanitizeVariants(payload.broad_terms ?? payload.query_variants_broad, 12),
+    court_hint: normalizeCourtHint(payload.court_hint ?? payload.jurisdiction_hint ?? propositionRaw.jurisdiction_hint),
+  };
+
+  if (sketch.strict_terms.length === 0) {
+    warnings.push("reasoner sketch has no strict_terms");
+  }
+  return { sketch, warnings };
+}
+
+export function expandReasonerPlanFromSketch(sketch: ReasonerSketch): ReasonerPlan {
+  const mustHaveTerms = uniqueTerms(
+    [...sketch.actors, ...sketch.proceeding, ...sketch.outcome, ...sketch.hooks, ...sketch.strict_terms],
+    16,
+  );
+  const contradictionTerms = defaultContradictionTerms(sketch.polarity);
+  const strictVariantsFromSketch = sanitizeVariants(sketch.strict_terms, 12);
+  const strictVariantsFallback = [
+    makeVariant([sketch.actors[0] ?? "", sketch.proceeding[0] ?? "", sketch.outcome[0] ?? "", ...(sketch.hooks.slice(0, 2) ?? [])]),
+    makeVariant([sketch.actors[0] ?? "", sketch.proceeding[0] ?? "", sketch.outcome[0] ?? ""]),
+    makeVariant([sketch.proceeding[0] ?? "", sketch.outcome[0] ?? "", ...(sketch.hooks.slice(0, 2) ?? [])]),
+  ]
+    .filter((value): value is string => Boolean(value));
+  const strictVariants = uniqueTerms([...strictVariantsFromSketch, ...strictVariantsFallback], 12);
+  const broadVariants = uniqueTerms(
+    [
+      ...sanitizeVariants(sketch.broad_terms, 12),
+      ...sanitizeVariants(sketch.strict_terms, 12),
+      makeVariant([sketch.proceeding[0] ?? "", sketch.outcome[0] ?? "", sketch.hooks[0] ?? ""]) ?? "",
+      makeVariant([sketch.outcome[0] ?? "", sketch.hooks[0] ?? ""]) ?? "",
+    ].filter(Boolean) as string[],
+    12,
+  );
+
+  const hookGroups: ReasonerHookGroup[] = sketch.hooks.slice(0, 4).map((hook, index) => ({
+    group_id: `hook_${index + 1}`,
+    terms: [hook],
+    min_match: 1,
+    required: true,
+  }));
+  const relations: ReasonerRelation[] =
+    hookGroups.length >= 2
+      ? [
+          {
+            type: "interacts_with",
+            left_group_id: hookGroups[0].group_id,
+            right_group_id: hookGroups[1].group_id,
+            required: true,
+          },
+        ]
+      : [];
+
+  return {
+    proposition: {
+      actors: sketch.actors,
+      proceeding: sketch.proceeding,
+      legal_hooks: sketch.hooks,
+      outcome_required: sketch.outcome,
+      outcome_negative: contradictionTerms,
+      jurisdiction_hint: sketch.court_hint,
+      hook_groups: hookGroups,
+      relations,
+      outcome_constraint: {
+        polarity: sketch.polarity,
+        terms: uniqueTerms([...sketch.outcome, ...sketch.strict_terms.slice(0, 2)], 10),
+        contradiction_terms: contradictionTerms,
+      },
+      interaction_required: hookGroups.length >= 2,
+    },
+    must_have_terms: mustHaveTerms,
+    must_not_have_terms: contradictionTerms,
+    query_variants_strict: strictVariants,
+    query_variants_broad: broadVariants,
+    case_anchors: uniqueTerms([...sketch.strict_terms, ...sketch.outcome, ...sketch.proceeding], 12),
+  };
+}
+
 export function validateReasonerPlan(raw: unknown): ReasonerValidationResult {
   const warnings: string[] = [];
   if (!raw || typeof raw !== "object") {
@@ -259,10 +462,10 @@ export function validateReasonerPlan(raw: unknown): ReasonerValidationResult {
   const normalizedOutcomeConstraint = asOutcomeConstraint(propositionRaw.outcome_constraint);
 
   const proposition: ReasonerProposition = {
-    actors: asTextList(propositionRaw.actors, 8),
-    proceeding: asTextList(propositionRaw.proceeding, 8),
+    actors: mergeTextAliases([propositionRaw.actors, propositionRaw.actor, propositionRaw.actor_role], 8),
+    proceeding: mergeTextAliases([propositionRaw.proceeding, propositionRaw.posture], 8),
     legal_hooks: asTextList(propositionRaw.legal_hooks, 12),
-    outcome_required: asTextList(propositionRaw.outcome_required, 10),
+    outcome_required: mergeTextAliases([propositionRaw.outcome_required, propositionRaw.required_outcome], 10, 160),
     outcome_negative: asTextList(propositionRaw.outcome_negative, 10),
     jurisdiction_hint: normalizeCourtHint(propositionRaw.jurisdiction_hint),
     hook_groups: hookGroups,

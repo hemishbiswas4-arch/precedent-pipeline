@@ -5,6 +5,8 @@ import { runLegacySearch } from "@/lib/legacy/engine";
 import { sharedCache } from "@/lib/cache/shared-cache";
 import { SearchResponse } from "@/lib/types";
 
+export const runtime = "nodejs";
+
 const DEFAULT_MAX_RESULTS = 20;
 const DEBUG_BY_DEFAULT = process.env.PRECEDENT_DEBUG === "1";
 const PIPELINE_V2_ENABLED = process.env.PIPELINE_V2 !== "0";
@@ -30,6 +32,8 @@ function searchCacheKey(query: string, maxResults: number): string {
     process.env.STRICT_INTERSECTION_REQUIRED_WHEN_MULTIHOOK ?? "1",
     process.env.PROVISIONAL_CONFIDENCE_CAP ?? "0.70",
     process.env.NEARMISS_CONFIDENCE_CAP ?? "0.50",
+    process.env.RETRIEVAL_PROVIDER ?? "auto",
+    process.env.SERPER_API_KEY ? "serper_key_present" : "serper_key_missing",
     SEARCH_RUNTIME_PROFILE,
   ].join("|");
   const digest = createHash("sha256")
@@ -83,7 +87,7 @@ async function waitForInflightCache(
 }
 
 function withRoutingAndTiming(response: SearchResponse, input: {
-  decision: "client_first" | "server_fallback" | "server_only";
+  decision: "server_fallback" | "server_only";
   reason: string;
   stageMs: Record<string, number>;
 }): SearchResponse {

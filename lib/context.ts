@@ -84,6 +84,11 @@ const ISSUE_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
     pattern: /\bcondonation(?:\s+of\s+delay)?\s+not\s+granted\b/gi,
   },
   {
+    label: "delay condonation refused",
+    pattern:
+      /\b(?:delay\s+condonation|condonation(?:\s+of\s+delay)?|application\s+for\s+condonation)\b[\s\S]{0,80}\b(?:refused|rejected|dismissed|declined|denied)\b/gi,
+  },
+  {
     label: "appeal dismissed as time barred",
     pattern: /\bappeal\s+(?:was\s+)?(?:dismissed|rejected)\s+(?:as\s+)?time[-\s]*barred\b/gi,
   },
@@ -130,12 +135,17 @@ function unique(values: string[]): string[] {
 function extractSectionsAndStatutes(query: string): string[] {
   const q = normalize(query);
   const sections = Array.from(
-    q.matchAll(/\b(?:section|sec\.?|s\.)\s*\d+[a-z]?(?:\(\d+\))?(?:\s*\([a-z]\))?(?:\s*(?:ipc|crpc|cpc|pc act|limitation act))?/gi),
+    q.matchAll(
+      /\b(?:section|sec\.?|s\.)\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\s*(?:ipc|crpc|cpc|pc act|limitation act))?/gi,
+    ),
   ).map((match) => match[0].replace(/\s+/g, " ").trim());
+  // Match subsection tokens like 13(1)(e) even though they end with ')', which breaks \b boundaries.
   const bareSections = Array.from(
-    q.matchAll(/\b\d+(?:\([0-9a-z]+\))+(?:\([a-z]\))?(?:\s*(?:ipc|crpc|cpc|pc act|prevention of corruption act|limitation act))?\b/gi),
+    q.matchAll(
+      /(?:^|[^a-z0-9])(\d+(?:\([0-9a-z]+\))+(?:\s*(?:ipc|crpc|cpc|pc act|prevention of corruption act|limitation act))?)(?=$|[^a-z0-9])/gi,
+    ),
   ).map((match) => {
-    const token = match[0].replace(/\s+/g, " ").trim();
+    const token = (match[1] ?? "").replace(/\s+/g, " ").trim();
     return token.startsWith("section") ? token : `section ${token}`;
   });
 

@@ -1,9 +1,15 @@
 import { randomUUID, createHash } from "crypto";
-import { ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+import { ConverseCommand, type ConverseCommandInput } from "@aws-sdk/client-bedrock-runtime";
 import { getBedrockClient, getBedrockModelConfig } from "@/lib/bedrock-client";
 import { sharedCache } from "@/lib/cache/shared-cache";
 import { ContextProfile } from "@/lib/types";
-import { isUsableReasonerPlan, ReasonerPlan, validateReasonerPlan } from "@/lib/reasoner-schema";
+import {
+  expandReasonerPlanFromSketch,
+  isUsableReasonerPlan,
+  ReasonerPlan,
+  validateReasonerPlan,
+  validateReasonerSketch,
+} from "@/lib/reasoner-schema";
 
 type ReasonerCachePayload = {
   plan: ReasonerPlan;
@@ -27,6 +33,9 @@ export type ReasonerTelemetry = {
   error?: string;
   modelId?: string;
   warnings?: string[];
+  reasonerStage?: "sketch" | "expand" | "pass2" | "skipped";
+  reasonerStageLatencyMs?: Record<string, number>;
+  reasonerPlanSource?: "llm_sketch+deterministic_expand" | "deterministic_only";
 };
 
 export type ReasonerExecution = {
@@ -40,23 +49,35 @@ export type ReasonerMode = "pass1" | "pass2";
 let inflightReasonerCalls = 0;
 
 const MODE = (process.env.LLM_REASONER_MODE ?? "initial").toLowerCase();
-const TIMEOUT_MS = Math.max(200, Number(process.env.LLM_REASONER_TIMEOUT_MS ?? "1500"));
-const MAX_TIMEOUT_MS = Math.max(TIMEOUT_MS, Number(process.env.LLM_REASONER_MAX_TIMEOUT_MS ?? "2400"));
-const MAX_TOKENS = Math.max(100, Number(process.env.LLM_REASONER_MAX_TOKENS ?? "450"));
+// Production default favors a single, slightly longer attempt so we actually use the reasoner,
+// instead of timing out quickly and falling back to deterministic every time.
+const TIMEOUT_MS = Math.max(200, Number(process.env.LLM_REASONER_TIMEOUT_MS ?? "1800"));
+const MAX_TIMEOUT_MS = Math.max(TIMEOUT_MS, Number(process.env.LLM_REASONER_MAX_TIMEOUT_MS ?? "4500"));
+const MAX_TOKENS = Math.max(100, Number(process.env.LLM_REASONER_MAX_TOKENS ?? "360"));
+// Guardrail: long generations are a primary source of latency/timeouts on big models.
+// Use LLM_REASONER_MAX_TOKENS to tune, but keep a sane upper bound unless explicitly overridden.
+const HARD_MAX_TOKENS = Math.max(120, Number(process.env.LLM_REASONER_HARD_MAX_TOKENS ?? "520"));
 const MAX_CALLS_PER_REQUEST = Math.max(0, Number(process.env.LLM_REASONER_MAX_CALLS_PER_REQUEST ?? "2"));
 const CACHE_TTL_SEC = Math.max(60, Number(process.env.LLM_REASONER_CACHE_TTL_SEC ?? "21600"));
 const PASS2_CACHE_TTL_SEC = Math.max(60, Number(process.env.LLM_REASONER_PASS2_CACHE_TTL_SEC ?? "900"));
 const CIRCUIT_ENABLED = (process.env.LLM_CIRCUIT_BREAKER_ENABLED ?? "1") !== "0";
-const CIRCUIT_FAIL_THRESHOLD = Math.max(1, Number(process.env.LLM_CIRCUIT_FAIL_THRESHOLD ?? "5"));
+const CIRCUIT_FAIL_THRESHOLD = Math.max(1, Number(process.env.LLM_CIRCUIT_FAIL_THRESHOLD ?? "2"));
 const CIRCUIT_COOLDOWN_MS = Math.max(1_000, Number(process.env.LLM_CIRCUIT_COOLDOWN_MS ?? "30000"));
 const LOCAL_MAX_INFLIGHT = Math.max(1, Number(process.env.LLM_REASONER_MAX_INFLIGHT ?? "4"));
 const GLOBAL_RATE_LIMIT = Math.max(0, Number(process.env.LLM_REASONER_GLOBAL_RATE_LIMIT ?? "0"));
 const GLOBAL_RATE_WINDOW_SEC = Math.max(5, Number(process.env.LLM_REASONER_GLOBAL_RATE_WINDOW_SEC ?? "60"));
 const LOCK_TTL_SEC = Math.max(2, Math.ceil(TIMEOUT_MS / 1000) + 2);
 const LOCK_WAIT_MS = Math.max(100, Number(process.env.LLM_REASONER_LOCK_WAIT_MS ?? "250"));
+// Default on: keep attempting pass-1 so users still get LLM reasoning when the model is healthy.
 const FORCE_PASS1_ATTEMPT = (process.env.LLM_REASONER_FORCE_PASS1_ATTEMPT ?? "1") !== "0";
-const RETRY_ON_TIMEOUT_ENABLED = (process.env.LLM_REASONER_RETRY_ON_TIMEOUT ?? "1") !== "0";
-const RETRY_TIMEOUT_BONUS_MS = Math.max(200, Number(process.env.LLM_REASONER_RETRY_TIMEOUT_BONUS_MS ?? "800"));
+const FALLBACK_TIMEOUT_BONUS_MS = Math.max(0, Number(process.env.LLM_REASONER_FALLBACK_TIMEOUT_BONUS_MS ?? "2200"));
+// Keep default off to avoid chaining a second expensive model call after non-timeout parse/config issues.
+const FALLBACK_ON_NON_TIMEOUT_ERROR_ENABLED =
+  (process.env.LLM_REASONER_FALLBACK_ON_NON_TIMEOUT_ERROR ?? "0") !== "0";
+const PASS1_COMPACT_PROMPT = (process.env.LLM_REASONER_PASS1_COMPACT_PROMPT ?? "1") !== "0";
+const STRUCTURED_OUTPUT_ENABLED = (process.env.LLM_REASONER_STRUCTURED_OUTPUT ?? "1") !== "0";
+const OPTIMIZED_LATENCY_ENABLED = (process.env.LLM_REASONER_OPTIMIZED_LATENCY ?? "1") !== "0";
+const FALLBACK_MODEL_ID = process.env.LLM_REASONER_FALLBACK_MODEL_ID?.trim() ?? "";
 
 const CIRCUIT_KEY = "reasoner:circuit:v1";
 
@@ -64,21 +85,233 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function stripMarkdownFences(text: string): string {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1].trim() : trimmed;
+}
+
+function stripPartialFence(text: string): string {
+  return text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function normalizeJsonLikeText(text: string): string {
+  return text
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\u00a0/g, " ")
+    .trim();
+}
+
+function removeTrailingCommas(text: string): string {
+  return text.replace(/,\s*([}\]])/g, "$1");
+}
+
+function previewForTelemetry(text: string, maxChars = 900): string {
+  const cleaned = text
+    .replace(/[^\x20-\x7E]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (cleaned.length <= maxChars) return cleaned;
+  const headLen = Math.max(200, Math.floor(maxChars * 0.7));
+  const tailLen = Math.max(140, maxChars - headLen);
+  return `${cleaned.slice(0, headLen)} … ${cleaned.slice(-tailLen)}`;
+}
+
+function extractBalancedJsonObject(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
 function safeJsonParse(text: string): Record<string, unknown> | null {
+  const normalized = normalizeJsonLikeText(text);
+  const directCandidates = [
+    normalized,
+    stripMarkdownFences(normalized),
+    stripPartialFence(normalized),
+  ];
+
+  for (const candidate of directCandidates) {
+    try {
+      return JSON.parse(candidate) as Record<string, unknown>;
+    } catch {
+      // keep trying
+    }
+  }
+
+  const extracted = extractBalancedJsonObject(stripPartialFence(stripMarkdownFences(normalized)));
+  if (!extracted) {
+    return null;
+  }
+
+  const extractedCandidates = [
+    extracted,
+    removeTrailingCommas(extracted),
+  ];
+  for (const candidate of extractedCandidates) {
+    try {
+      return JSON.parse(candidate) as Record<string, unknown>;
+    } catch {
+      // keep trying
+    }
+  }
+
   try {
     return JSON.parse(text) as Record<string, unknown>;
   } catch {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start < 0 || end <= start) {
-      return null;
-    }
-    try {
-      return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
-    } catch {
-      return null;
-    }
+    return null;
   }
+}
+
+function decodeLooseJsonStringToken(value: string): string {
+  try {
+    return JSON.parse(`"${value}"`) as string;
+  } catch {
+    return value
+      .replace(/\\n/g, " ")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+}
+
+function extractLooseStringArrayField(
+  text: string,
+  key: string,
+  maxItems: number,
+  maxLength = 160,
+): string[] {
+  const keyRegex = new RegExp(`"${key}"\\s*:\\s*\\[`, "i");
+  const keyMatch = keyRegex.exec(text);
+  if (!keyMatch) return [];
+
+  const start = keyMatch.index + keyMatch[0].length;
+  let end = text.indexOf("]", start);
+  if (end < 0) {
+    const rest = text.slice(start);
+    const nextKeyOffset = rest.search(/,\s*"[a-z_][a-z0-9_]*"\s*:/i);
+    end = nextKeyOffset >= 0 ? start + nextKeyOffset : Math.min(text.length, start + 1800);
+  }
+
+  const segment = text.slice(start, end);
+  const output: string[] = [];
+  const stringRegex = /"((?:\\.|[^"\\])*)"/g;
+  let match = stringRegex.exec(segment);
+  while (match) {
+    const decoded = decodeLooseJsonStringToken(match[1] ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (decoded && decoded.length <= maxLength && !output.includes(decoded)) {
+      output.push(decoded);
+      if (output.length >= maxItems) break;
+    }
+    match = stringRegex.exec(segment);
+  }
+  return output;
+}
+
+function extractLooseStringField(text: string, key: string): string | undefined {
+  const regex = new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "i");
+  const match = regex.exec(text);
+  if (!match) return undefined;
+  const decoded = decodeLooseJsonStringToken(match[1] ?? "").replace(/\s+/g, " ").trim();
+  return decoded || undefined;
+}
+
+function composeLooseTerm(parts: Array<string | undefined>, maxWords = 12): string | null {
+  const joined = parts
+    .map((value) => value?.replace(/\s+/g, " ").trim() ?? "")
+    .filter((value) => value.length > 0)
+    .join(" ")
+    .trim();
+  if (!joined) return null;
+  const tokens = joined.split(/\s+/).slice(0, maxWords);
+  if (tokens.length < 2) return null;
+  return tokens.join(" ");
+}
+
+function recoverSketchFromLoosePayload(text: string): Record<string, unknown> | null {
+  const normalized = stripPartialFence(stripMarkdownFences(normalizeJsonLikeText(text)));
+  if (!normalized || normalized.indexOf("{") < 0) return null;
+  const payloadText = normalized.slice(normalized.indexOf("{"));
+
+  const actors = extractLooseStringArrayField(payloadText, "actors", 8);
+  const proceeding = extractLooseStringArrayField(payloadText, "proceeding", 8);
+  const outcome = extractLooseStringArrayField(payloadText, "outcome", 10);
+  const hooks = extractLooseStringArrayField(payloadText, "hooks", 12);
+  const strictTerms = extractLooseStringArrayField(payloadText, "strict_terms", 8);
+  const broadTerms = extractLooseStringArrayField(payloadText, "broad_terms", 8);
+  const polarity = extractLooseStringField(payloadText, "polarity");
+  const courtHint = extractLooseStringField(payloadText, "court_hint");
+
+  const recoveredStrictTerms = strictTerms.length > 0
+    ? strictTerms
+    : [
+        composeLooseTerm([actors[0], proceeding[0], outcome[0], hooks[0]]),
+        composeLooseTerm([proceeding[0], outcome[0], hooks[0]]),
+        composeLooseTerm([actors[0], outcome[0], hooks[0]]),
+      ].filter((value): value is string => Boolean(value));
+
+  if (
+    recoveredStrictTerms.length === 0 &&
+    actors.length === 0 &&
+    proceeding.length === 0 &&
+    outcome.length === 0 &&
+    hooks.length === 0
+  ) {
+    return null;
+  }
+
+  const recovered: Record<string, unknown> = {
+    strict_terms: recoveredStrictTerms,
+  };
+  if (actors.length > 0) recovered.actors = actors;
+  if (proceeding.length > 0) recovered.proceeding = proceeding;
+  if (outcome.length > 0) recovered.outcome = outcome;
+  if (hooks.length > 0) recovered.hooks = hooks;
+  if (broadTerms.length > 0) recovered.broad_terms = broadTerms;
+  if (polarity) recovered.polarity = polarity;
+  if (courtHint) recovered.court_hint = courtHint;
+
+  return recovered;
 }
 
 function mergeWarnings(...sets: Array<string[] | undefined>): string[] {
@@ -94,123 +327,192 @@ function mergeWarnings(...sets: Array<string[] | undefined>): string[] {
   return output;
 }
 
-function promptForReasoner(query: string, context: ContextProfile): string {
-  return JSON.stringify({
-    query,
-    context,
-    output_schema: {
-      proposition: {
-        actors: ["..."],
-        proceeding: ["..."],
-        legal_hooks: ["..."],
-        outcome_required: ["..."],
-        outcome_negative: ["..."],
-        jurisdiction_hint: "SC|HC|ANY",
-        hook_groups: [
-          {
-            group_id: "hook_group_1",
-            terms: ["..."],
-            min_match: 1,
-            required: true,
+const REASONER_PLAN_JSON_SCHEMA = JSON.stringify({
+  $schema: "http://json-schema.org/draft-07/schema#",
+  title: "ReasonerPlan",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "proposition",
+    "query_variants_strict",
+  ],
+  properties: {
+    proposition: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "jurisdiction_hint",
+        "outcome_constraint",
+      ],
+      properties: {
+        actors: { type: "array", items: { type: "string" } },
+        proceeding: { type: "array", items: { type: "string" } },
+        legal_hooks: { type: "array", items: { type: "string" } },
+        outcome_required: { type: "array", items: { type: "string" } },
+        outcome_negative: { type: "array", items: { type: "string" } },
+        jurisdiction_hint: { type: "string", enum: ["SC", "HC", "ANY"] },
+        hook_groups: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["group_id", "terms", "min_match", "required"],
+            properties: {
+              group_id: { type: "string" },
+              terms: { type: "array", items: { type: "string" } },
+              min_match: { type: "integer" },
+              required: { type: "boolean" },
+            },
           },
-        ],
-        relations: [
-          {
-            type: "requires|applies_to|interacts_with|excluded_by",
-            left_group_id: "hook_group_1",
-            right_group_id: "hook_group_2",
-            required: true,
-          },
-        ],
-        outcome_constraint: {
-          polarity: "required|not_required|allowed|refused|dismissed|quashed|unknown",
-          modality: "mandatory|optional",
-          terms: ["..."],
-          contradiction_terms: ["..."],
         },
-        interaction_required: false,
+        relations: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "left_group_id", "right_group_id", "required"],
+            properties: {
+              type: { type: "string", enum: ["requires", "applies_to", "interacts_with", "excluded_by"] },
+              left_group_id: { type: "string" },
+              right_group_id: { type: "string" },
+              required: { type: "boolean" },
+            },
+          },
+        },
+        outcome_constraint: {
+          type: "object",
+          additionalProperties: false,
+          required: ["polarity", "terms", "contradiction_terms"],
+          properties: {
+            polarity: {
+              type: "string",
+              enum: ["required", "not_required", "allowed", "refused", "dismissed", "quashed", "unknown"],
+            },
+            modality: { type: "string" },
+            terms: { type: "array", items: { type: "string" } },
+            contradiction_terms: { type: "array", items: { type: "string" } },
+          },
+        },
+        interaction_required: { type: "boolean" },
       },
-      must_have_terms: ["..."],
-      must_not_have_terms: ["..."],
-      query_variants_strict: ["..."],
-      query_variants_broad: ["..."],
-      case_anchors: ["..."],
     },
-    constraints: [
-      "Return strict JSON only. No markdown.",
-      "No search operators like doctypes:, sortby:, fromdate:, todate:.",
-      "No conversational wrappers like 'cases where' or 'find cases'.",
-      "Strict variants must keep actor + proceeding + required outcome.",
-      "If legal hooks exist (sections/statutes/articles), include them in strict variants.",
-      "When multiple legal hooks interact doctrinally, emit hook_groups and mark interaction_required=true.",
-      "Do not collapse distinct hook groups into generic terms (for example 'crpc' alone).",
-      "Set outcome_constraint polarity explicitly. Do not use generic outcome tokens only.",
-      "Broad variants should still be legal-contextual and concise.",
-      "Keep each variant under 14 tokens.",
-    ],
-  });
+    must_have_terms: { type: "array", items: { type: "string" } },
+    must_not_have_terms: { type: "array", items: { type: "string" } },
+    query_variants_strict: {
+      type: "array",
+      items: { type: "string" },
+    },
+    query_variants_broad: { type: "array", items: { type: "string" } },
+    case_anchors: { type: "array", items: { type: "string" } },
+  },
+});
+
+const REASONER_SKETCH_JSON_SCHEMA = JSON.stringify({
+  $schema: "http://json-schema.org/draft-07/schema#",
+  title: "ReasonerSketch",
+  type: "object",
+  additionalProperties: false,
+  required: ["strict_terms"],
+  properties: {
+    actors: { type: "array", items: { type: "string" } },
+    proceeding: { type: "array", items: { type: "string" } },
+    outcome: { type: "array", items: { type: "string" } },
+    hooks: { type: "array", items: { type: "string" } },
+    polarity: {
+      type: "string",
+      enum: ["required", "not_required", "allowed", "refused", "dismissed", "quashed", "unknown"],
+    },
+    strict_terms: { type: "array", items: { type: "string" } },
+    broad_terms: { type: "array", items: { type: "string" } },
+    court_hint: { type: "string", enum: ["SC", "HC", "ANY"] },
+  },
+});
+
+function promptForReasoner(query: string, context: ContextProfile, compactMode = false): string {
+  const strictLimit = compactMode ? 3 : 6;
+  const broadLimit = compactMode ? 3 : 8;
+  const tokenLimit = compactMode ? 8 : 11;
+  const compactContext =
+    compactMode
+      ? {
+          domains: context.domains.slice(0, 4),
+          issues: context.issues.slice(0, 4),
+          statutesOrSections: context.statutesOrSections.slice(0, 4),
+          procedures: context.procedures.slice(0, 4),
+          actors: context.actors.slice(0, 4),
+          anchors: context.anchors.slice(0, 4),
+        }
+      : context;
+  return [
+    "Return ONE strict JSON object only (no markdown).",
+    "Task: produce a compact ReasonerSketch for Indian case retrieval.",
+    "Constraints:",
+    "- Keys allowed: actors, proceeding, outcome, hooks, polarity, strict_terms, broad_terms, court_hint.",
+    `- strict_terms<=${strictLimit}; broad_terms<=${broadLimit}; each term <=${tokenLimit} tokens.`,
+    "- strict_terms must include actor+proceeding+outcome when present.",
+    "- No search operators (doctypes:, sortby:, fromdate:, todate:).",
+    compactMode ? "- Keep terms very short. Omit empty arrays." : "- Keep output compact. Omit empty arrays.",
+    "Input:",
+    JSON.stringify({ query, context: compactContext }),
+  ].join("\n");
 }
 
-function promptForPass2Reasoner(input: {
+function promptForPass2Reasoner(
+  input: {
   query: string;
   context: ContextProfile;
   basePlan: ReasonerPlan;
   snippets: string[];
-}): string {
-  return JSON.stringify({
-    query: input.query,
-    context: input.context,
-    base_plan: input.basePlan,
-    snippets: input.snippets.slice(0, 10),
-    task: "Refine proposition constraints and retrieval variants using snippet evidence.",
-    output_schema: {
-      proposition: {
-        actors: ["..."],
-        proceeding: ["..."],
-        legal_hooks: ["..."],
-        outcome_required: ["..."],
-        outcome_negative: ["..."],
-        jurisdiction_hint: "SC|HC|ANY",
-        hook_groups: [
-          {
-            group_id: "hook_group_1",
-            terms: ["..."],
-            min_match: 1,
-            required: true,
-          },
-        ],
-        relations: [
-          {
-            type: "requires|applies_to|interacts_with|excluded_by",
-            left_group_id: "hook_group_1",
-            right_group_id: "hook_group_2",
-            required: true,
-          },
-        ],
-        outcome_constraint: {
-          polarity: "required|not_required|allowed|refused|dismissed|quashed|unknown",
-          modality: "mandatory|optional",
-          terms: ["..."],
-          contradiction_terms: ["..."],
-        },
-        interaction_required: false,
-      },
-      must_have_terms: ["..."],
-      must_not_have_terms: ["..."],
-      query_variants_strict: ["..."],
-      query_variants_broad: ["..."],
-      case_anchors: ["..."],
-    },
-    constraints: [
-      "Return strict JSON only. No markdown.",
-      "Do not weaken the required legal proposition. Tighten it when snippets show drift.",
-      "Strict variants must include proposition axes: actor, proceeding/posture, required outcome, and legal hooks when present.",
-      "If the proposition requires legal-hook intersection, preserve all required hook groups in strict variants.",
-      "Add contradictions to outcome_negative (for example allowed/condoned/restored when query requires refusal).",
-      "Set outcome_constraint polarity and contradictions explicitly.",
-      "Keep each query variant under 14 tokens.",
-    ],
-  });
+},
+  compactMode = false,
+): string {
+  const strictLimit = compactMode ? 4 : 5;
+  const broadLimit = compactMode ? 5 : 6;
+  const anchorLimit = compactMode ? 3 : 4;
+  const tokenLimit = compactMode ? 10 : 12;
+  const compactContext =
+    compactMode
+      ? {
+          domains: input.context.domains.slice(0, 4),
+          issues: input.context.issues.slice(0, 4),
+          statutesOrSections: input.context.statutesOrSections.slice(0, 4),
+          procedures: input.context.procedures.slice(0, 4),
+          actors: input.context.actors.slice(0, 4),
+          anchors: input.context.anchors.slice(0, 4),
+        }
+      : input.context;
+  if (compactMode) {
+    return [
+      "Return one JSON object only.",
+      "Refine base plan from snippets without weakening required proposition.",
+      `Strict<=${strictLimit}, Broad<=${broadLimit}, Anchors<=${anchorLimit}.`,
+      `Each variant <=${tokenLimit} tokens.`,
+      `Input:${JSON.stringify({
+        query: input.query,
+        context: compactContext,
+        base_plan: input.basePlan,
+        snippets: input.snippets.slice(0, 6),
+      })}`,
+    ].join("\n");
+  }
+  return [
+    "Return ONE strict JSON object (no markdown, no ``` fences).",
+    "Task: refine the base ReasonerPlan using snippet evidence.",
+    "Constraints:",
+    "- Do not weaken the required legal proposition; tighten it when snippets show drift.",
+    `- Keep output compact: query_variants_strict<=${strictLimit}; query_variants_broad<=${broadLimit}; case_anchors<=${anchorLimit}.`,
+    `- Each query variant <=${tokenLimit} tokens.`,
+    compactMode ? "- Use shortest legal phrases possible to reduce output length." : "",
+    "- Preserve required hook group intersections when doctrinally necessary.",
+    "- Set outcome_constraint.polarity explicitly and include contradiction_terms.",
+    "Input:",
+    JSON.stringify({
+      query: input.query,
+      context: compactContext,
+      base_plan: input.basePlan,
+      snippets: input.snippets.slice(0, 10),
+    }),
+  ].join("\n");
 }
 
 function telemetryDeterministic(
@@ -226,6 +528,8 @@ function telemetryDeterministic(
       degraded: true,
       timeout: false,
       error,
+      reasonerStage: "skipped",
+      reasonerPlanSource: "deterministic_only",
       ...extras,
     },
   };
@@ -290,54 +594,184 @@ function buildPass2SeedHash(basePlan: ReasonerPlan | undefined, snippets: string
 
 async function invokeReasonerModel(input: {
   mode: ReasonerMode;
+  target: "plan" | "sketch";
   query: string;
   context: ContextProfile;
   modelId: string;
   timeoutMs: number;
   basePlan?: ReasonerPlan;
   snippets?: string[];
-}): Promise<{ plan?: ReasonerPlan; warnings: string[]; timeout: boolean; error?: string }> {
+  compactPrompt?: boolean;
+  maxTokensOverride?: number;
+  structuredOverride?: boolean;
+  optimizedOverride?: boolean;
+}): Promise<{
+  plan?: ReasonerPlan;
+  warnings: string[];
+  timeout: boolean;
+  error?: string;
+  reasonerStage?: "sketch" | "expand" | "pass2";
+  reasonerStageLatencyMs?: Record<string, number>;
+  reasonerPlanSource?: "llm_sketch+deterministic_expand" | "deterministic_only";
+}> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), input.timeoutMs);
   try {
-    const command = new ConverseCommand({
-      modelId: input.modelId,
-      system: [
-        {
-          text: [
-            "You are a legal proposition planner for Indian case retrieval.",
-            "Return strict JSON only with the required schema.",
-            "Do not return explanations or markdown.",
-          ].join(" "),
-        },
-      ],
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              text:
-                input.mode === "pass2" && input.basePlan
-                  ? promptForPass2Reasoner({
-                      query: input.query,
-                      context: input.context,
-                      basePlan: input.basePlan,
-                      snippets: input.snippets ?? [],
-                    })
-                  : promptForReasoner(input.query, input.context),
-            },
-          ],
-        },
-      ],
-      inferenceConfig: {
-        temperature: 0,
-        maxTokens: MAX_TOKENS,
-      },
-    });
+    const warnings: string[] = [];
+    const requestedMaxTokens = Math.max(80, input.maxTokensOverride ?? MAX_TOKENS);
+    const maxTokensUsed = Math.min(requestedMaxTokens, HARD_MAX_TOKENS);
+    if (requestedMaxTokens > maxTokensUsed) {
+      warnings.push(`reasoner_max_tokens_capped:${maxTokensUsed}`);
+    }
+    const sendOnce = async (options: {
+      structured: boolean;
+      optimized: boolean;
+      maxTokens: number;
+      compactPrompt: boolean;
+    }) => {
+      const promptText =
+        input.target === "plan" && input.mode === "pass2" && input.basePlan
+          ? promptForPass2Reasoner(
+              {
+                query: input.query,
+                context: input.context,
+                basePlan: input.basePlan,
+                snippets: input.snippets ?? [],
+              },
+              options.compactPrompt,
+            )
+          : promptForReasoner(input.query, input.context, options.compactPrompt);
+      const outputSchema = input.target === "sketch" ? REASONER_SKETCH_JSON_SCHEMA : REASONER_PLAN_JSON_SCHEMA;
+      const outputSchemaName = input.target === "sketch" ? "reasoner_sketch_v1" : "reasoner_plan_v1";
 
-    const response = await getBedrockClient().send(command, {
-      abortSignal: controller.signal,
-    });
+      const baseRequest: ConverseCommandInput = {
+        modelId: input.modelId,
+        system: [
+          {
+            text: [
+              "You are a legal proposition planner for Indian case retrieval.",
+              "Return a single strict JSON object only.",
+              "No explanations. No markdown. No code fences.",
+            ].join(" "),
+          },
+        ],
+        messages: [
+          {
+            role: "user",
+            content: [{ text: promptText }],
+          },
+        ],
+        inferenceConfig: {
+          maxTokens: options.maxTokens,
+          temperature: 0,
+        },
+      };
+      const payload: ConverseCommandInput = {
+        ...baseRequest,
+        ...(options.optimized ? { performanceConfig: { latency: "optimized" as const } } : {}),
+        ...(options.structured
+          ? {
+              outputConfig: {
+                textFormat: {
+                  type: "json_schema" as const,
+                  structure: {
+                    jsonSchema: {
+                      name: outputSchemaName,
+                      description: "Reasoner output schema for retrieval pipeline.",
+                      schema: outputSchema,
+                    },
+                  },
+                },
+              },
+            }
+          : {}),
+      };
+      const command = new ConverseCommand(payload);
+      return await getBedrockClient({ modelId: input.modelId }).send(command, {
+        abortSignal: controller.signal,
+      });
+    };
+
+    const detectUnsupportedConfig = (
+      error: unknown,
+    ): { outputConfig: boolean; performanceConfig: boolean } | null => {
+      const name = error instanceof Error ? error.name.toLowerCase() : "";
+      const message = error instanceof Error ? error.message.toLowerCase() : "";
+      const combined = `${name} ${message}`;
+      const outputConfigUnsupported =
+        combined.includes("outputconfig") ||
+        combined.includes("output_config") ||
+        combined.includes("textformat") ||
+        combined.includes("json_schema") ||
+        combined.includes("jsonschema") ||
+        combined.includes("format.schema") ||
+        combined.includes("structured output");
+      const performanceConfigUnsupported =
+        combined.includes("performanceconfig") ||
+        combined.includes("performancedconfig") ||
+        combined.includes("latency");
+      if (!outputConfigUnsupported && !performanceConfigUnsupported) {
+        return null;
+      }
+      return {
+        outputConfig: outputConfigUnsupported,
+        performanceConfig: performanceConfigUnsupported,
+      };
+    };
+
+    let usedStructured = input.structuredOverride ?? STRUCTURED_OUTPUT_ENABLED;
+    let usedOptimized = input.optimizedOverride ?? OPTIMIZED_LATENCY_ENABLED;
+
+    let response;
+    try {
+      response = await sendOnce({
+        structured: usedStructured,
+        optimized: usedOptimized,
+        maxTokens: maxTokensUsed,
+        compactPrompt: input.compactPrompt ?? false,
+      });
+    } catch (error) {
+      const unsupported = detectUnsupportedConfig(error);
+      if (!unsupported) {
+        throw error;
+      }
+
+      // If Bedrock rejects outputConfig/performanceConfig for this model/profile, retry once with only the supported subset.
+      if (unsupported.outputConfig) {
+        usedStructured = false;
+        warnings.push("reasoner_model_rejected_structured_output");
+      }
+      if (unsupported.performanceConfig) {
+        usedOptimized = false;
+        warnings.push("reasoner_model_rejected_latency_optimized");
+      }
+
+      response = await sendOnce({
+        structured: usedStructured,
+        optimized: usedOptimized,
+        maxTokens: maxTokensUsed,
+        compactPrompt: input.compactPrompt ?? false,
+      });
+    }
+
+    if (usedStructured) {
+      warnings.push("reasoner_structured_output_enabled");
+    }
+    if (usedOptimized) {
+      warnings.push("reasoner_latency_optimized");
+    }
+    if (input.compactPrompt) {
+      warnings.push("reasoner_compact_prompt");
+    }
+    if (typeof response.metrics?.latencyMs === "number") {
+      warnings.push(`reasoner_bedrock_latency_ms:${response.metrics.latencyMs}`);
+    }
+    if (response.usage) {
+      const inputTokens = response.usage.inputTokens ?? 0;
+      const outputTokens = response.usage.outputTokens ?? 0;
+      const totalTokens = response.usage.totalTokens ?? inputTokens + outputTokens;
+      warnings.push(`reasoner_usage_tokens:in=${inputTokens} out=${outputTokens} total=${totalTokens}`);
+    }
 
     const text = (response.output?.message?.content ?? [])
       .flatMap((block) => ("text" in block && typeof block.text === "string" ? [block.text] : []))
@@ -346,36 +780,222 @@ async function invokeReasonerModel(input: {
 
     if (!text) {
       return {
-        warnings: ["reasoner returned empty response"],
+        warnings: mergeWarnings(warnings, ["reasoner returned empty response"]),
         timeout: false,
         error: "reasoner_empty_response",
       };
     }
 
+    const normalizeToPlan = (
+      raw: Record<string, unknown>,
+      modelStageLatencyMs: number | undefined,
+      extraWarnings?: string[],
+    ):
+      | {
+          ok: true;
+          plan: ReasonerPlan;
+          warnings: string[];
+          reasonerStage: "sketch" | "expand" | "pass2";
+          reasonerPlanSource: "llm_sketch+deterministic_expand" | "deterministic_only";
+          reasonerStageLatencyMs: Record<string, number>;
+        }
+      | { ok: false; error: string; warnings: string[] } => {
+      if (input.target === "sketch") {
+        const sketchValidated = validateReasonerSketch(raw);
+        const expandStartedAt = Date.now();
+        const expandedPlan = expandReasonerPlanFromSketch(sketchValidated.sketch);
+        const expandLatencyMs = Math.max(0, Date.now() - expandStartedAt);
+        if (!isUsableReasonerPlan(expandedPlan)) {
+          return {
+            ok: false,
+            error: "reasoner_sketch_not_usable",
+            warnings: mergeWarnings(extraWarnings, sketchValidated.warnings),
+          };
+        }
+        return {
+          ok: true,
+          plan: expandedPlan,
+          warnings: mergeWarnings(extraWarnings, sketchValidated.warnings),
+          reasonerStage: "expand",
+          reasonerPlanSource: "llm_sketch+deterministic_expand",
+          reasonerStageLatencyMs: {
+            sketch: Math.max(0, Math.floor(modelStageLatencyMs ?? 0)),
+            expand: expandLatencyMs,
+          },
+        };
+      }
+
+      const validated = validateReasonerPlan(raw);
+      if (!isUsableReasonerPlan(validated.plan)) {
+        return {
+          ok: false,
+          error: "reasoner_plan_not_usable",
+          warnings: mergeWarnings(extraWarnings, validated.warnings),
+        };
+      }
+      return {
+        ok: true,
+        plan: validated.plan,
+        warnings: mergeWarnings(extraWarnings, validated.warnings),
+        reasonerStage: input.mode === "pass2" ? "pass2" : "expand",
+        reasonerPlanSource: "llm_sketch+deterministic_expand",
+        reasonerStageLatencyMs: {
+          [input.mode === "pass2" ? "pass2" : "expand"]: Math.max(0, Math.floor(modelStageLatencyMs ?? 0)),
+        },
+      };
+    };
+
     const parsed = safeJsonParse(text);
     if (!parsed) {
+      if (input.target === "sketch") {
+        const recovered = recoverSketchFromLoosePayload(text);
+        if (recovered) {
+          const recoveredNormalized = normalizeToPlan(
+            recovered,
+            typeof response.metrics?.latencyMs === "number" ? response.metrics.latencyMs : undefined,
+            [
+              "reasoner_loose_json_salvaged",
+              response.stopReason ? `reasoner_stop_reason:${String(response.stopReason)}` : "",
+            ],
+          );
+          if (recoveredNormalized.ok) {
+            return {
+              plan: recoveredNormalized.plan,
+              warnings: mergeWarnings(warnings, recoveredNormalized.warnings),
+              timeout: false,
+              reasonerStage: recoveredNormalized.reasonerStage,
+              reasonerPlanSource: recoveredNormalized.reasonerPlanSource,
+              reasonerStageLatencyMs: recoveredNormalized.reasonerStageLatencyMs,
+            };
+          }
+        }
+      }
+
+      const stopReason = String(response.stopReason ?? "");
+      const maxTokensCutoff =
+        stopReason.toLowerCase().includes("max_tokens") || stopReason.toLowerCase().includes("maxtokens");
+      if (maxTokensCutoff && maxTokensUsed < HARD_MAX_TOKENS) {
+        const retryMaxTokens = Math.min(HARD_MAX_TOKENS, Math.max(maxTokensUsed + 160, Math.ceil(maxTokensUsed * 1.5)));
+        warnings.push(`reasoner_max_tokens_retry_attempt:${maxTokensUsed}->${retryMaxTokens}`);
+        const retryResponse = await sendOnce({
+          structured: usedStructured,
+          optimized: usedOptimized,
+          maxTokens: retryMaxTokens,
+          compactPrompt: true,
+        });
+        if (typeof retryResponse.metrics?.latencyMs === "number") {
+          warnings.push(`reasoner_bedrock_retry_latency_ms:${retryResponse.metrics.latencyMs}`);
+        }
+        const retryText = (retryResponse.output?.message?.content ?? [])
+          .flatMap((block) => ("text" in block && typeof block.text === "string" ? [block.text] : []))
+          .join("\n")
+          .trim();
+        const retryParsed = safeJsonParse(retryText);
+        if (retryParsed) {
+          const retryNormalized = normalizeToPlan(
+            retryParsed,
+            typeof retryResponse.metrics?.latencyMs === "number" ? retryResponse.metrics.latencyMs : undefined,
+            [
+              retryResponse.stopReason ? `reasoner_retry_stop_reason:${String(retryResponse.stopReason)}` : "",
+            ],
+          );
+          if (retryNormalized.ok) {
+            return {
+              plan: retryNormalized.plan,
+              warnings: mergeWarnings(warnings, ["reasoner_max_tokens_retry_success"], retryNormalized.warnings),
+              timeout: false,
+              reasonerStage: retryNormalized.reasonerStage,
+              reasonerPlanSource: retryNormalized.reasonerPlanSource,
+              reasonerStageLatencyMs: retryNormalized.reasonerStageLatencyMs,
+            };
+          }
+          return {
+            warnings: mergeWarnings(
+              warnings,
+              ["reasoner_max_tokens_retry_failed"],
+              retryNormalized.warnings,
+            ),
+            timeout: false,
+            error: retryNormalized.error,
+          };
+        }
+
+        if (input.target === "sketch") {
+          const recoveredRetry = recoverSketchFromLoosePayload(retryText);
+          if (recoveredRetry) {
+            const recoveredRetryNormalized = normalizeToPlan(
+              recoveredRetry,
+              typeof retryResponse.metrics?.latencyMs === "number" ? retryResponse.metrics.latencyMs : undefined,
+              [
+                "reasoner_max_tokens_retry_failed",
+                "reasoner_loose_json_salvaged",
+                retryResponse.stopReason ? `reasoner_retry_stop_reason:${String(retryResponse.stopReason)}` : "",
+              ],
+            );
+            if (recoveredRetryNormalized.ok) {
+              return {
+                plan: recoveredRetryNormalized.plan,
+                warnings: mergeWarnings(
+                  warnings,
+                  ["reasoner_max_tokens_retry_salvaged"],
+                  recoveredRetryNormalized.warnings,
+                ),
+                timeout: false,
+                reasonerStage: recoveredRetryNormalized.reasonerStage,
+                reasonerPlanSource: recoveredRetryNormalized.reasonerPlanSource,
+                reasonerStageLatencyMs: recoveredRetryNormalized.reasonerStageLatencyMs,
+              };
+            }
+          }
+        }
+
+        const retryPreview = previewForTelemetry(retryText);
+        return {
+          warnings: mergeWarnings(warnings, [
+            "reasoner_max_tokens_retry_failed",
+            "reasoner returned non-JSON payload",
+            retryPreview ? `reasoner_raw_preview:${retryPreview}` : "reasoner_raw_preview:empty",
+            retryResponse.stopReason ? `reasoner_retry_stop_reason:${String(retryResponse.stopReason)}` : "",
+          ]),
+          timeout: false,
+          error: retryPreview ? `reasoner_unparseable_json:${retryPreview}` : "reasoner_unparseable_json",
+        };
+      }
+      const preview = previewForTelemetry(text);
       return {
-        warnings: ["reasoner returned non-JSON payload"],
+        warnings: mergeWarnings(warnings, [
+          "reasoner returned non-JSON payload",
+          preview ? `reasoner_raw_preview:${preview}` : "reasoner_raw_preview:empty",
+          response.stopReason ? `reasoner_stop_reason:${String(response.stopReason)}` : "",
+        ]),
         timeout: false,
-        error: "reasoner_unparseable_json",
+        error: preview ? `reasoner_unparseable_json:${preview}` : "reasoner_unparseable_json",
       };
     }
 
-    const validated = validateReasonerPlan(parsed);
-    if (!isUsableReasonerPlan(validated.plan)) {
+    const normalized = normalizeToPlan(
+      parsed,
+      typeof response.metrics?.latencyMs === "number" ? response.metrics.latencyMs : undefined,
+      [response.stopReason ? `reasoner_stop_reason:${String(response.stopReason)}` : ""],
+    );
+    if (!normalized.ok) {
       return {
-        warnings: validated.warnings,
+        warnings: mergeWarnings(warnings, normalized.warnings),
         timeout: false,
-        error: "reasoner_plan_not_usable",
+        error: normalized.error,
       };
     }
     return {
-      plan: validated.plan,
-      warnings: validated.warnings,
+      plan: normalized.plan,
+      warnings: mergeWarnings(warnings, normalized.warnings),
       timeout: false,
+      reasonerStage: normalized.reasonerStage,
+      reasonerPlanSource: normalized.reasonerPlanSource,
+      reasonerStageLatencyMs: normalized.reasonerStageLatencyMs,
     };
   } catch (error) {
-    if (error instanceof Error && /abort/i.test(error.name)) {
+    const message = error instanceof Error ? error.message : "";
+    if (error instanceof Error && (/abort/i.test(error.name) || /request aborted|timed out|timeout|aborted/i.test(message))) {
       return {
         warnings: ["reasoner timeout"],
         timeout: true,
@@ -449,6 +1069,13 @@ export async function runOpusReasoner(input: {
       adaptiveTimeoutApplied,
     });
   }
+  const fallbackModelConfig = (() => {
+    if (!FALLBACK_MODEL_ID) return undefined;
+    const config = getBedrockModelConfig({ envKey: "LLM_REASONER_FALLBACK_MODEL_ID" });
+    if (!config.ok) return undefined;
+    if (config.modelId === modelConfig.modelId) return undefined;
+    return config;
+  })();
 
   const pass2SeedHash = mode === "pass2" ? buildPass2SeedHash(input.basePlan, input.snippets) : "";
   const cacheKey =
@@ -469,6 +1096,8 @@ export async function runOpusReasoner(input: {
         timeoutMsUsed,
         adaptiveTimeoutApplied,
         modelId: cached.modelId,
+        reasonerStage: mode === "pass2" ? "pass2" : "expand",
+        reasonerPlanSource: "llm_sketch+deterministic_expand",
       },
     };
   }
@@ -535,44 +1164,66 @@ export async function runOpusReasoner(input: {
   const startedAt = Date.now();
 
   try {
+    const passCompactPrompt = mode === "pass2" ? true : PASS1_COMPACT_PROMPT;
     let effectiveTimeoutMs = timeoutMsUsed;
+    let effectiveModelDebugId = modelConfig.debugModelId;
     let modelResult = await invokeReasonerModel({
       mode,
+      target: mode === "pass1" ? "sketch" : "plan",
       query: input.query,
       context: input.context,
       modelId: modelConfig.modelId,
       timeoutMs: timeoutMsUsed,
       basePlan: input.basePlan,
       snippets: input.snippets,
+      compactPrompt: passCompactPrompt,
     });
 
     if (
       !modelResult.plan &&
-      modelResult.timeout &&
       mode === "pass1" &&
-      RETRY_ON_TIMEOUT_ENABLED &&
-      timeoutMsUsed < MAX_TIMEOUT_MS
+      !modelResult.timeout &&
+      FALLBACK_ON_NON_TIMEOUT_ERROR_ENABLED &&
+      fallbackModelConfig
     ) {
-      const retryTimeoutMs = Math.min(MAX_TIMEOUT_MS, timeoutMsUsed + RETRY_TIMEOUT_BONUS_MS);
-      const retryResult = await invokeReasonerModel({
+      const fallbackTimeoutMs = Math.min(
+        MAX_TIMEOUT_MS,
+        Math.max(3_000, timeoutMsUsed + Math.min(FALLBACK_TIMEOUT_BONUS_MS, 1_200)),
+      );
+      const fallbackResult = await invokeReasonerModel({
         mode,
+        target: "sketch",
         query: input.query,
         context: input.context,
-        modelId: modelConfig.modelId,
-        timeoutMs: retryTimeoutMs,
+        modelId: fallbackModelConfig.modelId,
+        timeoutMs: fallbackTimeoutMs,
         basePlan: input.basePlan,
         snippets: input.snippets,
+        compactPrompt: true,
       });
-      effectiveTimeoutMs = retryTimeoutMs;
-      if (retryResult.plan) {
+      effectiveTimeoutMs = fallbackTimeoutMs;
+      if (fallbackResult.plan) {
+        effectiveModelDebugId = fallbackModelConfig.debugModelId;
         modelResult = {
-          ...retryResult,
-          warnings: mergeWarnings(modelResult.warnings, ["reasoner_timeout_retry_success"], retryResult.warnings),
+          ...fallbackResult,
+          warnings: mergeWarnings(
+            modelResult.warnings,
+            [`reasoner_primary_non_timeout_error:${modelConfig.debugModelId}`],
+            [`reasoner_fallback_timeout_ms:${effectiveTimeoutMs}`],
+            ["reasoner_fallback_model_success"],
+            fallbackResult.warnings,
+          ),
         };
       } else {
         modelResult = {
-          ...retryResult,
-          warnings: mergeWarnings(modelResult.warnings, ["reasoner_timeout_retry_failed"], retryResult.warnings),
+          ...fallbackResult,
+          warnings: mergeWarnings(
+            modelResult.warnings,
+            [`reasoner_primary_non_timeout_error:${modelConfig.debugModelId}`],
+            [`reasoner_fallback_timeout_ms:${effectiveTimeoutMs}`],
+            [`reasoner_fallback_model_failed:${fallbackModelConfig.debugModelId}`],
+            fallbackResult.warnings,
+          ),
         };
       }
     }
@@ -592,8 +1243,11 @@ export async function runOpusReasoner(input: {
           adaptiveTimeoutApplied,
           latencyMs,
           error: modelResult.error ?? "reasoner_plan_empty",
-          modelId: modelConfig.debugModelId,
+          modelId: effectiveModelDebugId,
           warnings: modelResult.warnings,
+          reasonerStage: "skipped",
+          reasonerPlanSource: "deterministic_only",
+          reasonerStageLatencyMs: modelResult.reasonerStageLatencyMs,
         },
       };
     }
@@ -602,7 +1256,7 @@ export async function runOpusReasoner(input: {
       cacheKey,
       {
         plan: modelResult.plan,
-        modelId: modelConfig.debugModelId,
+        modelId: effectiveModelDebugId,
         createdAt: Date.now(),
       } satisfies ReasonerCachePayload,
       mode === "pass2" ? PASS2_CACHE_TTL_SEC : CACHE_TTL_SEC,
@@ -621,8 +1275,11 @@ export async function runOpusReasoner(input: {
         timeoutMsUsed: effectiveTimeoutMs,
         adaptiveTimeoutApplied,
         latencyMs,
-        modelId: modelConfig.debugModelId,
+        modelId: effectiveModelDebugId,
         warnings: modelResult.warnings,
+        reasonerStage: modelResult.reasonerStage ?? (mode === "pass2" ? "pass2" : "expand"),
+        reasonerPlanSource: modelResult.reasonerPlanSource ?? "llm_sketch+deterministic_expand",
+        reasonerStageLatencyMs: modelResult.reasonerStageLatencyMs,
       },
     };
   } catch (error) {

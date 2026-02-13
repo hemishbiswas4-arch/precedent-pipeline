@@ -1,4 +1,4 @@
-import { evaluatePropositionSignals, PropositionChecklist } from "@/lib/proposition-gate";
+import { evaluatePropositionSignals, PropositionChecklist, PropositionSignalInput } from "@/lib/proposition-gate";
 import { CaseCandidate, ConfidenceBand, ContextProfile, ScoredCase } from "@/lib/types";
 
 const QUERY_STOPWORDS = new Set([
@@ -60,7 +60,7 @@ function countMatches(haystack: string, needles: string[]): number {
   return needles.filter((needle) => needle && lower.includes(needle.toLowerCase())).length;
 }
 
-function evaluateChecklistCoverage(corpus: string, checklist?: PropositionChecklist): {
+function evaluateChecklistCoverage(input: string | PropositionSignalInput, checklist?: PropositionChecklist): {
   requiredCoverage: number;
   coreCoverage: number;
   peripheralCoverage: number;
@@ -97,7 +97,7 @@ function evaluateChecklistCoverage(corpus: string, checklist?: PropositionCheckl
     };
   }
 
-  const signal = evaluatePropositionSignals(corpus, checklist);
+  const signal = evaluatePropositionSignals(input, checklist);
 
   return {
     requiredCoverage: signal.requiredCoverage,
@@ -142,7 +142,9 @@ export function scoreCases(
 
   return cases
     .map((candidate) => {
-      const corpus = `${candidate.title} ${candidate.snippet} ${candidate.detailText ?? ""}`;
+      const evidenceText = candidate.detailArtifact?.evidenceWindows?.join(" ") ?? "";
+      const bodyText = candidate.detailArtifact?.bodyExcerpt?.join(" ") ?? candidate.detailText ?? "";
+      const corpus = `${candidate.title} ${candidate.snippet} ${bodyText}`;
       const corpusTokens = new Set(normalizeTokens(corpus));
       const overlap = overlapRatio(queryTokens, corpusTokens);
 
@@ -150,7 +152,7 @@ export function scoreCases(
       const issuesMatched = countMatches(corpus, context.issues);
       const proceduresMatched = countMatches(corpus, context.procedures);
       const statutesMatched = countMatches(corpus, context.statutesOrSections);
-      const proposition = evaluateChecklistCoverage(corpus, options?.checklist);
+      const proposition = evaluateChecklistCoverage({ text: corpus, evidenceText }, options?.checklist);
 
       const lexicalScore = overlap * 0.38;
       let rawScore = lexicalScore;

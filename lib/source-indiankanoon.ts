@@ -1,5 +1,7 @@
 import { CaseCandidate, CourtLevel } from "@/lib/types";
-import { parseIndianKanoonSearchPage } from "@/lib/indiankanoon-parser";
+import { canonicalDocHref, parseIndianKanoonSearchPage } from "@/lib/indiankanoon-parser";
+import { parseIndianKanoonDetailPage } from "@/lib/indiankanoon-detail-parser";
+import { sharedCache } from "@/lib/cache/shared-cache";
 
 export type IndianKanoonFetchDebug = {
   phrase: string;
@@ -84,6 +86,37 @@ const MAX_RETRY_AFTER_MS = Number.isFinite(configuredMaxRetryAfter)
   ? Math.max(500, Math.min(5_000, Math.floor(configuredMaxRetryAfter)))
   : DEFAULT_MAX_RETRY_AFTER_MS;
 const challengeCooldownByScope = new Map<string, number>();
+
+class GlobalIkThrottleError extends Error {
+  retryAfterMs: number;
+
+  constructor(retryAfterMs: number) {
+    super("ik_global_rate_limited");
+    this.name = "GlobalIkThrottleError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+const IK_GLOBAL_RPS = Math.max(0, Number(process.env.IK_GLOBAL_RPS ?? "0"));
+const IK_GLOBAL_ENFORCED =
+  IK_GLOBAL_RPS > 0 &&
+  Boolean(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+const IK_GLOBAL_INTERVAL_SEC = IK_GLOBAL_RPS > 0 ? Math.max(1, Math.ceil(1 / IK_GLOBAL_RPS)) : 0;
+const IK_GLOBAL_LOCK_KEY = `ik:global:rps:${IK_GLOBAL_INTERVAL_SEC || 0}`;
+
+async function acquireGlobalIkSlot(): Promise<{ allowed: boolean; retryAfterMs?: number }> {
+  if (!IK_GLOBAL_ENFORCED || IK_GLOBAL_INTERVAL_SEC <= 0) {
+    return { allowed: true };
+  }
+
+  const owner = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const acquired = await sharedCache.acquireLock(IK_GLOBAL_LOCK_KEY, owner, IK_GLOBAL_INTERVAL_SEC);
+  if (acquired) {
+    // Do not release. The TTL enforces spacing between global requests.
+    return { allowed: true };
+  }
+  return { allowed: false, retryAfterMs: IK_GLOBAL_INTERVAL_SEC * 1000 };
+}
 
 function stripTags(input: string): string {
   return input
@@ -172,15 +205,6 @@ function normalizeSearchHref(href: string): string | null {
   } catch {
     return null;
   }
-}
-
-function parseIntSafe(value: string | undefined): number | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const normalized = value.replace(/,/g, "").trim();
-  const asNumber = Number(normalized);
-  return Number.isFinite(asNumber) ? asNumber : undefined;
 }
 
 function parseNextPageUrl(html: string): string | null {
@@ -291,6 +315,11 @@ async function fetchWithRateLimitHandling(
   let lastResponse: Response | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const globalSlot = await acquireGlobalIkSlot();
+    if (!globalSlot.allowed) {
+      throw new GlobalIkThrottleError(globalSlot.retryAfterMs ?? 1500);
+    }
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), fetchTimeoutMs);
     let response: Response;
@@ -299,8 +328,9 @@ async function fetchWithRateLimitHandling(
         method: "GET",
         headers: {
           "User-Agent":
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 precedentfinding/1.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
           Accept: "text/html,application/xhtml+xml",
+          "Accept-Language": "en-US,en;q=0.9",
         },
         cache: "no-store",
         signal: controller.signal,
@@ -422,6 +452,22 @@ async function crawlSearchPages(
         cooldownScope,
       });
     } catch (error) {
+      if (error instanceof GlobalIkThrottleError) {
+        throw new IndianKanoonFetchError(
+          `Indian Kanoon global throttle active (${Math.max(1, Math.ceil(error.retryAfterMs / 1000))}s)`,
+          makeBlockedDebug(
+            phrase,
+            searchQuery,
+            currentUrl,
+            `Global request shaping active; retry in ~${Math.max(1, Math.ceil(error.retryAfterMs / 1000))}s.`,
+            {
+              retryAfterMs: error.retryAfterMs,
+              blockedType: "rate_limit",
+              fetchTimeoutMsUsed: options.fetchTimeoutMs ?? FETCH_TIMEOUT_MS,
+            },
+          ),
+        );
+      }
       if (error instanceof FetchTimeoutError) {
         throw new IndianKanoonFetchError(
           `Indian Kanoon fetch timed out after ${error.timeoutMs}ms`,
@@ -486,6 +532,41 @@ async function crawlSearchPages(
     const effectiveParsed = noMatchPage
       ? { rawCases: [] as CaseCandidate[], parserMode: "generic_anchor" as const }
       : { rawCases: parsedPage.rawCases, parserMode: parsedPage.parserMode };
+    const suspiciousChallengeLikePage =
+      res.ok &&
+      !noMatchPage &&
+      effectiveParsed.rawCases.length === 0 &&
+      docLinkSignals === 0 &&
+      resultSignals <= 1;
+    if (suspiciousChallengeLikePage) {
+      setChallengeCooldown(cooldownScope, adaptiveCooldownMs);
+      const retryAfterMs = Math.max(1_000, challengeCooldownRemainingMs(cooldownScope));
+      throw new IndianKanoonFetchError("Cloudflare challenge detected (suspicious empty search page)", {
+        phrase,
+        searchQuery,
+        url: currentUrl,
+        status: res.status,
+        ok: res.ok,
+        contentType: res.headers.get("content-type") ?? "",
+        serverHeader: res.headers.get("server") ?? "",
+        cfRay: res.headers.get("cf-ray") ?? "",
+        cloudflareDetected: true,
+        challengeDetected: true,
+        retryAfterMs,
+        blockedType: "cloudflare_challenge",
+        timedOut: false,
+        fetchTimeoutMsUsed: Math.max(1_500, Math.min(options.fetchTimeoutMs ?? FETCH_TIMEOUT_MS, 15_000)),
+        parserMode: parsedPage.parserMode,
+        pagesScanned,
+        pageCaseCounts,
+        nextPageDetected,
+        rawParsedCount,
+        excludedStatuteCount,
+        excludedWeakCount,
+        parsedCount: collected.length,
+        htmlPreview: `suspicious_empty_results_page:docLinks=${docLinkSignals};resultSignals=${resultSignals};${stripTags(html).slice(0, 220)}`,
+      });
+    }
     parserMode = effectiveParsed.parserMode;
     rawParsedCount += effectiveParsed.rawCases.length;
 
@@ -604,6 +685,114 @@ export async function searchIndianKanoonByUrl(
   return crawlSearchPages(url, label, label, options);
 }
 
+function extractDocIdFromUrl(value: string): string | null {
+  const match = value.match(/\/(?:doc|docfragment)\/(\d+)\/?/i);
+  return match?.[1] ?? null;
+}
+
+function normalizeTitleTokens(value: string): string[] {
+  const stopwords = new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "case",
+    "versus",
+    "judgment",
+    "order",
+    "court",
+    "india",
+    "state",
+    "application",
+    "appeal",
+  ]);
+  const tokens = value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !stopwords.has(token));
+  return [...new Set(tokens)].slice(0, 10);
+}
+
+function titleOverlapScore(left: string, right: string): number {
+  const leftTokens = normalizeTitleTokens(left);
+  const rightTokens = normalizeTitleTokens(right);
+  if (leftTokens.length === 0 || rightTokens.length === 0) {
+    return 0;
+  }
+  const rightSet = new Set(rightTokens);
+  const overlap = leftTokens.filter((token) => rightSet.has(token)).length;
+  return overlap / Math.max(leftTokens.length, rightTokens.length);
+}
+
+export async function resolveIndianKanoonDetailUrlByHint(input: {
+  title: string;
+  docId?: string;
+  court?: CourtLevel;
+  fetchTimeoutMs?: number;
+  max429Retries?: number;
+  maxRetryAfterMs?: number;
+  cooldownScope?: string;
+}): Promise<string | undefined> {
+  const titleTokens = normalizeTitleTokens(input.title).slice(0, 8);
+  const phraseParts = [...titleTokens];
+  if (input.docId) {
+    phraseParts.push(input.docId);
+  }
+  if (input.court === "SC") {
+    phraseParts.push("supreme", "court");
+  } else if (input.court === "HC") {
+    phraseParts.push("high", "court");
+  }
+  const phrase = phraseParts.join(" ").replace(/\s+/g, " ").trim();
+  if (!phrase) {
+    return undefined;
+  }
+
+  const result = await searchIndianKanoon(phrase, {
+    maxResultsPerPhrase: 8,
+    maxPages: 1,
+    courtType: input.court === "SC" ? "supremecourt" : input.court === "HC" ? "highcourts" : undefined,
+    fetchTimeoutMs: input.fetchTimeoutMs,
+    max429Retries: input.max429Retries,
+    maxRetryAfterMs: input.maxRetryAfterMs,
+    cooldownScope: input.cooldownScope,
+  });
+
+  if (result.cases.length === 0) {
+    return undefined;
+  }
+
+  if (input.docId) {
+    const exactDocMatch = result.cases.find((candidate) => {
+      const candidateDocId =
+        extractDocIdFromUrl(candidate.url) ??
+        extractDocIdFromUrl(candidate.fullDocumentUrl ?? "");
+      return candidateDocId === input.docId;
+    });
+    if (exactDocMatch) {
+      return canonicalDocHref(exactDocMatch.fullDocumentUrl ?? exactDocMatch.url) ?? exactDocMatch.url;
+    }
+  }
+
+  const ranked = result.cases
+    .map((candidate) => ({
+      candidate,
+      score: titleOverlapScore(input.title, candidate.title),
+    }))
+    .sort((left, right) => right.score - left.score);
+  const best = ranked[0];
+  if (!best || best.score < 0.35) {
+    return undefined;
+  }
+
+  return canonicalDocHref(best.candidate.fullDocumentUrl ?? best.candidate.url) ?? best.candidate.url;
+}
+
 export async function discoverSupremeCourtBrowseMonthUrls(year: number): Promise<string[]> {
   const browseUrl = `https://indiankanoon.org/browse/supremecourt/${year}/`;
   const res = await fetchWithRateLimitHandling(browseUrl);
@@ -623,39 +812,6 @@ export async function discoverSupremeCourtBrowseMonthUrls(year: number): Promise
   return [...new Set(links)];
 }
 
-function splitEvidenceSentences(text: string): string[] {
-  return text
-    .split(/[\n.!?]+/)
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter((line) => line.length > 30);
-}
-
-function extractEvidenceWindows(blocks: string[], limit: number): string[] {
-  const relationCue = /(read with|vis[-\s]?a[-\s]?vis|interplay|interaction|requires under|applies to)/i;
-  const polarityCue =
-    /(required|not required|mandatory|necessary|refused|dismissed|rejected|not condoned|time barred|allowed|quashed)/i;
-  const hookCue = /(section\s*\d+[a-z]?(?:\([0-9a-z]+\))?|crpc|ipc|cpc|prevention of corruption act|pc act|limitation act)/i;
-  const roleCue =
-    /(appellant|respondent|petitioner|accused|state of|government|prosecution|filed appeal|preferred appeal)/i;
-  const chainCue = /(condonation of delay|delay condonation|application for condonation|not condoned|barred by limitation)/i;
-
-  const windows: string[] = [];
-  for (const block of blocks) {
-    for (const sentence of splitEvidenceSentences(block)) {
-      const relation = relationCue.test(sentence);
-      const polarity = polarityCue.test(sentence);
-      const hook = hookCue.test(sentence);
-      const role = roleCue.test(sentence);
-      const chain = chainCue.test(sentence);
-      if ((relation && hook) || (polarity && hook) || (relation && polarity) || (role && polarity) || (chain && polarity)) {
-        windows.push(sentence);
-      }
-      if (windows.length >= limit) return windows;
-    }
-  }
-  return windows;
-}
-
 export async function fetchIndianKanoonCaseDetail(
   url: string,
   options?: {
@@ -664,60 +820,21 @@ export async function fetchIndianKanoonCaseDetail(
     maxRetryAfterMs?: number;
     cooldownScope?: string;
   },
-): Promise<string> {
-  const res = await fetchWithRateLimitHandling(url, options);
+): Promise<ReturnType<typeof parseIndianKanoonDetailPage>> {
+  let res: Response;
+  try {
+    res = await fetchWithRateLimitHandling(url, options);
+  } catch (error) {
+    if (error instanceof GlobalIkThrottleError) {
+      throw new Error(`ik_global_rate_limited:${error.retryAfterMs}`);
+    }
+    throw error;
+  }
 
   if (!res.ok) {
     throw new Error(`Case page returned ${res.status}`);
   }
 
   const html = await res.text();
-  const title = stripTags(html.match(/<h2[^>]*>([\s\S]*?)<\/h2>/im)?.[1] ?? "");
-  const h3Matches = Array.from(html.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/gim)).map((m) =>
-    stripTags(m[1] ?? ""),
-  );
-  const courtName = h3Matches.find((item) => /\bcourt\b/i.test(item)) ?? "";
-  const equivalentCitations =
-    h3Matches.find((item) => /^equivalent citations:/i.test(item)) ?? "";
-  const authorLine = h3Matches.find((item) => /^author:/i.test(item)) ?? "";
-  const benchLine = h3Matches.find((item) => /^bench:/i.test(item)) ?? "";
-
-  const citesCount = parseIntSafe(html.match(/>\s*Cites\s*([0-9,]+)\s*</im)?.[1]);
-  const citedByCount = parseIntSafe(html.match(/>\s*Cited\s*by\s*([0-9,]+)\s*</im)?.[1]);
-
-  const blockquotes = Array.from(
-    html.matchAll(/<blockquote[^>]*>([\s\S]*?)<\/blockquote>/gim),
-  )
-    .map((m) => stripTags(m[1] ?? ""))
-    .filter((item) => item.length > 30)
-    .slice(0, 80);
-
-  const paragraphFallback =
-    blockquotes.length > 0
-      ? []
-      : Array.from(html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gim))
-          .map((m) => stripTags(m[1] ?? ""))
-          .filter((item) => item.length > 40)
-          .slice(0, 30);
-  const evidenceWindows = extractEvidenceWindows(blockquotes.length > 0 ? blockquotes : paragraphFallback, 28);
-
-  const parts = [
-    title ? `Title: ${title}` : "",
-    courtName ? `Court: ${courtName}` : "",
-    equivalentCitations ? `Equivalent citations: ${equivalentCitations}` : "",
-    authorLine ? `Author: ${authorLine.replace(/^author:\s*/i, "")}` : "",
-    benchLine ? `Bench: ${benchLine.replace(/^bench:\s*/i, "")}` : "",
-    typeof citesCount === "number" ? `Cites count: ${citesCount}` : "",
-    typeof citedByCount === "number" ? `Cited by count: ${citedByCount}` : "",
-    evidenceWindows.length > 0 ? `Evidence windows:\n${evidenceWindows.join("\n")}` : "",
-    blockquotes.length > 0
-      ? `Body:\n${blockquotes.join("\n")}`
-      : paragraphFallback.length > 0
-        ? `Body:\n${paragraphFallback.join("\n")}`
-        : "",
-  ]
-    .filter((v) => v.length > 0)
-    .join("\n");
-
-  return parts.slice(0, 12000);
+  return parseIndianKanoonDetailPage(html);
 }

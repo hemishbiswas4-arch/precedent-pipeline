@@ -62,6 +62,17 @@ function procedureLexemes(value: string): string[] {
   if (normalized.includes("delay condonation")) {
     output.push("delay condonation", "condonation of delay", "application for condonation", "section 5 limitation");
   }
+  if (normalized.includes("sanction for prosecution")) {
+    output.push(
+      "sanction",
+      "sanction required",
+      "prior sanction",
+      "previous sanction",
+      "prosecution sanction",
+      "sanction under section 197",
+      "sanction under section 19",
+    );
+  }
   return unique(output);
 }
 

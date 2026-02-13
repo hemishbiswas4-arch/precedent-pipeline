@@ -1,5 +1,6 @@
 import { PHASE_LIMITS } from "@/lib/kb/query-templates";
-import { IndianKanoonFetchError, searchIndianKanoon } from "@/lib/source-indiankanoon";
+import { hasRetrievalDebug } from "@/lib/retrieval/providers/types";
+import type { RetrievalProvider } from "@/lib/retrieval/providers/types";
 import { classifyCandidate } from "@/lib/pipeline/classifier";
 import {
   IntentProfile,
@@ -52,16 +53,64 @@ function querySignature(
   return [phase, phrase.toLowerCase(), courtType ?? "", fromDate ?? "", toDate ?? ""].join("|");
 }
 
+function candidateQualityScore(candidate: CaseCandidate): number {
+  let score = 0;
+  if (candidate.court !== "UNKNOWN") score += 10;
+  if (candidate.detailText) score += 12;
+  if ((candidate.detailArtifact?.evidenceWindows?.length ?? 0) > 0) score += 8;
+  if (candidate.courtText) score += 4;
+  if (candidate.fullDocumentUrl && candidate.fullDocumentUrl !== candidate.url) score += 2;
+  if (typeof candidate.citesCount === "number") score += 1;
+  if (typeof candidate.citedByCount === "number") score += 1;
+  score += Math.min(candidate.snippet.length, 600) / 120;
+  return score;
+}
+
+function mergeDuplicateCandidate(existing: CaseCandidate, incoming: CaseCandidate): CaseCandidate {
+  const existingScore = candidateQualityScore(existing);
+  const incomingScore = candidateQualityScore(incoming);
+  const base = incomingScore > existingScore ? incoming : existing;
+  const fallback = base === existing ? incoming : existing;
+
+  const mergedSnippet =
+    (base.snippet?.length ?? 0) >= (fallback.snippet?.length ?? 0)
+      ? base.snippet
+      : fallback.snippet;
+  const mergedCourt = base.court !== "UNKNOWN" ? base.court : fallback.court;
+  const mergedDetailArtifact = base.detailArtifact ?? fallback.detailArtifact;
+  const mergedDetailText =
+    base.detailText ??
+    fallback.detailText ??
+    (mergedDetailArtifact ? `${mergedDetailArtifact.evidenceWindows.join("\n")}` : undefined);
+
+  return {
+    ...base,
+    title: base.title && !/^untitled case/i.test(base.title) ? base.title : fallback.title || base.title,
+    snippet: mergedSnippet,
+    court: mergedCourt,
+    courtText: base.courtText ?? fallback.courtText,
+    citesCount: typeof base.citesCount === "number" ? base.citesCount : fallback.citesCount,
+    citedByCount: typeof base.citedByCount === "number" ? base.citedByCount : fallback.citedByCount,
+    author: base.author ?? fallback.author,
+    fullDocumentUrl: base.fullDocumentUrl ?? fallback.fullDocumentUrl ?? base.url,
+    detailText: mergedDetailText,
+    detailArtifact: mergedDetailArtifact,
+    detailHydration: base.detailHydration ?? fallback.detailHydration,
+    evidenceQuality: base.evidenceQuality ?? fallback.evidenceQuality,
+  };
+}
+
 function dedupeCases(cases: CaseCandidate[]): CaseCandidate[] {
-  const seen = new Set<string>();
-  const output: CaseCandidate[] = [];
+  const outputByUrl = new Map<string, CaseCandidate>();
   for (const item of cases) {
-    if (!seen.has(item.url)) {
-      seen.add(item.url);
-      output.push(item);
+    const existing = outputByUrl.get(item.url);
+    if (!existing) {
+      outputByUrl.set(item.url, item);
+      continue;
     }
+    outputByUrl.set(item.url, mergeDuplicateCandidate(existing, item));
   }
-  return output;
+  return Array.from(outputByUrl.values());
 }
 
 function buildCarryState(input: {
@@ -132,10 +181,11 @@ export async function runRetrievalSchedule(input: {
   variants: QueryVariant[];
   intent: IntentProfile;
   config: SchedulerConfig;
+  provider: RetrievalProvider;
   carryState?: SchedulerCarryState;
   cooldownScope?: string;
 }): Promise<SchedulerResult> {
-  const { variants, intent, config, carryState, cooldownScope } = input;
+  const { variants, intent, config, provider, carryState, cooldownScope } = input;
   const seenSignatures = new Set<string>(carryState?.seenSignatures ?? []);
   const attempts: SchedulerResult["attempts"] = [...(carryState?.attempts ?? [])];
   const allCandidates: CaseCandidate[] = [...(carryState?.candidates ?? [])];
@@ -249,10 +299,11 @@ export async function runRetrievalSchedule(input: {
         remainingBeforeAttempt < perAttemptTimeoutMs + 3_000 ? 0 : (config.max429Retries ?? 1);
       let delayMs = 80 + Math.floor(Math.random() * 80);
       try {
-        const result = await searchIndianKanoon(phrase, {
+        const result = await provider.search({
+          phrase,
+          courtScope: variant.courtScope,
           maxResultsPerPhrase: 14,
           maxPages: phase === "primary" ? PRIMARY_MAX_PAGES : 1,
-          courtHint: variant.courtScope === "SC" ? "SC" : variant.courtScope === "HC" ? "HC" : "UNKNOWN",
           courtType,
           fromDate,
           toDate,
@@ -265,7 +316,9 @@ export async function runRetrievalSchedule(input: {
         });
 
         attempts.push({
+          providerId: provider.id,
           phase,
+          courtScope: variant.courtScope,
           variantId: variant.id,
           phrase: variant.phrase,
           searchQuery: result.debug.searchQuery,
@@ -325,39 +378,44 @@ export async function runRetrievalSchedule(input: {
           retryAfterMs = undefined;
         }
       } catch (error) {
-        if (error instanceof IndianKanoonFetchError) {
+        if (hasRetrievalDebug(error)) {
+          const debug = error.debug;
+          const errorMessage =
+            error instanceof Error ? error.message : "retrieval_provider_error";
           attempts.push({
+            providerId: provider.id,
             phase,
+            courtScope: variant.courtScope,
             variantId: variant.id,
             phrase: variant.phrase,
-            searchQuery: error.debug.searchQuery,
-            status: error.debug.status,
-            ok: error.debug.ok,
-            parsedCount: error.debug.parsedCount,
-            parserMode: error.debug.parserMode,
-            pagesScanned: error.debug.pagesScanned,
-            pageCaseCounts: error.debug.pageCaseCounts,
-            nextPageDetected: error.debug.nextPageDetected,
-            rawParsedCount: error.debug.rawParsedCount,
-            excludedStatuteCount: error.debug.excludedStatuteCount,
-            excludedWeakCount: error.debug.excludedWeakCount,
-            cloudflareDetected: error.debug.cloudflareDetected,
-            challengeDetected: error.debug.challengeDetected,
-            cooldownActive: error.debug.cooldownActive,
-            retryAfterMs: error.debug.retryAfterMs,
-            blockedType: error.debug.blockedType,
-            timedOut: error.debug.timedOut,
-            fetchTimeoutMsUsed: error.debug.fetchTimeoutMsUsed,
-            htmlPreview: error.debug.htmlPreview,
-            error: error.message,
+            searchQuery: debug.searchQuery,
+            status: debug.status,
+            ok: debug.ok,
+            parsedCount: debug.parsedCount,
+            parserMode: debug.parserMode,
+            pagesScanned: debug.pagesScanned,
+            pageCaseCounts: debug.pageCaseCounts,
+            nextPageDetected: debug.nextPageDetected,
+            rawParsedCount: debug.rawParsedCount,
+            excludedStatuteCount: debug.excludedStatuteCount,
+            excludedWeakCount: debug.excludedWeakCount,
+            cloudflareDetected: debug.cloudflareDetected,
+            challengeDetected: debug.challengeDetected,
+            cooldownActive: debug.cooldownActive,
+            retryAfterMs: debug.retryAfterMs,
+            blockedType: debug.blockedType,
+            timedOut: debug.timedOut,
+            fetchTimeoutMsUsed: debug.fetchTimeoutMsUsed,
+            htmlPreview: debug.htmlPreview,
+            error: errorMessage,
           });
-          if (error.debug.blockedType === "local_cooldown") {
+          if (debug.blockedType === "local_cooldown") {
             stopReason = "blocked";
             blockedKind = "local_cooldown";
-            retryAfterMs = error.debug.retryAfterMs;
+            retryAfterMs = debug.retryAfterMs;
             blockedReason = `blocked_cooldown_active:${Math.max(
               1,
-              Math.ceil((error.debug.retryAfterMs ?? 1000) / 1000),
+              Math.ceil((debug.retryAfterMs ?? 1000) / 1000),
             )}`;
             return buildResult({
               startedAtMs: startedAt,
@@ -373,14 +431,14 @@ export async function runRetrievalSchedule(input: {
               attemptsUsed,
             });
           }
-          if (error.debug.challengeDetected || error.debug.status === 429) {
+          if (debug.challengeDetected || debug.status === 429) {
             blockedCount += 1;
             blockedKind =
-              error.debug.blockedType ??
-              (error.debug.challengeDetected ? "cloudflare_challenge" : "rate_limit");
-            retryAfterMs = error.debug.retryAfterMs;
+              debug.blockedType ??
+              (debug.challengeDetected ? "cloudflare_challenge" : "rate_limit");
+            retryAfterMs = debug.retryAfterMs;
             delayMs = 240 + Math.floor(Math.random() * 220);
-          } else if (error.debug.timedOut || error.debug.status === 408) {
+          } else if (debug.timedOut || debug.status === 408) {
             delayMs = 90;
           } else {
             blockedCount = 0;
@@ -390,7 +448,9 @@ export async function runRetrievalSchedule(input: {
           }
         } else {
           attempts.push({
+            providerId: provider.id,
             phase,
+            courtScope: variant.courtScope,
             variantId: variant.id,
             phrase: variant.phrase,
             status: 500,

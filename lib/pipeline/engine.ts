@@ -17,6 +17,8 @@ import {
 import { runRetrievalSchedule } from "@/lib/pipeline/scheduler";
 import { QueryVariant, SchedulerConfig, SchedulerResult } from "@/lib/pipeline/types";
 import { verifyCandidates } from "@/lib/pipeline/verifier";
+import { pickRetrievalProvider } from "@/lib/retrieval/provider";
+import type { RetrievalProvider } from "@/lib/retrieval/providers/types";
 import {
   buildPropositionChecklist,
   PropositionChecklist,
@@ -31,6 +33,10 @@ const PASS2_MIN_EXACT = Math.max(1, Number(process.env.AI_FAILOVER_MIN_CASES ?? 
 const PASS2_MIN_REMAINING_BUDGET = Math.max(
   1,
   Number(process.env.AI_FAILOVER_MIN_REMAINING_BUDGET ?? "4"),
+);
+const PASS2_MIN_REMAINING_MS = Math.max(
+  3_000,
+  Number(process.env.PASS2_MIN_REMAINING_MS ?? "9000"),
 );
 const PASS2_MIN_COVERAGE = Math.min(
   1,
@@ -76,6 +82,15 @@ const PIPELINE_MAX_ELAPSED_MS = Math.min(
   Math.max(Number(process.env.PIPELINE_MAX_ELAPSED_MS ?? "9000"), 5_000),
   60_000,
 );
+const DETAIL_MIN_SUCCESS_BEFORE_EARLY_STOP = Math.max(
+  0,
+  Number(process.env.DETAIL_MIN_SUCCESS_BEFORE_EARLY_STOP ?? "2"),
+);
+const SERPER_STOP_ON_CANDIDATE_TARGET = parseBooleanEnv(
+  process.env.SERPER_STOP_ON_CANDIDATE_TARGET,
+  false,
+);
+const NEAR_MISS_MAX_RESULTS = Math.max(1, Number(process.env.NEAR_MISS_MAX_RESULTS ?? "12"));
 
 type ReasonerHealthStatus =
   | "ok"
@@ -233,6 +248,15 @@ function phaseCount(values: Array<{ phase: string }>): Record<string, number> {
   }, {});
 }
 
+function hasPrimaryFallbackCourtFloor(
+  attempts: Array<{ phase: string; courtScope?: "SC" | "HC" | "ANY" }>,
+): boolean {
+  const scoped = attempts.filter((attempt) => attempt.phase === "primary" || attempt.phase === "fallback");
+  const hasSc = scoped.some((attempt) => attempt.courtScope === "SC");
+  const hasHc = scoped.some((attempt) => attempt.courtScope === "HC");
+  return hasSc && hasHc;
+}
+
 function isRelevantCase(item: ScoredCase): boolean {
   if (item.score < MIN_RELEVANT_SCORE) {
     return false;
@@ -271,6 +295,13 @@ type CandidateEvaluation = {
   verificationSummary: {
     attempted: number;
     detailFetched: number;
+    detailFetchFailed?: number;
+    detailFetchFallbackUsed?: number;
+    detailFetchErrorCounts?: Record<string, number>;
+    detailFetchSampleErrors?: string[];
+    hybridFallbackUsed?: number;
+    hybridFallbackSuccesses?: number;
+    detailHydrationCoverage?: number;
     passedCaseGate: number;
   };
 };
@@ -285,12 +316,15 @@ async function evaluateCandidates(input: {
   query: string;
   maxResults: number;
   verifyLimit: number;
+  allowNetworkFetch: boolean;
   context: ReturnType<typeof buildIntentProfile>["context"];
   checklist: PropositionChecklist;
   candidates: CaseCandidate[];
 }): Promise<CandidateEvaluation> {
   const classified = classifyCandidates(input.candidates);
-  const verified = await verifyCandidates(classified, input.verifyLimit);
+  const verified = await verifyCandidates(classified, input.verifyLimit, {
+    allowNetworkFetch: input.allowNetworkFetch,
+  });
   const postVerify = verified.verified;
   const counts = classificationCounts(postVerify);
 
@@ -334,6 +368,13 @@ async function evaluateCandidates(input: {
     verificationSummary: {
       attempted: verified.summary.attempted,
       detailFetched: verified.summary.detailFetched,
+      detailFetchFailed: verified.summary.detailFetchFailed,
+      detailFetchFallbackUsed: verified.summary.detailFetchFallbackUsed,
+      detailFetchErrorCounts: verified.summary.detailFetchErrorCounts,
+      detailFetchSampleErrors: verified.summary.detailFetchSampleErrors,
+      hybridFallbackUsed: verified.summary.hybridFallbackUsed,
+      hybridFallbackSuccesses: verified.summary.hybridFallbackSuccesses,
+      detailHydrationCoverage: verified.summary.detailHydrationCoverage,
       passedCaseGate: verified.summary.passedCaseGate,
     },
   };
@@ -343,6 +384,8 @@ async function runQualityAwarePhases(input: {
   variants: QueryVariant[];
   intent: ReturnType<typeof buildIntentProfile>;
   config: SchedulerConfig;
+  provider: RetrievalProvider;
+  allowNetworkFetch: boolean;
   carryState?: SchedulerResult["carryState"];
   cooldownScope?: string;
   strictStopTarget: number;
@@ -364,6 +407,7 @@ async function runQualityAwarePhases(input: {
     variants: [],
     intent: input.intent,
     config: input.config,
+    provider: input.provider,
     carryState: input.carryState,
     cooldownScope: input.cooldownScope,
   });
@@ -371,6 +415,7 @@ async function runQualityAwarePhases(input: {
     query: input.query,
     maxResults: input.maxResults,
     verifyLimit: input.config.verifyLimit,
+    allowNetworkFetch: input.allowNetworkFetch,
     context: input.intent.context,
     checklist: input.checklist,
     candidates: scheduler.candidates,
@@ -388,6 +433,7 @@ async function runQualityAwarePhases(input: {
       variants: phaseVariants,
       intent: input.intent,
       config: input.config,
+      provider: input.provider,
       carryState: scheduler.carryState,
       cooldownScope: input.cooldownScope,
     });
@@ -400,6 +446,7 @@ async function runQualityAwarePhases(input: {
         query: input.query,
         maxResults: input.maxResults,
         verifyLimit: input.config.verifyLimit,
+        allowNetworkFetch: input.allowNetworkFetch,
         context: input.intent.context,
         checklist: input.checklist,
         candidates: scheduler.candidates,
@@ -414,11 +461,16 @@ async function runQualityAwarePhases(input: {
         (item.missingMandatorySteps?.length ?? 0) > 0,
     );
     const chainCoverageReady = propositionSplit.chainCoverageAvg >= PROPOSITION_CHAIN_MIN_COVERAGE;
+    const detailCoverageReady =
+      evaluation.verificationSummary.detailFetched >= DETAIL_MIN_SUCCESS_BEFORE_EARLY_STOP;
+    const phaseFloorReady = hasPrimaryFallbackCourtFloor(scheduler.attempts);
+    const earlyStopQualityReady = detailCoverageReady && phaseFloorReady;
     if (
-      (propositionSplit.strictExactCount >= input.strictStopTarget && chainCoverageReady) ||
-      (propositionSplit.strictExactCount + qualifiedProvisional >= input.bestEffortStopTarget &&
-        !provisionalHasCoreFailures &&
-        chainCoverageReady)
+      earlyStopQualityReady &&
+      ((propositionSplit.strictExactCount >= input.strictStopTarget && chainCoverageReady) ||
+        (propositionSplit.strictExactCount + qualifiedProvisional >= input.bestEffortStopTarget &&
+          !provisionalHasCoreFailures &&
+          chainCoverageReady))
     ) {
       scheduler = {
         ...scheduler,
@@ -475,6 +527,8 @@ export async function runPipelineSearch(input: {
       reasonerAttempted?: boolean;
       reasonerStatus?: ReasonerHealthStatus;
       reasonerSkipReason?: string;
+      reasonerError?: string;
+      reasonerWarnings?: string[];
       reasonerTimeoutMsUsed?: number;
       reasonerLatencyMs?: number;
     };
@@ -503,6 +557,7 @@ export async function runPipelineSearch(input: {
       htmlPreview?: string;
       error: string | null;
       variantId?: string;
+      providerId?: string;
     }>;
     courtBreakdown: {
       sc: number;
@@ -527,6 +582,9 @@ export async function runPipelineSearch(input: {
   };
 }> {
   const intent = buildIntentProfile(input.query);
+  const retrievalSelection = pickRetrievalProvider();
+  const retrievalProvider = retrievalSelection.provider;
+  const allowNetworkFetch = retrievalProvider.supportsDetailFetch;
   const strictCaseOnly = parseBooleanEnv(process.env.STRICT_CASE_ONLY, true);
   const requireSupremeCourt = parseBooleanEnv(process.env.REQUIRE_SUPREME_COURT, false);
   const minCaseTarget = Math.min(Math.max(Math.floor(input.maxResults / 2), 6), 12);
@@ -564,7 +622,8 @@ export async function runPipelineSearch(input: {
     minCaseTarget,
     requireSupremeCourt,
     maxElapsedMs: PIPELINE_MAX_ELAPSED_MS,
-    stopOnCandidateTarget: false,
+    stopOnCandidateTarget:
+      retrievalProvider.id === "serper" ? SERPER_STOP_ON_CANDIDATE_TARGET : true,
     fetchTimeoutMs: IK_FETCH_TIMEOUT_MS,
     max429Retries: IK_MAX_429_RETRIES,
     maxRetryAfterMs: IK_MAX_RETRY_AFTER_MS,
@@ -599,6 +658,8 @@ export async function runPipelineSearch(input: {
     variants: initialVariants,
     intent,
     config,
+    provider: retrievalProvider,
+    allowNetworkFetch,
     cooldownScope: input.cooldownScope,
     strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
     bestEffortStopTarget: PROPOSITION_BEST_EFFORT_STOP_TARGET,
@@ -632,6 +693,8 @@ export async function runPipelineSearch(input: {
           variants: mergeVariants(constrainedTraceVariants),
           intent,
           config,
+          provider: retrievalProvider,
+          allowNetworkFetch,
           carryState: scheduler.carryState,
           cooldownScope: input.cooldownScope,
           strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
@@ -650,10 +713,12 @@ export async function runPipelineSearch(input: {
   }
 
   const remainingBudget = config.globalBudget - scheduler.carryState.attemptsUsed;
+  const remainingMsForPass2 = Math.max(0, config.maxElapsedMs - (Date.now() - scheduler.carryState.startedAtMs));
   const shouldRunPass2 =
     Boolean(activeReasonerPlan) &&
     scheduler.stopReason !== "blocked" &&
     remainingBudget >= PASS2_MIN_REMAINING_BUDGET &&
+    remainingMsForPass2 >= PASS2_MIN_REMAINING_MS &&
     (qualifiedExactTotal < Math.max(PASS2_MIN_EXACT, PROPOSITION_BEST_EFFORT_STOP_TARGET) ||
       propositionSplit.requiredElementCoverageAvg < PASS2_MIN_COVERAGE ||
       propositionSplit.hookGroupCoverageAvg < PASS2_MIN_HOOK_COVERAGE ||
@@ -702,6 +767,8 @@ export async function runPipelineSearch(input: {
         variants: mergeVariants(pass2Variants),
         intent,
         config,
+        provider: retrievalProvider,
+        allowNetworkFetch,
         carryState: scheduler.carryState,
         cooldownScope: input.cooldownScope,
         strictStopTarget: PROPOSITION_STRICT_STOP_TARGET,
@@ -730,8 +797,8 @@ export async function runPipelineSearch(input: {
     ? [...casesExactStrict, ...casesExactProvisional].slice(0, input.maxResults)
     : propositionSplit.exact.slice(0, input.maxResults);
   const casesNearMiss: NearMissCase[] = PROPOSITION_V41_ENABLED
-    ? propositionSplit.nearMiss.slice(0, input.maxResults)
-    : propositionSplit.nearMiss.slice(0, input.maxResults);
+    ? propositionSplit.nearMiss.slice(0, NEAR_MISS_MAX_RESULTS)
+    : propositionSplit.nearMiss.slice(0, NEAR_MISS_MAX_RESULTS);
   const allVariants = mergeVariants([...initialVariants, ...pass2Variants, ...traceVariantsUsed]);
   const variantLookup = new Map(allVariants.map((variant) => [variant.id, variant]));
   const selectedVariants = scheduler.attempts
@@ -770,6 +837,36 @@ export async function runPipelineSearch(input: {
     "Confidence uses calibrated bands and is not a legal-certainty percentage.",
     "HIGH/VERY_HIGH confidence is restricted to strict exact matches with evidence-window support.",
   ];
+  if (retrievalSelection.fallbackReason === "serper_missing_key") {
+    notes.push("RETRIEVAL_PROVIDER=serper was requested but SERPER_API_KEY is missing; using Indian Kanoon HTML retrieval.");
+  } else if (retrievalSelection.fallbackReason === "invalid_mode") {
+    notes.push("RETRIEVAL_PROVIDER has an invalid value; using default Indian Kanoon HTML retrieval.");
+  }
+  if (!retrievalProvider.supportsDetailFetch) {
+    notes.push("Detail verification was skipped (web-search retrieval). Results are snippet-based and confidence is capped.");
+  }
+  if (
+    retrievalProvider.supportsDetailFetch &&
+    evaluation.verificationSummary.attempted > 0 &&
+    evaluation.verificationSummary.detailFetched === 0
+  ) {
+    notes.push("Detail verification failed for all shortlisted candidates; ranking stayed snippet-based for this run.");
+  }
+  if ((evaluation.verificationSummary.detailFetchFallbackUsed ?? 0) > 0) {
+    notes.push(
+      `Detail verification used canonical full-document fallback for ${evaluation.verificationSummary.detailFetchFallbackUsed} candidates.`,
+    );
+  }
+  if ((evaluation.verificationSummary.hybridFallbackUsed ?? 0) > 0) {
+    notes.push(
+      `Hybrid detail fallback attempted for ${evaluation.verificationSummary.hybridFallbackUsed} shortlisted candidates.`,
+    );
+  }
+  if ((evaluation.verificationSummary.hybridFallbackSuccesses ?? 0) > 0) {
+    notes.push(
+      `Hybrid detail fallback successfully hydrated ${evaluation.verificationSummary.hybridFallbackSuccesses} candidates.`,
+    );
+  }
   if (PROPOSITION_V3_ENABLED) {
     notes.push("Universal proposition V3 gating is active (all required hook groups + polarity checks).");
   } else {
@@ -986,9 +1083,13 @@ export async function runPipelineSearch(input: {
         reasonerTimeout: reasonerPass1.telemetry.timeout,
         reasonerDegraded: reasonerPass1.telemetry.degraded,
         reasonerError: reasonerPass1.telemetry.error,
+        reasonerWarnings: reasonerPass1.telemetry.warnings,
         reasonerAttempted: reasonerHealth.attempted,
         reasonerStatus: reasonerHealth.status,
         reasonerSkipReason: reasonerHealth.skipReason,
+        reasonerStage: reasonerPass1.telemetry.reasonerStage,
+        reasonerStageLatencyMs: reasonerPass1.telemetry.reasonerStageLatencyMs,
+        reasonerPlanSource: reasonerPass1.telemetry.reasonerPlanSource,
         pass1Invoked,
         pass2Invoked,
         pass2Reason,
@@ -1020,6 +1121,8 @@ export async function runPipelineSearch(input: {
         elapsedMs,
       },
       retrieval: {
+        providerId: retrievalProvider.id,
+        providerReason: retrievalSelection.fallbackReason,
         phaseAttempts: attemptsByPhase,
         phaseSuccesses: successesByPhase,
         statusCounts,
@@ -1055,8 +1158,16 @@ export async function runPipelineSearch(input: {
       verification: {
         attempted: evaluation.verificationSummary.attempted,
         detailFetched: evaluation.verificationSummary.detailFetched,
+        detailFetchFailed: evaluation.verificationSummary.detailFetchFailed,
+        detailFetchFallbackUsed: evaluation.verificationSummary.detailFetchFallbackUsed,
+        detailFetchErrorCounts: evaluation.verificationSummary.detailFetchErrorCounts,
+        detailFetchSampleErrors: evaluation.verificationSummary.detailFetchSampleErrors,
+        hybridFallbackUsed: evaluation.verificationSummary.hybridFallbackUsed,
+        hybridFallbackSuccesses: evaluation.verificationSummary.hybridFallbackSuccesses,
+        detailHydrationCoverage: evaluation.verificationSummary.detailHydrationCoverage,
         passedCaseGate: evaluation.verificationSummary.passedCaseGate,
         limit: config.verifyLimit,
+        networkFetchAllowed: allowNetworkFetch,
       },
     },
   };
@@ -1079,6 +1190,8 @@ export async function runPipelineSearch(input: {
         reasonerAttempted: reasonerHealth.attempted,
         reasonerStatus: reasonerHealth.status,
         reasonerSkipReason: reasonerHealth.skipReason,
+        reasonerError: reasonerPass1.telemetry.error,
+        reasonerWarnings: reasonerPass1.telemetry.warnings,
         reasonerTimeoutMsUsed: reasonerPass1.telemetry.timeoutMsUsed,
         reasonerLatencyMs: reasonerPass1.telemetry.latencyMs,
       },
@@ -1107,6 +1220,7 @@ export async function runPipelineSearch(input: {
         htmlPreview: attempt.htmlPreview,
         error: attempt.error,
         variantId: attempt.variantId,
+        providerId: attempt.providerId,
       })),
       courtBreakdown: {
         sc: scheduler.candidates.filter((candidate) => candidate.court === "SC").length,

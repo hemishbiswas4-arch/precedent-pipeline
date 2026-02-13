@@ -8,8 +8,6 @@ import {
   summarizeSessionRuns,
   type SessionRunMetric,
 } from "@/lib/client-analytics";
-import { probeClientDirectRetrieval, runClientDirectRetrieval } from "@/lib/client-retrieval";
-import { QueryVariant } from "@/lib/pipeline/types";
 import { evaluateQueryCoach } from "@/lib/query-coach";
 import { NearMissCase, ScoredCase, SearchResponse } from "@/lib/types";
 
@@ -34,6 +32,8 @@ type DebugPayload = {
       | "disabled"
       | "error";
     reasonerSkipReason?: string;
+    reasonerError?: string;
+    reasonerWarnings?: string[];
     reasonerTimeoutMsUsed?: number;
     reasonerLatencyMs?: number;
   };
@@ -46,64 +46,44 @@ type DebugPayload = {
     phase?: string;
     parserMode?: string;
     challengeDetected?: boolean;
-    blockedType?: "local_cooldown" | "cloudflare_challenge" | "rate_limit" | "cors";
+    blockedType?: "local_cooldown" | "cloudflare_challenge" | "rate_limit";
     parsedCount: number;
     error: string | null;
     htmlPreview?: string;
   }>;
 };
 
-type PlanResponse = {
-  requestId: string;
-  query: string;
-  cleanedQuery: string;
-  context: SearchResponse["context"];
-  proposition?: SearchResponse["proposition"];
-  planner: {
-    source: "bedrock" | "fallback";
-    modelId?: string;
-    error?: string;
-    reasonerMode?: "opus" | "deterministic";
-    reasonerDegraded?: boolean;
-    reasonerAttempted?: boolean;
-    reasonerStatus?:
-      | "ok"
-      | "timeout"
-      | "circuit_open"
-      | "config_error"
-      | "rate_limited"
-      | "lock_timeout"
-      | "semaphore_saturated"
-      | "disabled"
-      | "error";
-    reasonerSkipReason?: string;
-    reasonerTimeoutMsUsed?: number;
-    reasonerLatencyMs?: number;
-  };
-  queryPlan: {
-    strictVariants: QueryVariant[];
-    fallbackVariants: QueryVariant[];
-  };
-  keywordPack: SearchResponse["keywordPack"];
-  runtime: {
-    profile: string;
-    maxElapsedMs: number;
-    verifyLimit: number;
-    globalBudget: number;
-    fetchTimeoutMs: number;
-    maxResults: number;
-  };
-  clientRetrieval: {
-    enabled: boolean;
-    strictVariantLimit: number;
-    probeTtlMs: number;
-  };
+type BedrockHealthResponse = {
+  ok: boolean;
+  region: string;
+  modelId: string | null;
+  latencyMs?: number;
+  preview?: string;
+  timeoutMs?: number;
+  aborted?: boolean;
+  errorName?: string;
+  httpStatusCode?: number;
+  hint?: string;
+  error?: string;
 };
 
 const INITIAL_QUERY =
   "State as appellant filed criminal appeal and delay condonation application was refused; find SC/HC cases where the appeal was dismissed as time-barred.";
-const REQUEST_TIMEOUT_MS = 28_000;
-const CLIENT_DIRECT_ENABLED = process.env.NEXT_PUBLIC_CLIENT_DIRECT_RETRIEVAL_ENABLED !== "0";
+const REQUEST_TIMEOUT_MS = Math.max(
+  45_000,
+  Number(process.env.NEXT_PUBLIC_SEARCH_TIMEOUT_MS ?? "90000"),
+);
+
+function executionPathLabel(path: SearchResponse["executionPath"] | undefined): string {
+  switch (path) {
+    case "server_fallback":
+      return "Server (fallback)";
+    case "server_only":
+      return "Server";
+    default:
+      return "Server";
+  }
+}
 
 function ScoreMeter({ score }: { score: number }) {
   return (
@@ -216,6 +196,26 @@ async function postJsonWithTimeout<T>(url: string, body: unknown, timeoutMs: num
   }
 }
 
+async function getJsonWithTimeout<T>(url: string, timeoutMs: number): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+
+    const json = (await response.json()) as T & { error?: string };
+    if (!response.ok) {
+      throw new Error(json.error || `Request failed (${response.status})`);
+    }
+    return json;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export default function Home() {
   const [query, setQuery] = useState(INITIAL_QUERY);
   const [data, setData] = useState<SearchResponse | null>(null);
@@ -226,10 +226,37 @@ export default function Home() {
   const [sessionRuns, setSessionRuns] = useState<SessionRunMetric[]>([]);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [enableDebugDiagnostics, setEnableDebugDiagnostics] = useState(false);
+  const [bedrockHealth, setBedrockHealth] = useState<BedrockHealthResponse | null>(null);
+  const [bedrockChecking, setBedrockChecking] = useState(false);
 
   useEffect(() => {
     setSessionRuns(loadSessionRuns());
   }, []);
+
+  async function runBedrockHealthCheck() {
+    setBedrockChecking(true);
+    try {
+      const requestedTimeoutMs = 9000;
+      const result = await getJsonWithTimeout<BedrockHealthResponse>(
+        `/api/health/bedrock?timeoutMs=${requestedTimeoutMs}`,
+        requestedTimeoutMs + 2500,
+      );
+      setBedrockHealth(result);
+    } catch (err) {
+      const isAbort = err instanceof DOMException && err.name === "AbortError";
+      setBedrockHealth({
+        ok: false,
+        region: "unknown",
+        modelId: null,
+        error: isAbort ? "bedrock_health_client_timeout:11500" : err instanceof Error ? err.message : "bedrock_health_failed",
+        hint: isAbort
+          ? "Browser-side timeout while waiting for Bedrock health response. Try again or increase timeout."
+          : undefined,
+      });
+    } finally {
+      setBedrockChecking(false);
+    }
+  }
 
   const sessionSummary = useMemo(() => summarizeSessionRuns(sessionRuns), [sessionRuns]);
   const queryCoach = useMemo(() => evaluateQueryCoach(query), [query]);
@@ -281,267 +308,35 @@ export default function Home() {
     setData(null);
     setDebugData(null);
     setRequestStatus("Running search...");
-
-    const runStartedAt = Date.now();
-    let clientDirectAttempted = false;
-    let clientDirectSucceeded = false;
-
     try {
-      let responsePayload: (SearchResponse & { debug?: DebugPayload }) | null = null;
-      let sourceDebug: DebugPayload | null = null;
-
-      if (CLIENT_DIRECT_ENABLED) {
-        const probeStartedAt = Date.now();
-        const probe = await probeClientDirectRetrieval();
-        const probeElapsedMs = Date.now() - probeStartedAt;
-
-        if (!probe.supported) {
-          responsePayload = await postJsonWithTimeout<SearchResponse>(
-            "/api/search",
-            { query, maxResults: 20, debug: enableDebugDiagnostics },
-            REQUEST_TIMEOUT_MS,
-          );
-          responsePayload = {
-            ...responsePayload,
-            notes: [
-              ...(responsePayload.notes ?? []),
-              `Client-direct retrieval unavailable (${probe.reason ?? "unknown"}${
-                probe.detail ? `: ${probe.detail}` : ""
-              }); server fallback used.`,
-            ],
-            executionPath: "server_fallback",
-            clientDirectAttempted: false,
-            clientDirectSucceeded: false,
-            pipelineTrace: responsePayload.pipelineTrace
-              ? {
-                  ...responsePayload.pipelineTrace,
-                  routing: {
-                    decision: "server_fallback",
-                    reason: "client_direct_probe_unsupported",
-                    clientProbe: `${probe.reason ?? "unknown"}${probe.detail ? `|${probe.detail}` : ""}`,
-                  },
-                  timing: {
-                    stageMs: {
-                      ...(responsePayload.pipelineTrace.timing?.stageMs ?? {}),
-                      client_probe: probeElapsedMs,
-                      total: Date.now() - runStartedAt,
-                    },
-                  },
-                }
-              : responsePayload.pipelineTrace,
-          };
-
-          if (enableDebugDiagnostics) {
-            const serverDebug = responsePayload.debug;
-            sourceDebug = {
-              requestId: serverDebug?.requestId ?? responsePayload.requestId ?? "n/a",
-              cleanedQuery: serverDebug?.cleanedQuery,
-              planner: serverDebug?.planner,
-              phrases: serverDebug?.phrases ?? [],
-              source: [
-                {
-                  phrase: "client_probe",
-                  searchQuery: undefined,
-                  status: 0,
-                  ok: false,
-                  phase: "client_probe",
-                  parserMode: "n/a",
-                  challengeDetected: false,
-                  blockedType: "cors",
-                  parsedCount: 0,
-                  error: probe.reason ?? "client_direct_unavailable",
-                  htmlPreview: probe.detail ?? "No client probe details available.",
-                },
-                ...(serverDebug?.source ?? []),
-              ],
-            };
-          }
-        }
-
-        if (!responsePayload) {
-          const planStartedAt = Date.now();
-          const plan = await postJsonWithTimeout<PlanResponse>(
-            "/api/search/plan",
-            { query, maxResults: 20, debug: enableDebugDiagnostics },
-            12_000,
-          );
-          const planElapsedMs = Date.now() - planStartedAt;
-
-          if (plan.clientRetrieval.enabled) {
-          const clientStartedAt = Date.now();
-          const clientResult = await runClientDirectRetrieval({
-            variants: plan.queryPlan.strictVariants,
-            maxVariants: Math.max(1, plan.clientRetrieval.strictVariantLimit),
-            fetchTimeoutMs: plan.runtime.fetchTimeoutMs,
-          });
-          const clientElapsedMs = Date.now() - clientStartedAt;
-
-          clientDirectAttempted = clientResult.attempted;
-          clientDirectSucceeded = clientResult.succeeded;
-
-          if (enableDebugDiagnostics) {
-            const sourceEntries =
-              clientResult.attempts.length > 0
-                ? clientResult.attempts.map((attempt) => ({
-                    phrase: attempt.phrase,
-                    searchQuery: attempt.url,
-                    status: attempt.status ?? (attempt.ok ? 200 : 0),
-                    ok: attempt.ok,
-                    phase: "client_direct",
-                    parserMode: attempt.parserMode,
-                    challengeDetected: attempt.challenge,
-                    blockedType: clientResult.blockedKind,
-                    parsedCount: attempt.parsedCount,
-                    error: attempt.error ?? null,
-                    htmlPreview: clientResult.reason,
-                  }))
-                : [
-                    {
-                      phrase: "client_probe",
-                      searchQuery: undefined,
-                      status: 0,
-                      ok: false,
-                      phase: "client_probe",
-                      parserMode: "n/a",
-                      challengeDetected: false,
-                      blockedType: clientResult.blockedKind,
-                      parsedCount: 0,
-                      error: clientResult.reason ?? "client_direct_unavailable",
-                      htmlPreview: clientResult.probeDetail ?? "No client probe details available.",
-                    },
-                  ];
-            sourceDebug = {
-              requestId: plan.requestId,
-              cleanedQuery: plan.cleanedQuery,
-              planner: {
-                source: plan.planner.source,
-                modelId: plan.planner.modelId,
-                error: plan.planner.error,
-                reasonerMode: plan.planner.reasonerMode,
-                reasonerDegraded: plan.planner.reasonerDegraded,
-                reasonerAttempted: plan.planner.reasonerAttempted,
-                reasonerStatus: plan.planner.reasonerStatus,
-                reasonerSkipReason: plan.planner.reasonerSkipReason,
-                reasonerTimeoutMsUsed: plan.planner.reasonerTimeoutMsUsed,
-                reasonerLatencyMs: plan.planner.reasonerLatencyMs,
-              },
-              phrases: plan.queryPlan.strictVariants.map((variant) => variant.phrase),
-              source: sourceEntries,
-            };
-          }
-
-          if (clientResult.succeeded && clientResult.candidates.length > 0) {
-            responsePayload = await postJsonWithTimeout<SearchResponse>(
-              "/api/search/finalize",
-              {
-                query,
-                maxResults: 20,
-                executionPath: "client_first",
-                clientDirectAttempted: true,
-                clientDirectSucceeded: true,
-                routingReason: "client_direct_finalize",
-                clientProbe: clientResult.reason,
-                stageTimings: {
-                  plan: planElapsedMs,
-                  client_direct: clientElapsedMs,
-                  total: Date.now() - runStartedAt,
-                },
-                rawCandidates: clientResult.candidates,
-                debugDiagnostics: {
-                  sourceAttempts: clientResult.attempts,
-                },
-              },
-              REQUEST_TIMEOUT_MS,
-            );
-          } else {
-            responsePayload = await postJsonWithTimeout<SearchResponse>(
-              "/api/search",
-              { query, maxResults: 20, debug: enableDebugDiagnostics },
-              REQUEST_TIMEOUT_MS,
-            );
-            responsePayload = {
-              ...responsePayload,
-              notes: [
-                ...(responsePayload.notes ?? []),
-                `Client-direct retrieval unavailable (${clientResult.reason ?? "unknown"}${
-                  clientResult.probeDetail ? `: ${clientResult.probeDetail}` : ""
-                }); server fallback used.`,
-              ],
-              executionPath: "server_fallback",
-              clientDirectAttempted,
-              clientDirectSucceeded,
-              pipelineTrace: responsePayload.pipelineTrace
-                ? {
-                    ...responsePayload.pipelineTrace,
-                    routing: {
-                      decision: "server_fallback",
-                      reason: "client_direct_unavailable_or_empty",
-                      clientProbe: `${clientResult.reason ?? "unknown"}${
-                        clientResult.probeDetail ? `|${clientResult.probeDetail}` : ""
-                      }`,
-                    },
-                    timing: {
-                      stageMs: {
-                        ...(responsePayload.pipelineTrace.timing?.stageMs ?? {}),
-                        client_probe: probeElapsedMs,
-                        plan: planElapsedMs,
-                        client_direct: clientElapsedMs,
-                        total: Date.now() - runStartedAt,
-                      },
-                    },
-                  }
-                : responsePayload.pipelineTrace,
-            };
-          }
-          } else {
-            responsePayload = await postJsonWithTimeout<SearchResponse>(
-              "/api/search",
-              { query, maxResults: 20, debug: enableDebugDiagnostics },
-              REQUEST_TIMEOUT_MS,
-            );
-            responsePayload = {
-              ...responsePayload,
-              executionPath: "server_only",
-              clientDirectAttempted: false,
-              clientDirectSucceeded: false,
-            };
-          }
-        }
-      } else {
-        responsePayload = await postJsonWithTimeout<SearchResponse>(
-          "/api/search",
-          { query, maxResults: 20, debug: enableDebugDiagnostics },
-          REQUEST_TIMEOUT_MS,
-        );
-      }
-
-      if (!responsePayload) {
-        throw new Error("Search failed to produce a response payload.");
-      }
+      const responsePayload = await postJsonWithTimeout<SearchResponse & { debug?: DebugPayload }>(
+        "/api/search",
+        { query, maxResults: 20, debug: enableDebugDiagnostics },
+        REQUEST_TIMEOUT_MS,
+      );
 
       setData(responsePayload);
-      setDebugData(enableDebugDiagnostics ? sourceDebug ?? responsePayload.debug ?? null : null);
+      setDebugData(enableDebugDiagnostics ? responsePayload.debug ?? null : null);
 
+      const exactCasesForRun = responsePayload.casesExact ?? responsePayload.cases;
       const blockedRun = responsePayload.status === "blocked";
       const partialRun = Boolean(responsePayload.pipelineTrace?.scheduler.partialDueToLatency || responsePayload.partialRun);
       const retryAfterMs = responsePayload.retryAfterMs ?? responsePayload.pipelineTrace?.scheduler.retryAfterMs;
 
       const avgConfidence =
-        (responsePayload.casesExact ?? responsePayload.cases).length > 0
-          ? (responsePayload.casesExact ?? responsePayload.cases).reduce(
-              (sum, item) => sum + (item.confidenceScore ?? item.score),
-              0,
-            ) / (responsePayload.casesExact ?? responsePayload.cases).length
+        exactCasesForRun.length > 0
+          ? exactCasesForRun.reduce((sum, item) => sum + (item.confidenceScore ?? item.score), 0) /
+            exactCasesForRun.length
           : 0;
-      const scCount = (responsePayload.casesExact ?? responsePayload.cases).filter((item) => item.court === "SC").length;
-      const hcCount = (responsePayload.casesExact ?? responsePayload.cases).filter((item) => item.court === "HC").length;
+      const scCount = exactCasesForRun.filter((item) => item.court === "SC").length;
+      const hcCount = exactCasesForRun.filter((item) => item.court === "HC").length;
 
       const nextRuns = saveSessionRun({
         timestamp: Date.now(),
         requestId: responsePayload.requestId,
         totalFetched: responsePayload.totalFetched,
         filteredCount: responsePayload.filteredCount,
-        casesCount: (responsePayload.casesExact ?? responsePayload.cases).length,
+        casesCount: exactCasesForRun.length,
         averageScore: avgConfidence,
         scCount,
         hcCount,
@@ -557,15 +352,18 @@ export default function Home() {
         );
       } else if (responsePayload.status === "partial" || partialRun) {
         setRequestStatus("Search completed with partial results due to runtime budget.");
+      } else if (responsePayload.status === "no_match" && (responsePayload.casesNearMiss?.length ?? 0) > 0) {
+        setRequestStatus("No exact proposition matches were verified; near misses are shown below.");
       } else if (responsePayload.status === "no_match") {
         setRequestStatus("No exact proposition matches were verified for this run.");
       } else {
         setRequestStatus("Search completed.");
       }
     } catch (err) {
+      const timeoutSeconds = Math.max(1, Math.round(REQUEST_TIMEOUT_MS / 1000));
       const errorMessage =
         err instanceof DOMException && err.name === "AbortError"
-          ? "Search timed out before the source responded. Please retry; if this persists, source throttling is likely active."
+          ? `Search exceeded the UI timeout (${timeoutSeconds}s) before the server completed. Please retry; if this repeats, increase NEXT_PUBLIC_SEARCH_TIMEOUT_MS.`
           : err instanceof Error
             ? err.message
             : "Unexpected error";
@@ -684,6 +482,41 @@ export default function Home() {
       {showAdvanced && (
         <section className="panel advanced-panel">
           <h2>Advanced settings</h2>
+          <div className="advanced-block">
+            <h3>Reasoner (Bedrock)</h3>
+            <button
+              type="button"
+              className="button-secondary"
+              onClick={() => void runBedrockHealthCheck()}
+              disabled={bedrockChecking}
+            >
+              {bedrockChecking ? "Testing..." : "Test Bedrock connection"}
+            </button>
+            {bedrockHealth && (
+              <>
+                <p className="stats">
+                  {bedrockHealth.ok
+                    ? `OK (${bedrockHealth.region}, ${bedrockHealth.modelId ?? "unknown model"}, ${bedrockHealth.latencyMs ?? 0}ms)`
+                    : `Error (${bedrockHealth.error ?? "unknown"}${
+                        typeof bedrockHealth.httpStatusCode === "number"
+                          ? `, HTTP ${bedrockHealth.httpStatusCode}`
+                          : ""
+                      }${
+                        typeof bedrockHealth.timeoutMs === "number"
+                          ? `, timeout ${bedrockHealth.timeoutMs}ms`
+                          : ""
+                      })`}
+                </p>
+                {!bedrockHealth.ok && bedrockHealth.hint && <p className="stats">{bedrockHealth.hint}</p>}
+              </>
+            )}
+            {!bedrockHealth && (
+              <p className="stats">
+                Use this to confirm AWS credentials/region/model config on Vercel. If it fails, reasoner planning will
+                fall back to deterministic mode.
+              </p>
+            )}
+          </div>
           <label className="checkbox-row">
             <input
               type="checkbox"
@@ -727,7 +560,7 @@ export default function Home() {
               </article>
               <article className="analytics-card">
                 <h3>Execution path</h3>
-                <p>{data.executionPath ?? "server_only"}</p>
+                <p>{executionPathLabel(data.executionPath)}</p>
               </article>
               <article className="analytics-card">
                 <h3>Partial run</h3>
@@ -789,6 +622,8 @@ export default function Home() {
                     ? "Source access is temporarily blocked/throttled. Retry after cooldown to continue retrieval."
                     : data.status === "partial"
                       ? "Run ended early due to runtime budget before exact matches were verified. Retry to continue."
+                      : nearMissCases.length > 0
+                        ? "No exact proposition matches were found. Near misses are expanded below."
                       : "No court-filtered exact matches found. Refine facts or add legal sections in the query."}
                 </p>
               )}
@@ -797,7 +632,7 @@ export default function Home() {
               ))}
             </div>
             {nearMissCases.length > 0 && (
-              <details className="case-details">
+              <details className="case-details" open={exactCases.length === 0}>
                 <summary>Near misses ({nearMissCases.length})</summary>
                 <p className="stats">
                   These are contextually similar but failed one or more mandatory proposition elements.
@@ -891,7 +726,15 @@ export default function Home() {
                         {debugData.planner.reasonerSkipReason
                           ? ` | skipReason=${debugData.planner.reasonerSkipReason}`
                           : ""}
+                        {!debugData.planner.reasonerSkipReason && debugData.planner.reasonerError
+                          ? ` | error=${debugData.planner.reasonerError}`
+                          : ""}
                       </p>
+                      {debugData.planner.reasonerWarnings && debugData.planner.reasonerWarnings.length > 0 && (
+                        <p className="stats">
+                          Reasoner warnings: {debugData.planner.reasonerWarnings.join(" | ")}
+                        </p>
+                      )}
                     </>
                   )}
                   <div className="cases">

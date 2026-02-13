@@ -157,7 +157,7 @@ async function callBedrockPlanner(
   context: ContextProfile,
   modelId: string,
 ): Promise<PlannerPayload | null> {
-  const client = getBedrockClient();
+  const client = getBedrockClient({ modelId });
   const command = new ConverseCommand({
     modelId,
     system: [
@@ -176,7 +176,6 @@ async function callBedrockPlanner(
       },
     ],
     inferenceConfig: {
-      temperature: 0.1,
       maxTokens: 700,
     },
   });
