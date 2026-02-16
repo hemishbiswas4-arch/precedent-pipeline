@@ -164,6 +164,7 @@ function buildDebug(input: {
     retryAfterMs: input.retryAfterMs,
     blockedType: input.blockedType,
     htmlPreview: input.htmlPreview,
+    sourceTag: "web_search",
   };
 }
 

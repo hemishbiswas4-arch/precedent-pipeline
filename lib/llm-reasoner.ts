@@ -2,6 +2,11 @@ import { randomUUID, createHash } from "crypto";
 import { ConverseCommand, type ConverseCommandInput } from "@aws-sdk/client-bedrock-runtime";
 import { getBedrockClient, getBedrockModelConfig } from "@/lib/bedrock-client";
 import { sharedCache } from "@/lib/cache/shared-cache";
+import {
+  getSearchRuntimeProfileSettings,
+  parseSearchRuntimeProfile,
+  resolveProfiledNumber,
+} from "@/lib/runtime-profile";
 import { ContextProfile } from "@/lib/types";
 import {
   expandReasonerPlanFromSketch,
@@ -49,15 +54,35 @@ export type ReasonerMode = "pass1" | "pass2";
 let inflightReasonerCalls = 0;
 
 const MODE = (process.env.LLM_REASONER_MODE ?? "initial").toLowerCase();
+const SEARCH_RUNTIME_PROFILE = parseSearchRuntimeProfile(process.env.SEARCH_RUNTIME_PROFILE);
+const RUNTIME_PROFILE = getSearchRuntimeProfileSettings(SEARCH_RUNTIME_PROFILE);
 // Production default favors a single, slightly longer attempt so we actually use the reasoner,
 // instead of timing out quickly and falling back to deterministic every time.
-const TIMEOUT_MS = Math.max(200, Number(process.env.LLM_REASONER_TIMEOUT_MS ?? "1800"));
-const MAX_TIMEOUT_MS = Math.max(TIMEOUT_MS, Number(process.env.LLM_REASONER_MAX_TIMEOUT_MS ?? "4500"));
+const TIMEOUT_MS = resolveProfiledNumber({
+  value: process.env.LLM_REASONER_TIMEOUT_MS,
+  defaultValue: RUNTIME_PROFILE.llmReasonerTimeoutMs.defaultValue,
+  min: RUNTIME_PROFILE.llmReasonerTimeoutMs.min,
+  cap: RUNTIME_PROFILE.llmReasonerTimeoutMs.cap,
+  round: "floor",
+});
+const MAX_TIMEOUT_MS = resolveProfiledNumber({
+  value: process.env.LLM_REASONER_MAX_TIMEOUT_MS,
+  defaultValue: Math.max(TIMEOUT_MS, RUNTIME_PROFILE.llmReasonerTimeoutMs.defaultValue + 1_200),
+  min: TIMEOUT_MS,
+  cap: RUNTIME_PROFILE.llmReasonerTimeoutMs.cap + 4_000,
+  round: "floor",
+});
 const MAX_TOKENS = Math.max(100, Number(process.env.LLM_REASONER_MAX_TOKENS ?? "360"));
 // Guardrail: long generations are a primary source of latency/timeouts on big models.
 // Use LLM_REASONER_MAX_TOKENS to tune, but keep a sane upper bound unless explicitly overridden.
 const HARD_MAX_TOKENS = Math.max(120, Number(process.env.LLM_REASONER_HARD_MAX_TOKENS ?? "520"));
-const MAX_CALLS_PER_REQUEST = Math.max(0, Number(process.env.LLM_REASONER_MAX_CALLS_PER_REQUEST ?? "2"));
+const MAX_CALLS_PER_REQUEST = resolveProfiledNumber({
+  value: process.env.LLM_REASONER_MAX_CALLS_PER_REQUEST,
+  defaultValue: RUNTIME_PROFILE.llmReasonerMaxCallsPerRequest.defaultValue,
+  min: RUNTIME_PROFILE.llmReasonerMaxCallsPerRequest.min,
+  cap: RUNTIME_PROFILE.llmReasonerMaxCallsPerRequest.cap,
+  round: "floor",
+});
 const CACHE_TTL_SEC = Math.max(60, Number(process.env.LLM_REASONER_CACHE_TTL_SEC ?? "21600"));
 const PASS2_CACHE_TTL_SEC = Math.max(60, Number(process.env.LLM_REASONER_PASS2_CACHE_TTL_SEC ?? "900"));
 const CIRCUIT_ENABLED = (process.env.LLM_CIRCUIT_BREAKER_ENABLED ?? "1") !== "0";

@@ -50,6 +50,13 @@ export type IntentProfile = {
     fromDate?: string;
     toDate?: string;
   };
+  entities: {
+    person: string[];
+    org: string[];
+    statute: string[];
+    section: string[];
+    case_citation: string[];
+  };
 };
 
 export type PlannerOutput = {
@@ -73,6 +80,7 @@ export type ClassifiedCandidate = CaseCandidate & {
 
 export type RetrievalAttempt = {
   providerId?: string;
+  sourceLabel?: "lexical_api" | "lexical_html" | "web_search" | "semantic_vector" | "fused";
   phase: QueryPhase;
   courtScope?: CourtScope;
   variantId: string;
@@ -101,6 +109,13 @@ export type RetrievalAttempt = {
   timedOut?: boolean;
   fetchTimeoutMsUsed?: number;
   htmlPreview?: string;
+  lexicalCandidateCount?: number;
+  semanticCandidateCount?: number;
+  fusedCandidateCount?: number;
+  rerankApplied?: boolean;
+  fusionLatencyMs?: number;
+  docFragmentHydrationMs?: number;
+  docFragmentCalls?: number;
   error: string | null;
 };
 

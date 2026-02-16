@@ -7,7 +7,12 @@
     "dev:turbo": "next dev --turbo",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "index:ik": "tsx scripts/index-ik-corpus.ts",
+    "backfill:ik": "tsx scripts/backfill-ik-window.ts",
+    "eval:retrieval": "tsx scripts/eval-retrieval.ts",
+    "eval:recall": "tsx scripts/eval-retrieval-recall.ts",
+    "test:hybrid": "tsx --test lib/ingestion/chunker.test.ts lib/ingestion/ik-api-client.test.ts lib/retrieval/hybrid.test.ts lib/retrieval/hybrid.integration.test.ts lib/scoring-rerank.test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.987.0",
@@ -17,6 +22,7 @@
     "react-dom": "19.2.3"
   },
   "devDependencies": {
+    "@esbuild/darwin-arm64": "^0.27.3",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
@@ -24,6 +30,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }

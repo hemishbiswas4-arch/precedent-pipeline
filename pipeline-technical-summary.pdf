@@ -1,0 +1,121 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 3322 >>
+stream
+BT
+/F1 10 Tf
+13 TL
+42 744 Td
+(Precedent Finder Pipeline - Technical Summary \(One Page\)) Tj
+T*
+(Source baseline: /app/api/search/route.ts + /lib/pipeline/*) Tj
+T*
+(Generated: 2026-02-14) Tj
+T*
+() Tj
+T*
+(1\) API Entry, Guardrails, and Caching) Tj
+T*
+(- POST /api/search is the single search entrypoint; query length floor is ~12 chars.) Tj
+T*
+(- Non-debug requests apply IP rate limiting \(default 40 req / 60s window\).) Tj
+T*
+(- Response cache key includes normalized query + policy seed; default TTL is 300s.) Tj
+T*
+(- In-flight lock/coalescing serves concurrent duplicates from shared cache when possible.) Tj
+T*
+(- Routing is server-only in this path; status can be completed/partial/blocked/no_match.) Tj
+T*
+() Tj
+T*
+(2\) Intent + Planning Layer) Tj
+T*
+(- Intent extraction builds domains, issues, statutes, procedures, actors, court hint, date window.) Tj
+T*
+(- Bedrock reasoner pass-1 \(bounded, fail-open\) outputs proposition sketch + query variants.) Tj
+T*
+(- Deterministic planner always runs and grounds/backs up reasoner output.) Tj
+T*
+(- Canonical rewrite V2 can synthesize prioritized strict+broad variants with token constraints.) Tj
+T*
+(- Retrieval provider is selected by RETRIEVAL_PROVIDER \(auto/indiankanoon_html/serper\).) Tj
+T*
+() Tj
+T*
+(3\) Retrieval Scheduler Mechanics) Tj
+T*
+(- Phase order: primary -> fallback -> rescue -> micro -> revolving -> browse.) Tj
+T*
+(- Default phase limits: 2/2/1/1/1/1, global budget: 8 attempts, max elapsed: 9000 ms.) Tj
+T*
+(- Adaptive scheduler reorders variants using utility, case-like yield, challenge, timeout rates.) Tj
+T*
+(- Per-attempt timeout is dynamically bounded \(cap ~3500 ms\) by remaining request budget.) Tj
+T*
+(- Query signatures prevent duplicate fetches; candidate provenance tracks strict/relaxed hit origin.) Tj
+T*
+(- Stop reasons include enough_candidates, budget_exhausted, blocked, completed.) Tj
+T*
+() Tj
+T*
+(4\) Verification, Scoring, and Proposition Gating) Tj
+T*
+(- Candidates are classified as case/statute/noise/unknown before ranking.) Tj
+T*
+(- Verifier hydrates shortlisted docs \(concurrency default 4\) with retry/fallback handling.) Tj
+T*
+(- Score combines lexical overlap, context matches, proposition coverage, court/citation signals.) Tj
+T*
+(- Penalties apply for polarity mismatch, contradictions, missing interactions, low-quality provenance.) Tj
+T*
+(- Proposition gate enforces hook groups, relations, outcome polarity, role-chain constraints.) Tj
+T*
+(- Results split into exact_strict, exact_provisional \(confidence-capped\), and near_miss tiers.) Tj
+T*
+() Tj
+T*
+(5\) Resilience, Pass-2, and Always-Return) Tj
+T*
+(- Conditional reasoner pass-2 runs once when exact quality/coverage is insufficient and budget remains.) Tj
+T*
+(- Timeout recovery can expand deterministic budget \(extended_deterministic mode\).) Tj
+T*
+(- Always-return guarantee may trigger extra backfill attempts when tier counts are sparse.) Tj
+T*
+(- Stale-similarity cache fallback and synthetic advisory fallback avoid empty final payloads.) Tj
+T*
+(- pipelineTrace returns planner/scheduler/retrieval/classification/verification diagnostics.) Tj
+T*
+() Tj
+T*
+(Technical intent: bounded latency, transparent ranking rationale, fail-open behavior, and explicit) Tj
+T*
+(degradation paths under source blocking, rate limits, or LLM unavailability.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000003615 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+3685
+%%EOF

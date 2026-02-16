@@ -1,5 +1,6 @@
 import { IntentProfile, PlannerOutput, QueryProviderHints, QueryVariant } from "@/lib/pipeline/types";
 import { ReasonerOutcomePolarity, ReasonerPlan } from "@/lib/reasoner-schema";
+import { expandOntologySynonymsForRecall } from "@/lib/kb/legal-ontology";
 
 export type CanonicalHookGroup = {
   groupId: string;
@@ -194,10 +195,20 @@ function buildVariant(
 }
 
 export function buildCanonicalIntent(intent: IntentProfile, reasonerPlan?: ReasonerPlan): CanonicalIntent {
-  const actors = unique([...(reasonerPlan?.proposition.actors ?? []), ...intent.actors]).slice(0, 6);
+  const actors = unique([
+    ...(reasonerPlan?.proposition.actors ?? []),
+    ...intent.actors,
+    ...intent.entities.person,
+    ...intent.entities.org,
+  ]).slice(0, 8);
   const proceedings = unique([...(reasonerPlan?.proposition.proceeding ?? []), ...intent.procedures]).slice(0, 6);
   const outcomes = unique([...(reasonerPlan?.proposition.outcome_required ?? []), ...intent.issues]).slice(0, 8);
-  const legalHooks = unique([...(reasonerPlan?.proposition.legal_hooks ?? []), ...intent.statutes]).slice(0, 10);
+  const legalHooks = unique([
+    ...(reasonerPlan?.proposition.legal_hooks ?? []),
+    ...intent.statutes,
+    ...intent.entities.statute,
+    ...intent.entities.section,
+  ]).slice(0, 14);
   const hookGroups = extractHookGroups(intent, reasonerPlan);
   const polarity = inferOutcomePolarity(intent, reasonerPlan);
   const contradictionTerms = unique([
@@ -281,6 +292,24 @@ export function synthesizeRetrievalQueries(input: {
     broadSeeds.push(phrase);
   }
   for (const phrase of deterministicPlanner.keywordPack.primary.slice(0, 10)) {
+    broadSeeds.push(phrase);
+  }
+  for (const phrase of expandOntologySynonymsForRecall({
+    terms: [
+      ...canonicalIntent.legalHooks,
+      ...canonicalIntent.outcomes,
+      ...canonicalIntent.proceedings,
+    ],
+    context: {
+      domains: [],
+      issues: canonicalIntent.outcomes,
+      statutesOrSections: canonicalIntent.legalHooks,
+      procedures: canonicalIntent.proceedings,
+      actors: canonicalIntent.actors,
+      anchors: canonicalIntent.canonicalOrderTerms,
+    },
+    maxExpansions: 18,
+  })) {
     broadSeeds.push(phrase);
   }
 

@@ -102,6 +102,7 @@ function identityKeys(item: ScoredCase): string[] {
   const keys: string[] = [];
   const equivalent = extractEquivalentCitationKey(item.detailText);
   if (equivalent) keys.push(equivalent);
+  if (item.retrieval?.semanticHash) keys.push(`sem:${item.retrieval.semanticHash}`);
 
   const primaryDocId = extractDocId(item.url);
   if (primaryDocId) keys.push(`doc:${primaryDocId}`);

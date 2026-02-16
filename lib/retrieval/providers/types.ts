@@ -1,6 +1,12 @@
 import { CaseCandidate } from "@/lib/types";
 
-export type RetrievalProviderId = "indiankanoon_html" | "serper";
+export type RetrievalProviderId = "indiankanoon_api" | "indiankanoon_html" | "serper";
+export type RetrievalSourceTag =
+  | "lexical_api"
+  | "lexical_html"
+  | "web_search"
+  | "semantic_vector"
+  | "fused";
 
 export type RetrievalBlockedType = "local_cooldown" | "cloudflare_challenge" | "rate_limit";
 
@@ -50,6 +56,14 @@ export type RetrievalSearchDebug = {
   timedOut?: boolean;
   fetchTimeoutMsUsed?: number;
   htmlPreview?: string;
+  sourceTag?: RetrievalSourceTag;
+  lexicalCandidateCount?: number;
+  semanticCandidateCount?: number;
+  fusedCandidateCount?: number;
+  rerankApplied?: boolean;
+  fusionLatencyMs?: number;
+  docFragmentHydrationMs?: number;
+  docFragmentCalls?: number;
 };
 
 export type RetrievalSearchResult = {

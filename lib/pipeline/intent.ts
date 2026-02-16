@@ -1,5 +1,6 @@
 import { buildContextProfile } from "@/lib/context";
 import { sanitizeNlqForSearch } from "@/lib/nlq";
+import { enrichEntities, EnrichedEntities } from "@/lib/pipeline/entity-enrichment";
 import { IntentProfile } from "@/lib/pipeline/types";
 
 function parseMonthName(name: string): number | null {
@@ -63,9 +64,46 @@ function inferCourtHint(cleaned: string): "SC" | "HC" | "ANY" {
   return "ANY";
 }
 
+function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
+  if (!value) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+type EntityEnricher = (input: { query: string; context: ReturnType<typeof buildContextProfile> }) => EnrichedEntities;
+
+const ENTITY_ENRICHERS: EntityEnricher[] = [enrichEntities];
+
+export function registerEntityEnricher(enricher: EntityEnricher): void {
+  ENTITY_ENRICHERS.push(enricher);
+}
+
+function mergeEntities(entities: EnrichedEntities[]): EnrichedEntities {
+  const unique = (values: string[]): string[] => [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  return {
+    person: unique(entities.flatMap((item) => item.person)).slice(0, 24),
+    org: unique(entities.flatMap((item) => item.org)).slice(0, 24),
+    statute: unique(entities.flatMap((item) => item.statute)).slice(0, 32),
+    section: unique(entities.flatMap((item) => item.section)).slice(0, 32),
+    case_citation: unique(entities.flatMap((item) => item.case_citation)).slice(0, 24),
+  };
+}
+
 export function buildIntentProfile(query: string): IntentProfile {
   const cleanedQuery = sanitizeNlqForSearch(query);
   const context = buildContextProfile(cleanedQuery);
+  const entityEnrichmentEnabled = parseBooleanEnv(process.env.ENTITY_ENRICHMENT_V1, true);
+  const entities = entityEnrichmentEnabled
+    ? mergeEntities(ENTITY_ENRICHERS.map((enricher) => enricher({ query, context })))
+    : {
+        person: [],
+        org: [],
+        statute: [],
+        section: [],
+        case_citation: [],
+      };
   return {
     query,
     cleanedQuery,
@@ -78,5 +116,6 @@ export function buildIntentProfile(query: string): IntentProfile {
     anchors: context.anchors,
     courtHint: inferCourtHint(cleanedQuery),
     dateWindow: extractDateWindow(cleanedQuery),
+    entities,
   };
 }

@@ -91,6 +91,17 @@ export type CaseCandidate = {
     hasRoleSentence?: boolean;
     hasChainSentence?: boolean;
   };
+  retrieval?: {
+    sourceTags?: Array<"lexical_api" | "lexical_html" | "web_search" | "semantic_vector" | "fused">;
+    lexicalRank?: number;
+    semanticRank?: number;
+    lexicalScore?: number;
+    semanticScore?: number;
+    fusionScore?: number;
+    rerankScore?: number;
+    semanticHash?: string;
+    sourceVersion?: string;
+  };
 };
 
 export type ScoredCase = CaseCandidate & {
@@ -285,7 +296,7 @@ export type SearchResponse = {
       guaranteeMet?: boolean;
     };
     retrieval: {
-      providerId?: "indiankanoon_html" | "serper";
+      providerId?: "indiankanoon_api" | "indiankanoon_html" | "serper";
       providerReason?: string;
       phaseAttempts: Record<string, number>;
       phaseSuccesses: Record<string, number>;
@@ -314,6 +325,13 @@ export type SearchResponse = {
       alwaysReturnFallbackUsed?: boolean;
       alwaysReturnFallbackType?: "none" | "stale_cache" | "synthetic_advisory";
       alwaysReturnFallbackReason?: string;
+      lexicalCandidateCount?: number;
+      semanticCandidateCount?: number;
+      fusedCandidateCount?: number;
+      rerankApplied?: boolean;
+      fusionLatencyMs?: number;
+      docFragmentHydrationMs?: number;
+      docFragmentCalls?: number;
     };
       classification: {
         counts: Record<CandidateKind, number>;

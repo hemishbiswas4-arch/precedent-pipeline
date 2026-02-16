@@ -1,4 +1,5 @@
 import { buildKeywordPackWithAI } from "@/lib/ai-keyword-planner";
+import { expandOntologySynonymsForRecall } from "@/lib/kb/legal-ontology";
 import { buildKeywordPack } from "@/lib/keywords";
 import { sanitizeNlqForSearch } from "@/lib/nlq";
 import { IntentProfile, PlannerOutput, QueryVariant } from "@/lib/pipeline/types";
@@ -317,7 +318,12 @@ function buildRequiredHookGroups(intent: IntentProfile, reasonerPlan?: ReasonerP
     });
   }
 
-  for (const hook of [...intent.statutes, ...(reasonerPlan?.proposition.legal_hooks ?? [])]) {
+  for (const hook of [
+    ...intent.statutes,
+    ...intent.entities.section,
+    ...intent.entities.statute,
+    ...(reasonerPlan?.proposition.legal_hooks ?? []),
+  ]) {
     const normalized = normalizePhrase(hook);
     if (!normalized) continue;
     const groupId = inferHookGroupId(normalized);
@@ -368,9 +374,14 @@ function buildLegalSignalTokenSet(intent: IntentProfile, reasonerPlan?: Reasoner
   const bag = [
     ...intent.domains,
     ...intent.actors,
+    ...intent.entities.person,
+    ...intent.entities.org,
     ...intent.procedures,
     ...intent.issues,
     ...intent.statutes,
+    ...intent.entities.statute,
+    ...intent.entities.section,
+    ...intent.entities.case_citation,
     ...(reasonerPlan?.proposition.actors ?? []),
     ...(reasonerPlan?.proposition.proceeding ?? []),
     ...(reasonerPlan?.proposition.legal_hooks ?? []),
@@ -417,7 +428,7 @@ function buildPropositionStrategy(input: {
   const { intent, reasonerPlan, keywordPack } = input;
   const actors = axisValuesFromReasonerOrIntent(
     reasonerPlan?.proposition.actors,
-    intent.actors,
+    [...intent.actors, ...intent.entities.person, ...intent.entities.org],
     intent.cleanedQuery.includes("state") ? ["state"] : [],
   );
   const proceedings = axisValuesFromReasonerOrIntent(
@@ -429,7 +440,7 @@ function buildPropositionStrategy(input: {
   const hooks = representativeHooks(requiredHookGroups);
   const outcomes = axisValuesFromReasonerOrIntent(
     reasonerPlan?.proposition.outcome_required,
-    intent.issues,
+    [...intent.issues, ...intent.entities.case_citation],
     [],
   );
   const expectedPolarity = inferExpectedPolarity(intent.cleanedQuery, outcomes, reasonerPlan);
@@ -698,6 +709,17 @@ function buildVariantsFromKeywordPack(input: {
     .filter((value) => value.length >= 6)
     .slice(0, 8);
   const strictAxisRequirement = propositionStrategy.strictAxisRequirement;
+  const recallSynonyms = expandOntologySynonymsForRecall({
+    terms: [
+      ...intent.issues,
+      ...intent.procedures,
+      ...intent.statutes,
+      ...intent.entities.statute,
+      ...intent.entities.section,
+    ],
+    context: intent.context,
+    maxExpansions: 26,
+  });
   const variants: QueryVariant[] = [];
   const seen = new Set<string>();
   const courtScope = resolveCourtScope(intent.courtHint, reasonerPlan?.proposition.jurisdiction_hint);
@@ -776,7 +798,13 @@ function buildVariantsFromKeywordPack(input: {
     seen,
     phase: "rescue",
     purpose: "keyword-rescue",
-    phrases: [...propositionStrategy.strict, ...outcomePhrases, ...keywordPack.searchPhrases],
+    phrases: [
+      ...propositionStrategy.strict,
+      ...outcomePhrases,
+      ...keywordPack.searchPhrases,
+      ...recallSynonyms,
+      ...intent.entities.case_citation,
+    ],
     courtScope,
     strictness: "relaxed",
     courted: false,
@@ -788,7 +816,16 @@ function buildVariantsFromKeywordPack(input: {
     seen,
     phase: "micro",
     purpose: "micro-signals",
-    phrases: [...outcomePhrases, ...keywordPack.legalSignals, ...intent.statutes, ...intent.procedures, ...intent.issues],
+    phrases: [
+      ...outcomePhrases,
+      ...keywordPack.legalSignals,
+      ...intent.statutes,
+      ...intent.procedures,
+      ...intent.issues,
+      ...intent.entities.section,
+      ...intent.entities.statute,
+      ...recallSynonyms,
+    ],
     courtScope,
     strictness: "relaxed",
     courted: false,
@@ -800,7 +837,14 @@ function buildVariantsFromKeywordPack(input: {
     seen,
     phase: "revolving",
     purpose: "revolving-broad",
-    phrases: [...outcomePhrases, ...keywordPack.primary, ...keywordPack.searchPhrases, ...intent.issues],
+    phrases: [
+      ...outcomePhrases,
+      ...keywordPack.primary,
+      ...keywordPack.searchPhrases,
+      ...intent.issues,
+      ...intent.entities.section,
+      ...recallSynonyms,
+    ],
     courtScope,
     strictness: "relaxed",
     courted: false,

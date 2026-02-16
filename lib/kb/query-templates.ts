@@ -19,10 +19,10 @@ export const PHASE_LIMITS: Record<QueryPhase, number> = {
   browse: 1,
 };
 
-export const DEFAULT_GLOBAL_BUDGET = 8;
+export const DEFAULT_GLOBAL_BUDGET = 6;
 export const DEFAULT_BLOCKED_THRESHOLD = 4;
 export const DEFAULT_VERIFY_LIMIT = 8;
-export const DEFAULT_MAX_ELAPSED_MS = 9_000;
+export const DEFAULT_MAX_ELAPSED_MS = 12_000;
 
 function normalizeSpaces(value: string): string {
   return value.replace(/\s+/g, " ").trim();

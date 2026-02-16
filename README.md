@@ -30,10 +30,13 @@ Open [http://localhost:3000](http://localhost:3000).
 
 Provider selection is controlled with:
 - `RETRIEVAL_PROVIDER=auto|indiankanoon_html|serper` (default: `auto`)
+- `RETRIEVAL_PROVIDER=auto|indiankanoon_api|indiankanoon_html|serper` (default: `auto`)
 - `SERPER_API_KEY` (required when using Serper)
+- `IK_API_BASE_URL` + `IK_API_KEY` (required when using `indiankanoon_api`)
 
 `auto` behavior:
-- On Vercel (`VERCEL=1`) with `SERPER_API_KEY` set: uses `serper`
+- If IK API credentials are configured: uses `indiankanoon_api` (hybrid-capable)
+- Else on Vercel (`VERCEL=1`) with `SERPER_API_KEY` set: uses `serper`
 - Otherwise: uses `indiankanoon_html`
 
 ## Optional: Universal Two-Pass Reasoner (Bounded, Fail-Open)
@@ -60,6 +63,17 @@ ALWAYS_RETURN_V1=1
 ALWAYS_RETURN_SYNTHETIC_FALLBACK=1
 RETRIEVAL_PROVIDER=auto
 SERPER_API_KEY=
+IK_API_BASE_URL=
+IK_API_KEY=
+EMBEDDING_MODEL_ID=
+RERANK_MODEL_ID=
+VECTOR_DB_URL=
+VECTOR_DB_API_KEY=
+VECTOR_COLLECTION=
+HYBRID_RETRIEVAL_V1=0
+HYBRID_RRF_K=60
+HYBRID_SEMANTIC_TOPK=24
+HYBRID_LEXICAL_TOPK=18
 PROPOSITION_V3=1
 PROPOSITION_V41=1
 PROPOSITION_V5=1

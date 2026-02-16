@@ -109,6 +109,16 @@ export const DOMAIN_TEMPLATES: Record<string, string[]> = {
   ],
 };
 
+export const LEGAL_SYNONYM_MAP: Record<string, string[]> = {
+  sanction: ["prior sanction", "previous sanction", "sanction for prosecution"],
+  condonation: ["delay condonation", "condonation of delay", "delay condoned", "delay not condoned"],
+  limitation: ["time barred", "barred by limitation", "limitation act section 5"],
+  quash: ["quashing", "set aside proceedings", "section 482 crpc quashing"],
+  prosecution: ["criminal prosecution", "trial for offence", "prosecution under section"],
+  appeal: ["criminal appeal", "appeal against acquittal", "appellate challenge"],
+  corruption: ["prevention of corruption act", "pc act", "disproportionate assets"],
+};
+
 export function ontologyTemplatesForContext(context: ContextProfile): string[] {
   const values: string[] = [];
   for (const issue of context.issues) {
@@ -118,4 +128,23 @@ export function ontologyTemplatesForContext(context: ContextProfile): string[] {
     values.push(...(DOMAIN_TEMPLATES[domain] ?? []));
   }
   return [...new Set(values)];
+}
+
+export function expandOntologySynonymsForRecall(input: {
+  terms: string[];
+  context: ContextProfile;
+  maxExpansions?: number;
+}): string[] {
+  const maxExpansions = Math.max(4, input.maxExpansions ?? 24);
+  const bag = [...input.terms, ...input.context.issues, ...input.context.procedures, ...input.context.domains]
+    .join(" ")
+    .toLowerCase();
+
+  const expansions: string[] = [];
+  for (const [seed, values] of Object.entries(LEGAL_SYNONYM_MAP)) {
+    if (!bag.includes(seed)) continue;
+    expansions.push(...values);
+  }
+
+  return [...new Set(expansions.map((value) => value.trim()).filter(Boolean))].slice(0, maxExpansions);
 }

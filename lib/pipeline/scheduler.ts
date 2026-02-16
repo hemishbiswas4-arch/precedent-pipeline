@@ -542,6 +542,7 @@ export async function runRetrievalSchedule(input: {
 
         attempts.push({
           providerId: provider.id,
+          sourceLabel: result.debug.sourceTag,
           phase,
           courtScope: variant.courtScope,
           variantId: variant.id,
@@ -570,6 +571,13 @@ export async function runRetrievalSchedule(input: {
           timedOut: result.debug.timedOut,
           fetchTimeoutMsUsed: result.debug.fetchTimeoutMsUsed,
           htmlPreview: result.debug.htmlPreview,
+          lexicalCandidateCount: result.debug.lexicalCandidateCount,
+          semanticCandidateCount: result.debug.semanticCandidateCount,
+          fusedCandidateCount: result.debug.fusedCandidateCount,
+          rerankApplied: result.debug.rerankApplied,
+          fusionLatencyMs: result.debug.fusionLatencyMs,
+          docFragmentHydrationMs: result.debug.docFragmentHydrationMs,
+          docFragmentCalls: result.debug.docFragmentCalls,
           error: null,
         });
 
@@ -637,6 +645,7 @@ export async function runRetrievalSchedule(input: {
           });
           attempts.push({
             providerId: provider.id,
+            sourceLabel: debug.sourceTag,
             phase,
             courtScope: variant.courtScope,
             variantId: variant.id,
@@ -665,6 +674,11 @@ export async function runRetrievalSchedule(input: {
             timedOut: debug.timedOut,
             fetchTimeoutMsUsed: debug.fetchTimeoutMsUsed,
             htmlPreview: debug.htmlPreview,
+            lexicalCandidateCount: debug.lexicalCandidateCount,
+            semanticCandidateCount: debug.semanticCandidateCount,
+            fusedCandidateCount: debug.fusedCandidateCount,
+            rerankApplied: debug.rerankApplied,
+            fusionLatencyMs: debug.fusionLatencyMs,
             error: errorMessage,
           });
           if (debug.blockedType === "local_cooldown") {
@@ -725,6 +739,12 @@ export async function runRetrievalSchedule(input: {
           });
           attempts.push({
             providerId: provider.id,
+            sourceLabel:
+              provider.id === "indiankanoon_api"
+                ? "lexical_api"
+                : provider.id === "indiankanoon_html"
+                  ? "lexical_html"
+                  : "web_search",
             phase,
             courtScope: variant.courtScope,
             variantId: variant.id,

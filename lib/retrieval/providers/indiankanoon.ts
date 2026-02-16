@@ -57,6 +57,7 @@ export const indianKanoonHtmlProvider: RetrievalProvider = {
           timedOut: result.debug.timedOut,
           fetchTimeoutMsUsed: result.debug.fetchTimeoutMsUsed,
           htmlPreview: result.debug.htmlPreview,
+          sourceTag: "lexical_html",
         },
       };
     } catch (error) {
@@ -81,6 +82,7 @@ export const indianKanoonHtmlProvider: RetrievalProvider = {
           timedOut: error.debug.timedOut,
           fetchTimeoutMsUsed: error.debug.fetchTimeoutMsUsed,
           htmlPreview: error.debug.htmlPreview,
+          sourceTag: "lexical_html",
         });
       }
       throw error;

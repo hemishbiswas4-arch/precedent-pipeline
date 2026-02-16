@@ -40,6 +40,11 @@ import {
   splitByProposition,
 } from "@/lib/proposition-gate";
 import { diversifyRankedCases } from "@/lib/ranking-diversity";
+import {
+  getSearchRuntimeProfileSettings,
+  parseSearchRuntimeProfile,
+  resolveProfiledNumber,
+} from "@/lib/runtime-profile";
 import { scoreCases } from "@/lib/scoring";
 import { CaseCandidate, NearMissCase, ScoredCase, SearchResponse } from "@/lib/types";
 
@@ -93,10 +98,15 @@ const TRACE_EXPANSION_MIN_REMAINING_MS = Math.max(
   1_500,
   Number(process.env.TRACE_EXPANSION_MIN_REMAINING_MS ?? "6000"),
 );
-const PIPELINE_MAX_ELAPSED_MS = Math.min(
-  Math.max(Number(process.env.PIPELINE_MAX_ELAPSED_MS ?? "9000"), 5_000),
-  60_000,
-);
+const SEARCH_RUNTIME_PROFILE = parseSearchRuntimeProfile(process.env.SEARCH_RUNTIME_PROFILE);
+const RUNTIME_PROFILE = getSearchRuntimeProfileSettings(SEARCH_RUNTIME_PROFILE);
+const PIPELINE_MAX_ELAPSED_MS = resolveProfiledNumber({
+  value: process.env.PIPELINE_MAX_ELAPSED_MS,
+  defaultValue: RUNTIME_PROFILE.pipelineMaxElapsedMs.defaultValue,
+  min: RUNTIME_PROFILE.pipelineMaxElapsedMs.min,
+  cap: RUNTIME_PROFILE.pipelineMaxElapsedMs.cap,
+  round: "floor",
+});
 const DETAIL_MIN_SUCCESS_BEFORE_EARLY_STOP = Math.max(
   0,
   Number(process.env.DETAIL_MIN_SUCCESS_BEFORE_EARLY_STOP ?? "2"),
@@ -121,7 +131,13 @@ const ALWAYS_RETURN_SYNTHETIC_FALLBACK_ENABLED = parseBooleanEnv(
 );
 const STALE_FALLBACK_ENABLED = parseBooleanEnv(process.env.STALE_FALLBACK_ENABLED, true);
 const GUARANTEE_MIN_RESULTS = Math.max(1, Number(process.env.GUARANTEE_MIN_RESULTS ?? "3"));
-const GUARANTEE_EXTRA_ATTEMPTS = Math.max(1, Number(process.env.GUARANTEE_EXTRA_ATTEMPTS ?? "2"));
+const GUARANTEE_EXTRA_ATTEMPTS = resolveProfiledNumber({
+  value: process.env.GUARANTEE_EXTRA_ATTEMPTS,
+  defaultValue: RUNTIME_PROFILE.guaranteeExtraAttempts.defaultValue,
+  min: RUNTIME_PROFILE.guaranteeExtraAttempts.min,
+  cap: RUNTIME_PROFILE.guaranteeExtraAttempts.cap,
+  round: "floor",
+});
 const GUARANTEE_MIN_REMAINING_MS = Math.max(
   1_000,
   Number(process.env.GUARANTEE_MIN_REMAINING_MS ?? "1500"),
@@ -360,6 +376,47 @@ function qualifiedProvisionalCount(cases: ScoredCase[]): number {
   return cases.filter((item) => (item.confidenceScore ?? item.score) >= PROPOSITION_PROVISIONAL_CONFIDENCE_FLOOR).length;
 }
 
+function exploratoryConfidenceBand(score: number): "LOW" | "MEDIUM" {
+  return score >= 0.34 ? "MEDIUM" : "LOW";
+}
+
+function materializeHighFetchExploratory(input: {
+  totalFetched: number;
+  exactStrict: ScoredCase[];
+  exactProvisional: ScoredCase[];
+  exploratory: NearMissCase[];
+  rankedPool: ScoredCase[];
+}): NearMissCase | null {
+  if (input.totalFetched < 20) return null;
+  if (input.exactStrict.length > 0 || input.exactProvisional.length > 0 || input.exploratory.length > 0) return null;
+  const candidate = input.rankedPool[0];
+  if (!candidate) return null;
+
+  const cappedScore = Math.min(candidate.confidenceScore ?? candidate.score, 0.45);
+  const missingElements = uniqueLimit(
+    [
+      ...(candidate.missingCoreElements ?? []),
+      ...(candidate.missingMandatorySteps ?? []),
+      "strict proposition threshold not met",
+    ],
+    6,
+  );
+
+  return {
+    ...candidate,
+    score: cappedScore,
+    rankingScore: cappedScore,
+    confidenceScore: cappedScore,
+    confidenceBand: exploratoryConfidenceBand(cappedScore),
+    retrievalTier: "exploratory",
+    fallbackReason: "guarantee_backfill",
+    gapSummary: missingElements,
+    missingElements,
+    selectionSummary:
+      candidate.selectionSummary || "Exploratory fallback from high-fetch retrieval because strict exact criteria were not met.",
+  };
+}
+
 function filterTraceVariantsByChecklist(variants: QueryVariant[], checklist: PropositionChecklist): QueryVariant[] {
   const requiredGroups = checklist.hookGroups.filter((group) => group.required);
   if (requiredGroups.length === 0) return variants;
@@ -397,6 +454,10 @@ type PhaseRunResult = {
   scheduler: SchedulerResult;
   evaluation: CandidateEvaluation;
   propositionSplit: ReturnType<typeof splitByProposition>;
+  timing: {
+    retrievalMs: number;
+    gatingMs: number;
+  };
 };
 
 type CanonicalLexicalProfile = {
@@ -500,6 +561,8 @@ async function runQualityAwarePhases(input: {
   maxResults: number;
   checklist: PropositionChecklist;
 }): Promise<PhaseRunResult> {
+  let retrievalMs = 0;
+  let gatingMs = 0;
   const phaseOrder = ["primary", "fallback", "rescue", "micro", "revolving", "browse"] as const;
   const phaseBuckets = new Map<string, QueryVariant[]>();
   for (const phase of phaseOrder) {
@@ -509,6 +572,7 @@ async function runQualityAwarePhases(input: {
     );
   }
 
+  let retrievalStartedAt = Date.now();
   let scheduler: SchedulerResult = await runRetrievalSchedule({
     variants: [],
     intent: input.intent,
@@ -517,6 +581,9 @@ async function runQualityAwarePhases(input: {
     carryState: input.carryState,
     cooldownScope: input.cooldownScope,
   });
+  retrievalMs += Date.now() - retrievalStartedAt;
+
+  let gatingStartedAt = Date.now();
   let evaluation = await evaluateCandidates({
     query: input.query,
     maxResults: input.maxResults,
@@ -528,7 +595,10 @@ async function runQualityAwarePhases(input: {
     canonicalLexicalProfile: input.canonicalLexicalProfile,
     candidateProvenance: scheduler.carryState.candidateProvenance,
   });
+  gatingMs += Date.now() - gatingStartedAt;
+  gatingStartedAt = Date.now();
   let propositionSplit = splitByProposition(evaluation.rankedPool, input.checklist);
+  gatingMs += Date.now() - gatingStartedAt;
   let lastCandidateSignature = `${scheduler.candidates.length}|${scheduler.candidates
     .slice(0, 48)
     .map((candidate) => candidate.url)
@@ -537,6 +607,7 @@ async function runQualityAwarePhases(input: {
   for (const phase of phaseOrder) {
     const phaseVariants = phaseBuckets.get(phase) ?? [];
     if (phaseVariants.length === 0) continue;
+    retrievalStartedAt = Date.now();
     scheduler = await runRetrievalSchedule({
       variants: phaseVariants,
       intent: input.intent,
@@ -545,11 +616,13 @@ async function runQualityAwarePhases(input: {
       carryState: scheduler.carryState,
       cooldownScope: input.cooldownScope,
     });
+    retrievalMs += Date.now() - retrievalStartedAt;
     const currentCandidateSignature = `${scheduler.candidates.length}|${scheduler.candidates
       .slice(0, 48)
       .map((candidate) => candidate.url)
       .join("|")}`;
     if (currentCandidateSignature !== lastCandidateSignature) {
+      gatingStartedAt = Date.now();
       evaluation = await evaluateCandidates({
         query: input.query,
         maxResults: input.maxResults,
@@ -561,7 +634,10 @@ async function runQualityAwarePhases(input: {
         canonicalLexicalProfile: input.canonicalLexicalProfile,
         candidateProvenance: scheduler.carryState.candidateProvenance,
       });
+      gatingMs += Date.now() - gatingStartedAt;
+      gatingStartedAt = Date.now();
       propositionSplit = splitByProposition(evaluation.rankedPool, input.checklist);
+      gatingMs += Date.now() - gatingStartedAt;
       lastCandidateSignature = currentCandidateSignature;
     }
     const qualifiedProvisional = qualifiedProvisionalCount(propositionSplit.exactProvisional);
@@ -597,6 +673,10 @@ async function runQualityAwarePhases(input: {
     scheduler,
     evaluation,
     propositionSplit,
+    timing: {
+      retrievalMs,
+      gatingMs,
+    },
   };
 }
 
@@ -698,6 +778,12 @@ export async function runPipelineSearch(input: {
       utilityScore?: number;
       caseLikeRatio?: number;
       statuteLikeRatio?: number;
+      sourceLabel?: "lexical_api" | "lexical_html" | "web_search" | "semantic_vector" | "fused";
+      lexicalCandidateCount?: number;
+      semanticCandidateCount?: number;
+      fusedCandidateCount?: number;
+      rerankApplied?: boolean;
+      fusionLatencyMs?: number;
       status: number;
       ok: boolean;
       phase: string;
@@ -755,17 +841,23 @@ export async function runPipelineSearch(input: {
   const minCaseTarget = Math.min(Math.max(Math.floor(input.maxResults / 2), 6), 12);
   const timeoutRecoveryMode = REASONER_TIMEOUT_RECOVERY_MODE;
   const effectiveVerifyLimit = Math.max(4, Number(process.env.DEFAULT_VERIFY_LIMIT ?? String(DEFAULT_VERIFY_LIMIT)));
-  const effectiveGlobalBudget = Math.max(
-    4,
-    Number(process.env.DEFAULT_GLOBAL_BUDGET ?? String(DEFAULT_GLOBAL_BUDGET)),
-  );
+  const effectiveGlobalBudget = resolveProfiledNumber({
+    value: process.env.DEFAULT_GLOBAL_BUDGET,
+    defaultValue: RUNTIME_PROFILE.defaultGlobalBudget.defaultValue ?? DEFAULT_GLOBAL_BUDGET,
+    min: RUNTIME_PROFILE.defaultGlobalBudget.min,
+    cap: RUNTIME_PROFILE.defaultGlobalBudget.cap,
+    round: "floor",
+  });
   let extendedDeterministicUsed = false;
+  let retrievalStageMs = 0;
+  let gatingStageMs = 0;
 
   const pass1Invoked = true;
   let pass2Invoked = false;
   let pass2Reason: string | undefined;
   let pass2LatencyMs: number | undefined;
 
+  const reasonerPass1StartedAt = Date.now();
   const reasonerPass1 = await runOpusReasoner({
     mode: "pass1",
     query: input.query,
@@ -773,6 +865,7 @@ export async function runPipelineSearch(input: {
     context: intent.context,
     requestCallIndex: 0,
   });
+  let reasonerStageMs = Date.now() - reasonerPass1StartedAt;
   const reasonerHealth = classifyReasonerHealth({
     mode: reasonerPass1.telemetry.mode,
     error: reasonerPass1.telemetry.error,
@@ -897,6 +990,8 @@ export async function runPipelineSearch(input: {
     maxResults: input.maxResults,
     checklist,
   });
+  retrievalStageMs += phaseRun.timing.retrievalMs;
+  gatingStageMs += phaseRun.timing.gatingMs;
   let scheduler = phaseRun.scheduler;
   let evaluation = phaseRun.evaluation;
   let propositionSplit = phaseRun.propositionSplit;
@@ -934,6 +1029,8 @@ export async function runPipelineSearch(input: {
           maxResults: input.maxResults,
           checklist,
         });
+        retrievalStageMs += phaseRun.timing.retrievalMs;
+        gatingStageMs += phaseRun.timing.gatingMs;
         scheduler = phaseRun.scheduler;
         evaluation = phaseRun.evaluation;
         propositionSplit = phaseRun.propositionSplit;
@@ -970,6 +1067,7 @@ export async function runPipelineSearch(input: {
               ? `low_hook_group_coverage:${propositionSplit.hookGroupCoverageAvg}<${PASS2_MIN_HOOK_COVERAGE}`
               : `low_required_coverage:${propositionSplit.requiredElementCoverageAvg}<${PASS2_MIN_COVERAGE}`;
     const snippets = buildPass2Snippets(evaluation.rankedPool);
+    const reasonerPass2StartedAt = Date.now();
     const reasonerPass2 = await runOpusReasoner({
       mode: "pass2",
       query: input.query,
@@ -979,6 +1077,7 @@ export async function runPipelineSearch(input: {
       basePlan: activeReasonerPlan,
       snippets,
     });
+    reasonerStageMs += Date.now() - reasonerPass2StartedAt;
     pass2LatencyMs = reasonerPass2.telemetry.latencyMs;
 
     if (reasonerPass2.plan) {
@@ -1068,6 +1167,8 @@ export async function runPipelineSearch(input: {
         maxResults: input.maxResults,
         checklist,
       });
+      retrievalStageMs += phaseRun.timing.retrievalMs;
+      gatingStageMs += phaseRun.timing.gatingMs;
       scheduler = phaseRun.scheduler;
       evaluation = phaseRun.evaluation;
       propositionSplit = phaseRun.propositionSplit;
@@ -1160,6 +1261,8 @@ export async function runPipelineSearch(input: {
           maxResults: input.maxResults,
           checklist,
         });
+        retrievalStageMs += phaseRun.timing.retrievalMs;
+        gatingStageMs += phaseRun.timing.gatingMs;
         scheduler = phaseRun.scheduler;
         evaluation = phaseRun.evaluation;
         propositionSplit = phaseRun.propositionSplit;
@@ -1182,6 +1285,7 @@ export async function runPipelineSearch(input: {
     : propositionSplit.exact.slice(0, input.maxResults);
   let casesExploratory: NearMissCase[] = propositionSplit.nearMiss.slice(0, NEAR_MISS_MAX_RESULTS);
   let casesNearMiss: NearMissCase[] = [...casesExploratory];
+  let highFetchProvisionalFallbackUsed = false;
 
   if (guaranteeTriggered && guaranteeSource === "live" && casesExploratory.length > 0) {
     casesExploratory = casesExploratory.map((item) => ({
@@ -1191,6 +1295,21 @@ export async function runPipelineSearch(input: {
       gapSummary: item.gapSummary ?? item.missingElements,
     }));
     casesNearMiss = [...casesExploratory];
+  }
+
+  const highFetchExploratory = materializeHighFetchExploratory({
+    totalFetched: scheduler.candidates.length,
+    exactStrict: casesExactStrict,
+    exactProvisional: casesExactProvisional,
+    exploratory: casesExploratory,
+    rankedPool: evaluation.rankedPool,
+  });
+  if (highFetchExploratory) {
+    casesExploratory = [highFetchExploratory];
+    casesNearMiss = [highFetchExploratory];
+    highFetchProvisionalFallbackUsed = true;
+    guaranteeUsed = true;
+    guaranteeSource = "live";
   }
 
   if (
@@ -1318,10 +1437,15 @@ export async function runPipelineSearch(input: {
     "Confidence uses calibrated bands and is not a legal-certainty percentage.",
     "HIGH/VERY_HIGH confidence is restricted to strict exact matches with evidence-window support.",
   ];
+  notes.push(`Runtime profile active: ${SEARCH_RUNTIME_PROFILE}.`);
   if (retrievalSelection.fallbackReason === "serper_missing_key") {
     notes.push("RETRIEVAL_PROVIDER=serper was requested but SERPER_API_KEY is missing; using Indian Kanoon HTML retrieval.");
+  } else if (retrievalSelection.fallbackReason === "ik_api_missing_config") {
+    notes.push(
+      "RETRIEVAL_PROVIDER=indiankanoon_api was requested but IK_API_BASE_URL or IK_API_KEY is missing; using Indian Kanoon HTML retrieval.",
+    );
   } else if (retrievalSelection.fallbackReason === "invalid_mode") {
-    notes.push("RETRIEVAL_PROVIDER has an invalid value; using default Indian Kanoon HTML retrieval.");
+    notes.push("RETRIEVAL_PROVIDER has an invalid value; using default provider selection.");
   }
   if (!retrievalProvider.supportsDetailFetch) {
     notes.push("Detail verification was skipped (web-search retrieval). Results are snippet-based and confidence is capped.");
@@ -1465,6 +1589,10 @@ export async function runPipelineSearch(input: {
     notes.push(
       `Served stale exploratory fallback from similarity-matched cache (${staleFallbackSignatureLevel ?? "unknown"} signature).`,
     );
+  } else if (highFetchProvisionalFallbackUsed) {
+    notes.push(
+      "High-fetch fallback promoted one provisional exploratory result before synthetic advisory.",
+    );
   } else if (syntheticFallbackUsed) {
     notes.push(
       `Served synthetic advisory fallback because ${syntheticFallbackReason ?? "retrieval returned no verifiable candidates"}.`,
@@ -1521,6 +1649,37 @@ export async function runPipelineSearch(input: {
   const cooldownSkipCount = scheduler.attempts.filter((attempt) => attempt.cooldownActive === true).length;
   const noMatchCount = scheduler.attempts.filter((attempt) => /no matching results/i.test(attempt.htmlPreview ?? "")).length;
   const successCount = successfulAttemptsCount;
+  const lexicalCandidateCount = scheduler.attempts.reduce(
+    (max, attempt) => Math.max(max, attempt.lexicalCandidateCount ?? 0),
+    0,
+  );
+  const semanticCandidateCount = scheduler.attempts.reduce(
+    (max, attempt) => Math.max(max, attempt.semanticCandidateCount ?? 0),
+    0,
+  );
+  const fusedCandidateCount = scheduler.attempts.reduce(
+    (max, attempt) => Math.max(max, attempt.fusedCandidateCount ?? 0),
+    0,
+  );
+  const rerankApplied = scheduler.attempts.some((attempt) => attempt.rerankApplied === true);
+  const fusionLatencyMs = scheduler.attempts.reduce(
+    (max, attempt) => Math.max(max, attempt.fusionLatencyMs ?? 0),
+    0,
+  );
+  const docFragmentHydrationMs = scheduler.attempts.reduce(
+    (sum, attempt) => sum + (attempt.docFragmentHydrationMs ?? 0),
+    0,
+  );
+  const docFragmentCalls = scheduler.attempts.reduce(
+    (sum, attempt) => sum + (attempt.docFragmentCalls ?? 0),
+    0,
+  );
+  if (semanticCandidateCount > 0 || fusedCandidateCount > 0) {
+    notes.push(
+      `Hybrid retrieval engaged (lexical=${lexicalCandidateCount}, semantic=${semanticCandidateCount}, fused=${fusedCandidateCount}, rerank=${rerankApplied ? "on" : "off"}).`,
+    );
+  }
+
   const effectiveBlockedState = scheduler.stopReason === "blocked" && successCount === 0 && !staleFallbackUsed;
   const responseStatus: SearchResponse["status"] = staleFallbackUsed
     ? "partial"
@@ -1710,6 +1869,13 @@ export async function runPipelineSearch(input: {
         alwaysReturnFallbackUsed: staleFallbackUsed || syntheticFallbackUsed,
         alwaysReturnFallbackType,
         alwaysReturnFallbackReason,
+        lexicalCandidateCount,
+        semanticCandidateCount,
+        fusedCandidateCount,
+        rerankApplied,
+        fusionLatencyMs: fusionLatencyMs > 0 ? fusionLatencyMs : undefined,
+        docFragmentHydrationMs: docFragmentHydrationMs > 0 ? docFragmentHydrationMs : undefined,
+        docFragmentCalls: docFragmentCalls > 0 ? docFragmentCalls : undefined,
       },
       classification: {
         counts: evaluation.counts,
@@ -1747,6 +1913,13 @@ export async function runPipelineSearch(input: {
         passedCaseGate: evaluation.verificationSummary.passedCaseGate,
         limit: config.verifyLimit,
         networkFetchAllowed: allowNetworkFetch,
+      },
+      timing: {
+        stageMs: {
+          reasonerMs: Math.max(0, Math.round(reasonerStageMs)),
+          retrievalMs: Math.max(0, Math.round(retrievalStageMs)),
+          gatingMs: Math.max(0, Math.round(gatingStageMs)),
+        },
       },
     },
   };
@@ -1814,6 +1987,14 @@ export async function runPipelineSearch(input: {
         utilityScore: attempt.utilityScore,
         caseLikeRatio: attempt.caseLikeRatio,
         statuteLikeRatio: attempt.statuteLikeRatio,
+        sourceLabel: attempt.sourceLabel,
+        lexicalCandidateCount: attempt.lexicalCandidateCount,
+        semanticCandidateCount: attempt.semanticCandidateCount,
+        fusedCandidateCount: attempt.fusedCandidateCount,
+        rerankApplied: attempt.rerankApplied,
+        fusionLatencyMs: attempt.fusionLatencyMs,
+        docFragmentHydrationMs: attempt.docFragmentHydrationMs,
+        docFragmentCalls: attempt.docFragmentCalls,
         status: attempt.status,
         ok: attempt.ok,
         phase: attempt.phase,

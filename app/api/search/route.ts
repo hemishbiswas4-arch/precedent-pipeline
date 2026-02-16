@@ -33,7 +33,14 @@ function searchCacheKey(query: string, maxResults: number): string {
     process.env.PROVISIONAL_CONFIDENCE_CAP ?? "0.70",
     process.env.NEARMISS_CONFIDENCE_CAP ?? "0.50",
     process.env.RETRIEVAL_PROVIDER ?? "auto",
+    process.env.HYBRID_RETRIEVAL_V1 ?? "0",
+    process.env.HYBRID_RRF_K ?? "60",
+    process.env.HYBRID_SEMANTIC_TOPK ?? "24",
+    process.env.HYBRID_LEXICAL_TOPK ?? "18",
     process.env.SERPER_API_KEY ? "serper_key_present" : "serper_key_missing",
+    process.env.IK_API_BASE_URL ? "ik_api_base_present" : "ik_api_base_missing",
+    process.env.IK_API_KEY ? "ik_api_key_present" : "ik_api_key_missing",
+    process.env.VECTOR_COLLECTION ? "vector_collection_present" : "vector_collection_missing",
     SEARCH_RUNTIME_PROFILE,
   ].join("|");
   const digest = createHash("sha256")

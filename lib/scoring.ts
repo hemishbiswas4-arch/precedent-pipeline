@@ -185,6 +185,8 @@ export function scoreCases(
       const detailChecked = Boolean(candidate.detailText || candidate.detailArtifact?.evidenceWindows?.length);
       const detailWeight = detailChecked ? 1 : 0.62;
       const provenance = options?.candidateProvenance?.[candidate.url];
+      const rerankScore = candidate.retrieval?.rerankScore;
+      const fusionScore = candidate.retrieval?.fusionScore;
 
       const anchorsMatched = countMatches(corpus, context.anchors);
       const issuesMatched = countMatches(corpus, context.issues);
@@ -291,6 +293,16 @@ export function scoreCases(
       } else {
         rawScore -= 0.09;
         reasons.push("Detail not verified (down-ranked)");
+      }
+
+      if (typeof fusionScore === "number" && Number.isFinite(fusionScore)) {
+        const boundedFusion = Math.max(0, Math.min(1, fusionScore * 8));
+        rawScore += boundedFusion * 0.08;
+        reasons.push(`Hybrid fusion signal ${(boundedFusion * 100).toFixed(0)}%`);
+      }
+      if (typeof rerankScore === "number" && Number.isFinite(rerankScore)) {
+        rawScore += (Math.max(0, Math.min(1, rerankScore)) - 0.5) * 0.2;
+        reasons.push(`Rerank signal ${(Math.max(0, Math.min(1, rerankScore)) * 100).toFixed(0)}%`);
       }
 
       if (provenance) {
