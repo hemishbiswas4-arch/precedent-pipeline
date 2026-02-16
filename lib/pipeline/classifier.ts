@@ -6,9 +6,11 @@ function isStatuteLike(text: string): boolean {
     /\bconstitution of india\b/.test(text) ||
     /\bindian penal code\b/.test(text) ||
     /\bcode of criminal procedure\b/.test(text) ||
+    /\b(?:prevention of corruption|limitation)\s+act\b/.test(text) ||
     /\bact,\s*\d{4}\b/.test(text) ||
     /\bcode,\s*\d{4}\b/.test(text) ||
     /\brules,\s*\d{4}\b/.test(text) ||
+    /\b(?:regulation|notification|ordinance)\b/.test(text) ||
     /\bsection\s+\d+[a-z]?\b[\s\S]{0,70}\b(?:punishment|whoever|shall be punished)\b/.test(text)
   );
 }
@@ -17,6 +19,7 @@ function isStatuteLikeTitle(title: string): boolean {
   return (
     /\bconstitution of india\b/.test(title) ||
     /\b(indian penal code|code of criminal procedure)\b/.test(title) ||
+    /\b(?:prevention of corruption|limitation)\s+act\b/.test(title) ||
     /\bact,\s*\d{4}\b/.test(title) ||
     /\bcode,\s*\d{4}\b/.test(title) ||
     /\brules,\s*\d{4}\b/.test(title)
@@ -27,7 +30,7 @@ function isCaseLike(text: string): boolean {
   return (
     /\b v(?:s\.?|\.?) \b/.test(text) ||
     /\bon\s+\d{1,2}\s+[a-z]{3,9}\s+\d{4}\b/.test(text) ||
-    /\b(?:petitioner|respondent|appellant|appeal|criminal appeal|writ petition|judgment)\b/.test(
+    /\b(?:petitioner|respondent|appellant|appeal|criminal appeal|writ petition|judgment|tribunal)\b/.test(
       text,
     )
   );
@@ -45,6 +48,16 @@ export function classifyCandidate(candidate: CaseCandidate): CandidateClassifica
   if (!title || /^(search|full document|similar judgments?)$/.test(title)) {
     reasons.push("pseudo-result title");
     return { kind: "noise", reasons };
+  }
+
+  if (titleStatuteLike && !titleCaseLike) {
+    reasons.push("statutory-title signal");
+    return { kind: "statute", reasons };
+  }
+
+  if (bodyStatuteLike && !bodyCaseLike) {
+    reasons.push("statutory-body signal");
+    return { kind: "statute", reasons };
   }
 
   if (titleCaseLike || (bodyCaseLike && !titleStatuteLike)) {

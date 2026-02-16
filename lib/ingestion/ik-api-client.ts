@@ -59,6 +59,7 @@ export class IkApiClientError extends Error {
   readonly status: number;
   readonly retryAfterMs?: number;
   readonly endpoint?: string;
+  readonly detail?: string;
 
   constructor(
     message: string,
@@ -66,6 +67,7 @@ export class IkApiClientError extends Error {
       status: number;
       retryAfterMs?: number;
       endpoint?: string;
+      detail?: string;
     },
   ) {
     super(message);
@@ -73,6 +75,7 @@ export class IkApiClientError extends Error {
     this.status = input.status;
     this.retryAfterMs = input.retryAfterMs;
     this.endpoint = input.endpoint;
+    this.detail = input.detail;
   }
 }
 
@@ -93,6 +96,17 @@ function normalizeText(value: string): string {
 function toArray<T>(value: unknown): T[] {
   if (Array.isArray(value)) return value as T[];
   return [];
+}
+
+function extractErrorDetail(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const row = payload as Record<string, unknown>;
+  const value = row.detail ?? row.error ?? row.message;
+  if (typeof value === "string") {
+    const normalized = normalizeText(value);
+    return normalized || undefined;
+  }
+  return undefined;
 }
 
 function parseRetryAfterMs(value: string | null): number {
@@ -205,6 +219,11 @@ function mapRowToRawDocument(row: Record<string, unknown>): IkRawDocument {
     permalink: normalizeText(String(row.permalink ?? link ?? "")),
     citations: flattenCitationValues(row.citeList),
     equivalentCitations: flattenCitationValues(row.citedbyList),
+    numcites: typeof row.numcites === "number" ? row.numcites : Number(row.numcites ?? 0) || undefined,
+    numcitedby:
+      typeof row.numcitedby === "number" ? row.numcitedby : Number(row.numcitedby ?? 0) || undefined,
+    author: normalizeText(String(row.author ?? row.judge ?? "")),
+    bench: normalizeText(String(row.bench ?? row.coram ?? "")),
     statutes: toArray<string>(row.statutes),
     sections: toArray<string>(row.sections),
     text: normalizeText(String(row.text ?? row.content ?? row.body ?? row.doc ?? "")),
@@ -356,10 +375,12 @@ export class IndianKanoonApiClient {
     const response = await this.requestJson(url, "POST", { endpoint: "search" });
 
     if (response.status >= 400) {
+      const detail = extractErrorDetail(response.payload);
       throw new IkApiClientError(`ik_api_search_http_${response.status}`, {
         status: response.status,
         retryAfterMs: response.retryAfterMs,
         endpoint: "search",
+        detail,
       });
     }
 
@@ -403,10 +424,12 @@ export class IndianKanoonApiClient {
 
     const response = await this.requestJson(url, "POST", { endpoint: "doc" });
     if (response.status >= 400) {
+      const detail = extractErrorDetail(response.payload);
       throw new IkApiClientError(`ik_api_doc_http_${response.status}`, {
         status: response.status,
         retryAfterMs: response.retryAfterMs,
         endpoint: "doc",
+        detail,
       });
     }
 
@@ -420,10 +443,12 @@ export class IndianKanoonApiClient {
       timeoutMs: options?.timeoutMs,
     });
     if (response.status >= 400) {
+      const detail = extractErrorDetail(response.payload);
       throw new IkApiClientError(`ik_api_docfragment_http_${response.status}`, {
         status: response.status,
         retryAfterMs: response.retryAfterMs,
         endpoint: "docfragment",
+        detail,
       });
     }
     return mapRowToRawDocument(response.payload as Record<string, unknown>);
@@ -433,10 +458,12 @@ export class IndianKanoonApiClient {
     const url = this.buildDocMetaUrl(docId);
     const response = await this.requestJson(url, "POST", { endpoint: "docmeta" });
     if (response.status >= 400) {
+      const detail = extractErrorDetail(response.payload);
       throw new IkApiClientError(`ik_api_docmeta_http_${response.status}`, {
         status: response.status,
         retryAfterMs: response.retryAfterMs,
         endpoint: "docmeta",
+        detail,
       });
     }
     return mapRowToRawDocument(response.payload as Record<string, unknown>);
@@ -446,10 +473,12 @@ export class IndianKanoonApiClient {
     const url = this.buildCourtCopyUrl(docId);
     const response = await this.requestJson(url, "POST", { endpoint: "origdoc" });
     if (response.status >= 400) {
+      const detail = extractErrorDetail(response.payload);
       throw new IkApiClientError(`ik_api_origdoc_http_${response.status}`, {
         status: response.status,
         retryAfterMs: response.retryAfterMs,
         endpoint: "origdoc",
+        detail,
       });
     }
     return mapRowToRawDocument(response.payload as Record<string, unknown>);

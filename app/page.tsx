@@ -21,6 +21,7 @@ import { AdvancedDrawer } from "@/app/components/consumer/AdvancedDrawer";
 import {
   BedrockHealthResponse,
   DebugPayload,
+  IndianKanoonHealthResponse,
   ResearchSummaryStats,
   ResultMode,
 } from "@/app/components/consumer/types";
@@ -30,6 +31,10 @@ const INITIAL_QUERY =
 const REQUEST_TIMEOUT_MS = Math.max(
   45_000,
   Number(process.env.NEXT_PUBLIC_SEARCH_TIMEOUT_MS ?? "90000"),
+);
+const PRIMARY_PANEL_MIN_RESULTS = Math.max(
+  1,
+  Number(process.env.NEXT_PUBLIC_PRIMARY_PANEL_MIN_RESULTS ?? "3"),
 );
 
 type ThemeMode = "light" | "dark";
@@ -112,6 +117,13 @@ function emptyStateMessage(data: SearchResponse, nearMissCount: number): string 
   return "No court-filtered matches were found. Add clearer actor, proceeding, and outcome cues to improve precision.";
 }
 
+function buildPrimaryDisplayCases(exactCases: ScoredCase[], nearMissCases: NearMissCase[]): ScoredCase[] {
+  if (exactCases.length === 0) return nearMissCases;
+  if (exactCases.length >= PRIMARY_PANEL_MIN_RESULTS || nearMissCases.length === 0) return exactCases;
+  const needed = Math.max(0, PRIMARY_PANEL_MIN_RESULTS - exactCases.length);
+  return [...exactCases, ...nearMissCases.slice(0, needed)];
+}
+
 export default function Home() {
   const [query, setQuery] = useState(INITIAL_QUERY);
   const [data, setData] = useState<SearchResponse | null>(null);
@@ -124,6 +136,8 @@ export default function Home() {
   const [enableDebugDiagnostics, setEnableDebugDiagnostics] = useState(false);
   const [bedrockHealth, setBedrockHealth] = useState<BedrockHealthResponse | null>(null);
   const [bedrockChecking, setBedrockChecking] = useState(false);
+  const [indianKanoonHealth, setIndianKanoonHealth] = useState<IndianKanoonHealthResponse | null>(null);
+  const [indianKanoonChecking, setIndianKanoonChecking] = useState(false);
   const [theme, setTheme] = useState<ThemeMode>("light");
 
   useEffect(() => {
@@ -177,6 +191,32 @@ export default function Home() {
     }
   }
 
+  async function runIndianKanoonHealthCheck() {
+    setIndianKanoonChecking(true);
+    try {
+      const requestedTimeoutMs = 6500;
+      const result = await getJsonWithTimeout<IndianKanoonHealthResponse>(
+        `/api/health/indiankanoon?timeoutMs=${requestedTimeoutMs}`,
+        requestedTimeoutMs + 2500,
+      );
+      setIndianKanoonHealth(result);
+    } catch (err) {
+      const isAbort = err instanceof DOMException && err.name === "AbortError";
+      setIndianKanoonHealth({
+        ok: false,
+        baseUrl: "unknown",
+        error: isAbort
+          ? "ik_health_client_timeout"
+          : err instanceof Error
+            ? err.message
+            : "ik_health_failed",
+        hint: isAbort ? "Browser-side timeout while waiting for IK API health response. Try again." : undefined,
+      });
+    } finally {
+      setIndianKanoonChecking(false);
+    }
+  }
+
   async function runSearch() {
     setIsLoading(true);
     setError(null);
@@ -195,7 +235,7 @@ export default function Home() {
 
       const exactCasesForRun = responsePayload.casesExact ?? responsePayload.cases;
       const exploratoryForRun = responsePayload.casesExploratory ?? responsePayload.casesNearMiss ?? [];
-      const summaryCasesForRun = exactCasesForRun.length > 0 ? exactCasesForRun : exploratoryForRun;
+      const summaryCasesForRun = buildPrimaryDisplayCases(exactCasesForRun, exploratoryForRun);
       const blockedRun = responsePayload.status === "blocked";
       const partialRun = Boolean(responsePayload.pipelineTrace?.scheduler.partialDueToLatency || responsePayload.partialRun);
       const retryAfterMs = responsePayload.retryAfterMs ?? responsePayload.pipelineTrace?.scheduler.retryAfterMs;
@@ -280,8 +320,11 @@ export default function Home() {
   }, [data]);
 
   const summaryCases = useMemo(() => {
-    if (exactCases.length > 0) return exactCases;
-    return nearMissCases;
+    return buildPrimaryDisplayCases(exactCases, nearMissCases);
+  }, [exactCases, nearMissCases]);
+
+  const primaryDisplayCases = useMemo(() => {
+    return buildPrimaryDisplayCases(exactCases, nearMissCases);
   }, [exactCases, nearMissCases]);
 
   const runStats = useMemo<ResearchSummaryStats | null>(() => {
@@ -347,15 +390,20 @@ export default function Home() {
 
           <section className="surface-panel reveal-up">
             <h2>Ranked precedents</h2>
-            {exactCases.length === 0 && <p className="empty-state-text">{emptyStateMessage(data, nearMissCases.length)}</p>}
+            {primaryDisplayCases.length === 0 && (
+              <p className="empty-state-text">{emptyStateMessage(data, nearMissCases.length)}</p>
+            )}
             <div className="result-list">
-              {exactCases.map((item) => (
+              {primaryDisplayCases.map((item) => (
                 <CaseResultCard key={item.url} item={item} />
               ))}
             </div>
           </section>
 
-          <NearMissPanel items={nearMissCases} openByDefault={exactCases.length === 0} />
+          <NearMissPanel
+            items={nearMissCases}
+            openByDefault={exactCases.length === 0 || (exactCases.length < PRIMARY_PANEL_MIN_RESULTS && nearMissCases.length > 0)}
+          />
         </>
       )}
 
@@ -366,6 +414,9 @@ export default function Home() {
           bedrockHealth={bedrockHealth}
           bedrockChecking={bedrockChecking}
           onRunBedrockHealthCheck={() => void runBedrockHealthCheck()}
+          indianKanoonHealth={indianKanoonHealth}
+          indianKanoonChecking={indianKanoonChecking}
+          onRunIndianKanoonHealthCheck={() => void runIndianKanoonHealthCheck()}
           enableDebugDiagnostics={enableDebugDiagnostics}
           onToggleDebugDiagnostics={setEnableDebugDiagnostics}
           sessionSummary={sessionSummary}

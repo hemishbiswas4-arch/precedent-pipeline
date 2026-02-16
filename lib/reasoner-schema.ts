@@ -170,6 +170,26 @@ function normalizeRelationType(value: unknown): ReasonerRelationType | null {
   return null;
 }
 
+function isWeakHookTerm(term: string): boolean {
+  const normalized = term.trim().toLowerCase();
+  if (!normalized) return true;
+  if (normalized.length <= 1) return true;
+  if (/^\d{1,4}$/.test(normalized)) return true;
+  if (/^(?:[ivxlcdm]+)$/.test(normalized)) return true;
+  return false;
+}
+
+function isStatutoryHookTerm(term: string): boolean {
+  const normalized = term.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\bsection\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\([a-z]\))?/i.test(normalized) ||
+    /\barticle\s*\d+[a-z]?\b/i.test(normalized) ||
+    /\b(?:ipc|crpc|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
+    /\b[a-z][a-z\s]{2,}\s+act\b/i.test(normalized)
+  );
+}
+
 function asHookGroups(value: unknown): ReasonerHookGroup[] {
   if (!Array.isArray(value)) return [];
   const output: ReasonerHookGroup[] = [];
@@ -178,7 +198,7 @@ function asHookGroups(value: unknown): ReasonerHookGroup[] {
     const payload = raw as Record<string, unknown>;
     const groupId = sanitizeId(payload.group_id);
     if (!groupId) continue;
-    const terms = asTextList(payload.terms, 10);
+    const terms = asTextList(payload.terms, 10).filter((term) => !isWeakHookTerm(term));
     if (terms.length === 0) continue;
     const minMatchRaw = Number(payload.min_match);
     const minMatch = Number.isFinite(minMatchRaw)
@@ -409,29 +429,39 @@ export function expandReasonerPlanFromSketch(sketch: ReasonerSketch): ReasonerPl
     12,
   );
 
-  const hookGroups: ReasonerHookGroup[] = sketch.hooks.slice(0, 4).map((hook, index) => ({
-    group_id: `hook_${index + 1}`,
-    terms: [hook],
-    min_match: 1,
-    required: true,
-  }));
-  const relations: ReasonerRelation[] =
-    hookGroups.length >= 2
-      ? [
-          {
-            type: "interacts_with",
-            left_group_id: hookGroups[0].group_id,
-            right_group_id: hookGroups[1].group_id,
-            required: true,
-          },
-        ]
-      : [];
+  const hookGroupsRaw = sketch.hooks
+    .map((hook) => hook.trim().toLowerCase())
+    .filter((hook) => hook.length > 0 && !isWeakHookTerm(hook))
+    .slice(0, 6);
+  const disjunctiveSketch =
+    /\b(?:or|either|alternatively|versus|vs\.?|instead of)\b/.test(sketch.outcome.join(" ")) ||
+    /\b(?:or|either|alternatively|versus|vs\.?|instead of)\b/.test(sketch.proceeding.join(" ")) ||
+    /\b(?:or|either|alternatively|versus|vs\.?|instead of)\b/.test(sketch.strict_terms.join(" "));
+  const statutoryHookCount = hookGroupsRaw.filter((hook) => isStatutoryHookTerm(hook)).length;
+  const hookGroups: ReasonerHookGroup[] = hookGroupsRaw.map((hook, index) => {
+    const statutory = isStatutoryHookTerm(hook);
+    const required = disjunctiveSketch
+      ? statutory
+      : statutoryHookCount > 0
+        ? statutory
+        : index === 0;
+    return {
+      group_id: `hook_${index + 1}`,
+      terms: [hook],
+      min_match: 1,
+      required,
+    };
+  });
+  if (hookGroups.length > 0 && !hookGroups.some((group) => group.required)) {
+    hookGroups[0].required = true;
+  }
+  const relations: ReasonerRelation[] = [];
 
   return {
     proposition: {
       actors: sketch.actors,
       proceeding: sketch.proceeding,
-      legal_hooks: sketch.hooks,
+      legal_hooks: hookGroupsRaw,
       outcome_required: sketch.outcome,
       outcome_negative: contradictionTerms,
       jurisdiction_hint: sketch.court_hint,
@@ -442,7 +472,7 @@ export function expandReasonerPlanFromSketch(sketch: ReasonerSketch): ReasonerPl
         terms: uniqueTerms([...sketch.outcome, ...sketch.strict_terms.slice(0, 2)], 10),
         contradiction_terms: contradictionTerms,
       },
-      interaction_required: hookGroups.length >= 2,
+      interaction_required: false,
     },
     must_have_terms: mustHaveTerms,
     must_not_have_terms: contradictionTerms,

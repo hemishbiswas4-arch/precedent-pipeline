@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { schedulerTestUtils } from "@/lib/pipeline/scheduler";
-import type { QueryVariant, VariantUtilitySnapshot } from "@/lib/pipeline/types";
+import { runRetrievalSchedule, schedulerTestUtils } from "@/lib/pipeline/scheduler";
+import type { IntentProfile, QueryVariant, VariantUtilitySnapshot } from "@/lib/pipeline/types";
 
 function variant(input: {
   id: string;
@@ -95,4 +95,151 @@ test("toSortedPhaseVariants favors historically high-utility canonical keys", ()
   };
   const sorted = schedulerTestUtils.toSortedPhaseVariants(variants, utility);
   assert.equal(sorted[0].canonicalKey, "rewrite:strict:high");
+});
+
+function buildIntent(): IntentProfile {
+  return {
+    query: "state appeal limitation",
+    cleanedQuery: "state appeal limitation",
+    context: {
+      domains: ["criminal"],
+      issues: ["delay condonation refused"],
+      statutesOrSections: ["section 5 limitation act"],
+      procedures: ["criminal appeal"],
+      actors: ["state"],
+      anchors: ["delay", "condonation"],
+    },
+    domains: ["criminal"],
+    issues: ["delay condonation refused"],
+    statutes: ["section 5 limitation act"],
+    procedures: ["criminal appeal"],
+    actors: ["state"],
+    anchors: ["delay", "condonation"],
+    courtHint: "ANY",
+    dateWindow: {},
+    retrievalIntent: {
+      actors: ["state"],
+      proceeding: ["criminal appeal"],
+      hookGroups: [
+        {
+          groupId: "sec_5_limitation",
+          terms: ["section 5 limitation act"],
+          required: true,
+        },
+      ],
+      outcomePolarity: "refused",
+      citationHints: [],
+      judgeHints: [],
+      dateWindow: {},
+      doctypeProfile: "judgments_sc_hc_tribunal",
+    },
+    entities: {
+      person: [],
+      org: [],
+      statute: ["limitation act"],
+      section: ["section 5 limitation act"],
+      case_citation: [],
+    },
+  };
+}
+
+test("runRetrievalSchedule honors per-phase page policy and does not early-stop on raw count by default", async () => {
+  const calls: Array<{ phase?: string; maxPages: number }> = [];
+  const provider = {
+    id: "indiankanoon_api" as const,
+    supportsDetailFetch: true,
+    async search(input: {
+      maxPages: number;
+      phrase: string;
+    }) {
+      calls.push({ maxPages: input.maxPages });
+      return {
+        cases: [
+          {
+            source: "indiankanoon" as const,
+            title: `State v. Candidate ${calls.length}`,
+            url: `https://indiankanoon.org/doc/${calls.length}/`,
+            snippet: "criminal appeal dismissed as time barred",
+            court: "SC" as const,
+          },
+        ],
+        debug: {
+          searchQuery: input.phrase,
+          status: 200,
+          ok: true,
+          parsedCount: 1,
+          parserMode: "ik_api",
+          cloudflareDetected: false,
+          challengeDetected: false,
+        },
+      };
+    },
+  };
+
+  const variants: QueryVariant[] = [
+    {
+      id: "p1",
+      phrase: "state criminal appeal limitation",
+      phase: "primary",
+      purpose: "test",
+      courtScope: "ANY",
+      strictness: "strict",
+      tokens: ["state", "criminal", "appeal", "limitation"],
+    },
+    {
+      id: "f1",
+      phrase: "delay condonation refused limitation",
+      phase: "fallback",
+      purpose: "test",
+      courtScope: "ANY",
+      strictness: "strict",
+      tokens: ["delay", "condonation", "refused", "limitation"],
+    },
+    {
+      id: "r1",
+      phrase: "section 5 limitation act",
+      phase: "rescue",
+      purpose: "test",
+      courtScope: "ANY",
+      strictness: "relaxed",
+      tokens: ["section", "5", "limitation", "act"],
+    },
+  ];
+
+  const result = await runRetrievalSchedule({
+    variants,
+    intent: buildIntent(),
+    provider,
+    config: {
+      strictCaseOnly: true,
+      verifyLimit: 4,
+      globalBudget: 6,
+      phaseLimits: {
+        primary: 2,
+        fallback: 2,
+        rescue: 1,
+        micro: 1,
+        revolving: 1,
+        browse: 1,
+      },
+      maxPagesByPhase: {
+        primary: 2,
+        fallback: 2,
+        other: 1,
+      },
+      blockedThreshold: 3,
+      minCaseTarget: 1,
+      requireSupremeCourt: false,
+      maxElapsedMs: 5000,
+      stopOnCandidateTarget: true,
+      fetchTimeoutMs: 1200,
+      max429Retries: 0,
+    },
+  });
+
+  assert.equal(result.attempts.length, 3);
+  assert.deepEqual(
+    calls.map((entry) => entry.maxPages),
+    [2, 2, 1],
+  );
 });

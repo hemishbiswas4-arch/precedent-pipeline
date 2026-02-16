@@ -1,6 +1,11 @@
 "use client";
 
-import { DebugPayload, BedrockHealthResponse, SessionSummary } from "@/app/components/consumer/types";
+import {
+  DebugPayload,
+  BedrockHealthResponse,
+  IndianKanoonHealthResponse,
+  SessionSummary,
+} from "@/app/components/consumer/types";
 import { SearchResponse } from "@/lib/types";
 
 export function AdvancedDrawer(props: {
@@ -9,6 +14,9 @@ export function AdvancedDrawer(props: {
   bedrockHealth: BedrockHealthResponse | null;
   bedrockChecking: boolean;
   onRunBedrockHealthCheck: () => void;
+  indianKanoonHealth: IndianKanoonHealthResponse | null;
+  indianKanoonChecking: boolean;
+  onRunIndianKanoonHealthCheck: () => void;
   enableDebugDiagnostics: boolean;
   onToggleDebugDiagnostics: (next: boolean) => void;
   sessionSummary: SessionSummary;
@@ -20,6 +28,9 @@ export function AdvancedDrawer(props: {
     bedrockHealth,
     bedrockChecking,
     onRunBedrockHealthCheck,
+    indianKanoonHealth,
+    indianKanoonChecking,
+    onRunIndianKanoonHealthCheck,
     enableDebugDiagnostics,
     onToggleDebugDiagnostics,
     sessionSummary,
@@ -47,6 +58,35 @@ export function AdvancedDrawer(props: {
           </p>
         ) : (
           <p className="stats-line">Use this to validate AWS credentials, region, and model connectivity.</p>
+        )}
+      </div>
+
+      <div className="advanced-block">
+        <h3>Retrieval (Indian Kanoon API)</h3>
+        <button
+          type="button"
+          className="secondary-btn"
+          onClick={onRunIndianKanoonHealthCheck}
+          disabled={indianKanoonChecking}
+        >
+          {indianKanoonChecking ? "Testing..." : "Test Indian Kanoon connection"}
+        </button>
+        {indianKanoonHealth ? (
+          <>
+            <p className="stats-line">
+              {indianKanoonHealth.ok
+                ? `OK (${indianKanoonHealth.baseUrl}, HTTP ${indianKanoonHealth.status ?? 200}, rows ${indianKanoonHealth.rows ?? 0}, ${indianKanoonHealth.latencyMs ?? 0}ms)`
+                : `Error (${indianKanoonHealth.error ?? "unknown"}${
+                    typeof indianKanoonHealth.status === "number"
+                      ? `, HTTP ${indianKanoonHealth.status}`
+                      : ""
+                  }${typeof indianKanoonHealth.timeoutMs === "number" ? `, timeout ${indianKanoonHealth.timeoutMs}ms` : ""})`}
+            </p>
+            {indianKanoonHealth.detail ? <p className="stats-line">detail: {indianKanoonHealth.detail}</p> : null}
+            {indianKanoonHealth.hint ? <p className="stats-line">{indianKanoonHealth.hint}</p> : null}
+          </>
+        ) : (
+          <p className="stats-line">Use this to validate IK API key, base URL, and retrieval endpoint connectivity.</p>
         )}
       </div>
 
@@ -82,6 +122,35 @@ export function AdvancedDrawer(props: {
           </p>
           <p className="stats-line">executionPath: {data.executionPath ?? "server_only"}</p>
           <p className="stats-line">stopReason: {data.pipelineTrace?.scheduler.stopReason ?? "n/a"}</p>
+          <p className="stats-line">
+            strict-hit-rate:{" "}
+            {(() => {
+              const stats = data.pipelineTrace?.retrieval.precisionLaneStats;
+              if (!stats || stats.strictRetrieved <= 0) return "n/a";
+              return `${((stats.strictAccepted / stats.strictRetrieved) * 100).toFixed(0)}%`;
+            })()}
+            {" | "}
+            related-hit-rate:{" "}
+            {(() => {
+              const stats = data.pipelineTrace?.retrieval.precisionLaneStats;
+              if (!stats) return "n/a";
+              const denominator = Math.max(1, stats.strictAccepted + stats.relatedAccepted);
+              return `${((stats.relatedAccepted / denominator) * 100).toFixed(0)}%`;
+            })()}
+          </p>
+          <p className="stats-line">
+            no-match-rate:{" "}
+            {(() => {
+              const attempts = data.pipelineTrace?.scheduler.attemptsUsed ?? 0;
+              const noMatch = data.pipelineTrace?.retrieval.noMatchCount ?? 0;
+              if (attempts <= 0) return "n/a";
+              return `${((noMatch / attempts) * 100).toFixed(0)}%`;
+            })()}
+            {" | "}
+            polarity-mismatch-count: {data.pipelineTrace?.classification.polarityMismatchCount ?? 0}
+            {" | "}
+            latency-ms: {data.pipelineTrace?.scheduler.elapsedMs ?? "n/a"}
+          </p>
           <p className="stats-line">domains: {data.context.domains.join(", ") || "none"}</p>
           <p className="stats-line">issues: {data.context.issues.join(", ") || "none"}</p>
           <p className="stats-line">statutes/sections: {data.context.statutesOrSections.join(", ") || "none"}</p>

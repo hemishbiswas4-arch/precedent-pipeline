@@ -269,10 +269,27 @@ const STRICT_INTERSECTION_REQUIRED_WHEN_MULTIHOOK = parseBooleanEnv(
   process.env.STRICT_INTERSECTION_REQUIRED_WHEN_MULTIHOOK,
   true,
 );
+const PROPOSITION_GATE_V6_ENABLED = parseBooleanEnv(process.env.PROPOSITION_GATE_V6, true);
+const CONSUMER_RELAXED_GATING_V1 = parseBooleanEnv(
+  process.env.CONSUMER_RELAXED_GATING_V1,
+  true,
+);
 const STRICT_HIGH_CONFIDENCE_ONLY = parseBooleanEnv(process.env.STRICT_HIGH_CONFIDENCE_ONLY, true);
 const PROVISIONAL_CONFIDENCE_CAP = Math.min(
   0.8,
   Math.max(Number(process.env.PROVISIONAL_CONFIDENCE_CAP ?? "0.70"), 0.45),
+);
+const CONSUMER_RELAXED_PROVISIONAL_TARGET = Math.max(
+  1,
+  Math.min(Number(process.env.CONSUMER_RELAXED_PROVISIONAL_TARGET ?? "3"), 10),
+);
+const CONSUMER_RELATED_BACKFILL_TARGET = Math.max(
+  1,
+  Math.min(Number(process.env.CONSUMER_RELATED_BACKFILL_TARGET ?? "4"), 12),
+);
+const CONSUMER_RELAXED_RELATED_POLARITY_MISMATCH = parseBooleanEnv(
+  process.env.CONSUMER_RELAXED_RELATED_POLARITY_MISMATCH,
+  true,
 );
 const EXPLORATORY_CONFIDENCE_CAP = Math.min(
   0.55,
@@ -395,6 +412,9 @@ function inferSectionFamilyFromContext(input: {
   );
 
   const cleanSection = input.sectionToken.replace(/\s+/g, "").toLowerCase();
+  if (/^5(?:\([0-9a-z]+\))*(?:\([a-z]\))?$/.test(cleanSection) && knownFamilies.has("limitation_act")) {
+    return "limitation_act";
+  }
   if (/^13(?:\([0-9a-z]+\))*(?:\([a-z]\))?$/.test(cleanSection) && knownFamilies.has("pc_act")) return "pc_act";
   if (/^19(?:\([0-9a-z]+\))*(?:\([a-z]\))?$/.test(cleanSection) && knownFamilies.has("pc_act")) return "pc_act";
   if (/^(197|482|378)(?:\([0-9a-z]+\))*(?:\([a-z]\))?$/.test(cleanSection) && knownFamilies.has("crpc")) return "crpc";
@@ -487,6 +507,21 @@ function parseOutcomePhrasesFromQuery(query: string): string[] {
   return phrases;
 }
 
+function hasOpenEndedOutcomeQuestion(text: string): boolean {
+  return (
+    /\b(?:whether|when|can|could|would|if)\b/.test(text) &&
+    /\b(?:condon(?:e|ed|ation)|quash(?:ed|ing)?|dismiss(?:ed)?|allow(?:ed)?|grant(?:ed)?|refus(?:e|ed)|reject(?:ed)?|discharge|framing\s+of\s+charge)\b/.test(
+      text,
+    )
+  );
+}
+
+function hasExplicitDisposition(text: string): boolean {
+  return /\b(?:dismissed|refused|rejected|denied|declined|quashed|allowed|granted|restored|not condoned|time barred|barred by limitation)\b/.test(
+    text,
+  );
+}
+
 function inferOutcomePolarity(query: string, terms: string[]): ReasonerOutcomePolarity {
   const q = normalizeText(query);
   const bag = normalizeText(`${q} ${terms.join(" ")}`);
@@ -507,11 +542,43 @@ function inferOutcomePolarity(query: string, terms: string[]): ReasonerOutcomePo
     if (/\b(?:not required|no sanction required|without sanction)\b/.test(bag)) return "not_required";
     if (/\b(?:must|required|mandatory|necessary|prior|previous)\b/.test(bag)) return "required";
   }
-  if (hasNegativeCondonation || /\b(?:not condoned|refused|rejected|declined)\b/.test(bag)) return "refused";
-  if (/\b(?:dismissed|time barred|barred by limitation)\b/.test(bag)) return "dismissed";
-  if (/\bquashed\b/.test(bag)) return "quashed";
-  if (hasPositiveCondonation || /\b(?:allowed|granted|condoned|restored)\b/.test(bag)) return "allowed";
+  const openEndedQuestion = hasOpenEndedOutcomeQuestion(q);
+  const explicitDisposition = hasExplicitDisposition(q);
+  if (!openEndedQuestion || explicitDisposition) {
+    if (hasNegativeCondonation || /\b(?:not condoned|refused|rejected|declined)\b/.test(bag)) return "refused";
+    if (/\b(?:dismissed|time barred|barred by limitation)\b/.test(bag)) return "dismissed";
+    if (/\bquashed\b/.test(bag)) return "quashed";
+    if (hasPositiveCondonation || /\b(?:allowed|granted|condoned|restored)\b/.test(bag)) return "allowed";
+  }
   return "unknown";
+}
+
+function hasDelayCondonationContextForChecklist(cleanedQuery: string, context: ContextProfile): boolean {
+  const bag = normalizeText(
+    [
+      cleanedQuery,
+      ...context.issues,
+      ...context.procedures,
+      ...context.statutesOrSections,
+    ].join(" "),
+  );
+  return /\b(?:condonation|delay|limitation|time[-\s]*barred|barred\s+by\s+limitation|not\s+condoned|section\s*5)\b/.test(
+    bag,
+  );
+}
+
+function filterOutcomeTermsByContext(terms: string[], delayCondonationContext: boolean): string[] {
+  return terms.filter((term) => {
+    const normalized = normalizeText(term);
+    if (!normalized) return false;
+    if (
+      !delayCondonationContext &&
+      /\b(?:condonation|delay|time[-\s]*barred|barred\s+by\s+limitation|not\s+condoned)\b/.test(normalized)
+    ) {
+      return false;
+    }
+    return true;
+  });
 }
 
 function normalizeOutcomeConstraint(input: {
@@ -520,9 +587,31 @@ function normalizeOutcomeConstraint(input: {
   contradictionTerms: string[];
   query: string;
 }): OutcomeConstraint {
+  const normalizedQuery = normalizeText(input.query);
+  const normalizedBag = normalizeText(`${input.query} ${input.outcomeTerms.join(" ")}`);
+  const openEndedOutcomeQuestion =
+    hasOpenEndedOutcomeQuestion(normalizedQuery) && !hasExplicitDisposition(normalizedQuery);
   const reasonerPolarity = input.reasonerOutcome?.polarity ?? "unknown";
-  const inferredPolarity =
+  let inferredPolarity =
     reasonerPolarity !== "unknown" ? reasonerPolarity : inferOutcomePolarity(input.query, input.outcomeTerms);
+  const delayCondonationContext =
+    /\b(?:condonation|delay|limitation|time[-\s]*barred|barred\s+by\s+limitation|not\s+condoned)\b/.test(
+      normalizedBag,
+    );
+  const refusalToInterfereContext = /\b(?:refused|declined)\s+to\s+interfere\b/.test(normalizedBag);
+  const mixedOutcomeDisjunction =
+    /\bor\b/.test(normalizedQuery) &&
+    /\b(?:failed|dismissed|rejected)\b/.test(normalizedBag) &&
+    /\b(?:proceeded|continued|allowed)\b/.test(normalizedBag);
+  if (mixedOutcomeDisjunction) {
+    inferredPolarity = "unknown";
+  }
+  if (inferredPolarity === "refused" && refusalToInterfereContext && !delayCondonationContext) {
+    inferredPolarity = "unknown";
+  }
+  if (openEndedOutcomeQuestion && inferredPolarity !== "required" && inferredPolarity !== "not_required") {
+    inferredPolarity = "unknown";
+  }
   const defaults = OUTCOME_TERMS_BY_POLARITY[inferredPolarity];
   const terms = normalizeTerms(
     [...(input.reasonerOutcome?.terms ?? []), ...input.outcomeTerms, ...defaults.positive],
@@ -534,7 +623,7 @@ function normalizeOutcomeConstraint(input: {
   );
   return {
     polarity: inferredPolarity,
-    required: terms.length > 0 || inferredPolarity !== "unknown",
+    required: inferredPolarity !== "unknown",
     terms,
     contradictionTerms,
   };
@@ -552,6 +641,12 @@ function buildAxis(input: {
     required: input.required,
     terms: normalizeTerms(input.terms, input.key === "legal_hook" ? 24 : 16),
   };
+}
+
+function isOutcomeLikeProceedingTerm(term: string): boolean {
+  const normalized = normalizeText(term);
+  if (!normalized) return false;
+  return /\b(?:discharge|framing of charge|frame charge|charge framed|quash|quashing)\b/.test(normalized);
 }
 
 function axisValuesFromReasonerOrContext(
@@ -575,8 +670,40 @@ function toGroupLabel(groupId: string): string {
   return groupId.replace(/^hook_/, "").replace(/_/g, " ").trim();
 }
 
+function isStatutoryHookTerm(term: string): boolean {
+  const normalized = normalizeText(term);
+  if (!normalized) return false;
+  return (
+    /\bsection\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\([a-z]\))?/i.test(normalized) ||
+    /\barticle\s*\d+[a-z]?\b/i.test(normalized) ||
+    /\b(?:ipc|crpc|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
+    /\b[a-z][a-z\s]{2,}\s+act\b/i.test(normalized)
+  );
+}
+
+function isWeakHookTerm(term: string): boolean {
+  const normalized = normalizeText(term);
+  if (!normalized) return true;
+  if (normalized.length <= 1) return true;
+  if (/^\d{1,4}$/.test(normalized)) return true;
+  if (/^(?:[ivxlcdm]+)$/.test(normalized)) return true;
+  return false;
+}
+
+function hasDisjunctiveSignals(cleanedQuery: string): boolean {
+  const normalized = normalizeText(cleanedQuery);
+  return /\b(?:or|either|alternatively|versus|vs\.?|instead of)\b/.test(normalized);
+}
+
+function isStatutoryProceedingTerm(term: string): boolean {
+  const normalized = normalizeText(term);
+  if (!normalized) return false;
+  return isStatutoryHookTerm(normalized);
+}
+
 function buildHookGroupsFromTerms(input: {
   legalHookTerms: string[];
+  cleanedQuery: string;
   reasonerPlan?: ReasonerPlan;
 }): HookGroupConstraint[] {
   const groups = new Map<string, HookGroupConstraint>();
@@ -589,11 +716,15 @@ function buildHookGroupsFromTerms(input: {
   for (const group of input.reasonerPlan?.proposition.hook_groups ?? []) {
     const groupId = slug(group.group_id);
     if (!groupId) continue;
+    const terms = normalizeTerms(group.terms, 12).filter((term) => !isWeakHookTerm(term));
+    if (terms.length === 0) continue;
+    const labelFromId = toGroupLabel(groupId);
+    const label = /^[0-9]+$/.test(labelFromId) ? terms[0] : labelFromId;
     groups.set(groupId, {
       groupId,
-      label: toGroupLabel(groupId),
-      terms: normalizeTerms(group.terms, 12),
-      minMatch: Math.max(1, Math.min(group.min_match, 4)),
+      label,
+      terms,
+      minMatch: Math.max(1, Math.min(group.min_match, Math.min(terms.length, 4))),
       required: group.required,
     });
   }
@@ -601,6 +732,7 @@ function buildHookGroupsFromTerms(input: {
   for (const term of input.legalHookTerms) {
     const normalized = normalizeTerm(term);
     if (!normalized) continue;
+    if (isWeakHookTerm(normalized)) continue;
     const family = inferHookFamily(normalized, allLegalTerms);
     const groupId = slug(family);
     const familyToken = family.startsWith("sec_")
@@ -620,14 +752,117 @@ function buildHookGroupsFromTerms(input: {
     existing.terms = normalizeTerms([...existing.terms, ...expandHookTerm(normalized, familyToken)], 16);
   }
 
-  return Array.from(groups.values())
+  const disjunctiveQuery = hasDisjunctiveSignals(input.cleanedQuery);
+  const normalizedGroupsRaw = Array.from(groups.values())
     .map((group) => ({
       ...group,
-      terms: group.terms.slice(0, 16),
-      required: group.required,
+      terms: group.terms.filter((term) => !isWeakHookTerm(term)).slice(0, 16),
+      required: disjunctiveQuery
+        ? group.required && group.terms.some((term) => isStatutoryHookTerm(term))
+        : group.required,
     }))
     .filter((group) => group.terms.length > 0)
-    .slice(0, 8);
+    .sort((left, right) => {
+      const leftStatutory = left.terms.some((term) => isStatutoryHookTerm(term)) ? 1 : 0;
+      const rightStatutory = right.terms.some((term) => isStatutoryHookTerm(term)) ? 1 : 0;
+      if (left.required !== right.required) return left.required ? -1 : 1;
+      if (leftStatutory !== rightStatutory) return rightStatutory - leftStatutory;
+      return right.terms.length - left.terms.length;
+    });
+
+  const deduped = new Map<string, HookGroupConstraint>();
+  for (const group of normalizedGroupsRaw) {
+    const representative = normalizeText(group.terms[0] ?? group.label ?? group.groupId);
+    const dedupeKey = representative || normalizeText(group.groupId);
+    const existing = deduped.get(dedupeKey);
+    if (!existing) {
+      deduped.set(dedupeKey, {
+        ...group,
+        terms: normalizeTerms(group.terms, 16),
+      });
+      continue;
+    }
+    existing.terms = normalizeTerms([...existing.terms, ...group.terms], 16);
+    existing.required = existing.required || group.required;
+    existing.minMatch = Math.max(existing.minMatch, Math.min(group.minMatch, existing.terms.length));
+  }
+  const normalizedGroups = Array.from(deduped.values());
+
+  const semanticKeyForGroup = (group: HookGroupConstraint): string | null => {
+    const section = group.terms
+      .map((term) => parseSectionToken(term))
+      .find((value): value is string => Boolean(value))
+      ?.replace(/\s+/g, "")
+      .toLowerCase();
+    const familyFromTerms = group.terms
+      .map((term) => detectHookFamily(normalizeText(term)))
+      .find((value): value is string => Boolean(value));
+    const familyFromId =
+      group.groupId.match(/^sec_(pc_act|crpc|ipc|cpc|limitation_act)_/)?.[1] ??
+      group.groupId.match(/^(pc_act|crpc|ipc|cpc|limitation_act)$/)?.[1] ??
+      null;
+    const family = familyFromTerms ?? familyFromId;
+    if (family && section) return `family:${family}:section:${section}`;
+    if (family) return `family:${family}`;
+    if (section) return `section:${section}`;
+    return null;
+  };
+
+  const semanticDeduped = new Map<string, HookGroupConstraint>();
+  for (const group of normalizedGroups) {
+    const semanticKey = semanticKeyForGroup(group);
+    if (!semanticKey) {
+      semanticDeduped.set(`${group.groupId}:${semanticDeduped.size}`, group);
+      continue;
+    }
+    const existing = semanticDeduped.get(semanticKey);
+    if (!existing) {
+      semanticDeduped.set(semanticKey, { ...group, terms: normalizeTerms(group.terms, 16) });
+      continue;
+    }
+    existing.terms = normalizeTerms([...existing.terms, ...group.terms], 16);
+    existing.required = existing.required || group.required;
+    existing.minMatch = Math.max(existing.minMatch, Math.min(group.minMatch, existing.terms.length));
+  }
+  const semanticGroups = Array.from(semanticDeduped.values());
+  const familiesWithSection = new Set<string>();
+  for (const group of semanticGroups) {
+    const sectionBound = group.terms.some((term) => Boolean(parseSectionToken(term)));
+    if (!sectionBound) continue;
+    for (const term of group.terms) {
+      const family = detectHookFamily(normalizeText(term));
+      if (family) familiesWithSection.add(family);
+    }
+  }
+  const prunedGroups = semanticGroups.filter((group) => {
+    const hasSection = group.terms.some((term) => Boolean(parseSectionToken(term)));
+    if (hasSection) return true;
+    const families = new Set(
+      group.terms
+        .map((term) => detectHookFamily(normalizeText(term)))
+        .filter((family): family is string => Boolean(family)),
+    );
+    if (families.size === 0) return true;
+    return !Array.from(families).some((family) => familiesWithSection.has(family));
+  });
+
+  if (prunedGroups.length === 0) return [];
+  if (!prunedGroups.some((group) => group.required)) {
+    const primary =
+      prunedGroups.find((group) => group.terms.some((term) => isStatutoryHookTerm(term))) ??
+      prunedGroups[0];
+    primary.required = true;
+  }
+  if (disjunctiveQuery) {
+    const required = prunedGroups.filter((group) => group.required);
+    if (required.length > 2) {
+      for (const group of required.slice(2)) {
+        group.required = false;
+      }
+    }
+  }
+
+  return prunedGroups.slice(0, 8);
 }
 
 function buildRelations(input: {
@@ -657,20 +892,41 @@ function buildRelations(input: {
     }));
 
   const q = normalizeText(input.cleanedQuery);
+  const disjunctiveQuery = hasDisjunctiveSignals(input.cleanedQuery);
   const requiredGroupsCount = input.groups.filter((group) => group.required).length;
-  const interactionCueDetected = INTERACTION_CUES.some((cue) => q.includes(cue));
-  const structuralInteractionDetected = STRUCTURAL_INTERACTION_PATTERNS.some((pattern) => pattern.test(q));
+  const statutoryGroupCount = input.groups.filter((group) =>
+    group.terms.some((term) => isStatutoryHookTerm(term)),
+  ).length;
+  const interactionCueDetected = INTERACTION_CUES.some((cue) => {
+    if (!q.includes(cue)) return false;
+    if (cue === "under section" || cue === "requires under" || cue === "for prosecution under") {
+      return statutoryGroupCount >= 2;
+    }
+    return true;
+  });
+  const structuralInteractionDetected =
+    statutoryGroupCount >= 2 && STRUCTURAL_INTERACTION_PATTERNS.some((pattern) => pattern.test(q));
   const inferredInteractionRequired =
     requiredGroupsCount > 1 && (interactionCueDetected || structuralInteractionDetected);
   const strictMultiHookDefault =
-    STRICT_INTERSECTION_REQUIRED_WHEN_MULTIHOOK && requiredGroupsCount > 1 && !reasonerExplicitlyNegatesInteraction;
+    STRICT_INTERSECTION_REQUIRED_WHEN_MULTIHOOK &&
+    requiredGroupsCount > 1 &&
+    !reasonerExplicitlyNegatesInteraction &&
+    !disjunctiveQuery;
+  const allowReasonerInteraction =
+    !(disjunctiveQuery && !interactionCueDetected && !structuralInteractionDetected);
   const interactionRequired =
-    Boolean(input.reasonerPlan?.proposition.interaction_required) ||
+    (Boolean(input.reasonerPlan?.proposition.interaction_required) && allowReasonerInteraction) ||
     inferredInteractionRequired ||
     strictMultiHookDefault;
+  const downgradeRequiredRelations = disjunctiveQuery && !interactionCueDetected && !structuralInteractionDetected;
+  const normalizedReasonerRelations = reasonerRelations.map((relation) => ({
+    ...relation,
+    required: downgradeRequiredRelations ? false : relation.required,
+  }));
 
-  if (reasonerRelations.length > 0) {
-    return { relations: reasonerRelations, interactionRequired };
+  if (normalizedReasonerRelations.length > 0) {
+    return { relations: normalizedReasonerRelations, interactionRequired };
   }
   if (!interactionRequired) {
     return { relations: [], interactionRequired };
@@ -726,6 +982,15 @@ function hasDoctrinalNearMissSignals(checklist: PropositionChecklist): boolean {
   const hasRequiredRelations = checklist.relations.some((relation) => relation.required) || checklist.interactionRequired;
   const hasRequiredOutcome = checklist.outcomeConstraint.required;
   return hasRequiredHooks || hasRequiredRelations || hasRequiredOutcome;
+}
+
+function contextEvidenceStrength(candidate: ScoredCase): number {
+  const anchors = candidate.verification.anchorsMatched > 0 ? 1 : 0;
+  const issues = candidate.verification.issuesMatched > 0 ? 1 : 0;
+  const procedures = candidate.verification.proceduresMatched > 0 ? 1 : 0;
+  const relation = candidate.verification.hasRelationSentence ? 1 : 0;
+  const polarity = candidate.verification.hasPolaritySentence ? 1 : 0;
+  return anchors + issues + procedures + relation + polarity;
 }
 
 function clamp(value: number, min = 0, max = 1): number {
@@ -828,10 +1093,21 @@ function hasMinimumExploratorySignal(input: {
 function isExploratoryEligible(input: {
   caseItem: ScoredCase;
   result: PropositionGateResult;
+}, options?: {
+  allowPolarityMismatch?: boolean;
 }): boolean {
+  const allowPolarityMismatch = Boolean(
+    options?.allowPolarityMismatch && CONSUMER_RELAXED_RELATED_POLARITY_MISMATCH,
+  );
+  const polarityEligible =
+    !input.result.polarityMismatch ||
+    (allowPolarityMismatch &&
+      input.result.requiredCoverage >= 0.3 &&
+      input.result.coreCoverage >= 0.3 &&
+      input.result.hookGroupCoverage >= 0.4);
   return (
     !input.result.contradiction &&
-    !input.result.polarityMismatch &&
+    polarityEligible &&
     (input.caseItem.court === "SC" || input.caseItem.court === "HC") &&
     hasMinimumExploratorySignal(input)
   );
@@ -860,6 +1136,7 @@ export function buildPropositionChecklist(input: {
   reasonerPlan?: ReasonerPlan;
 }): PropositionChecklist {
   const { context, cleanedQuery, reasonerPlan } = input;
+  const delayCondonationContext = hasDelayCondonationContextForChecklist(cleanedQuery, context);
   const actorTerms = axisValuesFromReasonerOrContext(
     reasonerPlan?.proposition.actors,
     context.actors,
@@ -879,7 +1156,7 @@ export function buildPropositionChecklist(input: {
 
   const outcomeTerms = normalizeTerms(
     [
-      ...(reasonerPlan?.proposition.outcome_required ?? []),
+      ...filterOutcomeTermsByContext(reasonerPlan?.proposition.outcome_required ?? [], delayCondonationContext),
       ...context.issues,
       ...parseOutcomePhrasesFromQuery(cleanedQuery),
       ...OUTCOME_HINTS.filter((hint) => normalizeText(cleanedQuery).includes(hint)),
@@ -888,14 +1165,28 @@ export function buildPropositionChecklist(input: {
   );
   const contradictionTerms = normalizeTerms(
     [
-      ...(reasonerPlan?.proposition.outcome_negative ?? []),
-      ...(reasonerPlan?.must_not_have_terms ?? []),
+      ...filterOutcomeTermsByContext(reasonerPlan?.proposition.outcome_negative ?? [], delayCondonationContext),
+      ...filterOutcomeTermsByContext(reasonerPlan?.must_not_have_terms ?? [], delayCondonationContext),
     ],
     16,
   );
+  const filteredReasonerOutcomeConstraint = reasonerPlan?.proposition.outcome_constraint
+    ? {
+        ...reasonerPlan.proposition.outcome_constraint,
+        terms: filterOutcomeTermsByContext(
+          reasonerPlan.proposition.outcome_constraint.terms ?? [],
+          delayCondonationContext,
+        ),
+        contradiction_terms: filterOutcomeTermsByContext(
+          reasonerPlan.proposition.outcome_constraint.contradiction_terms ?? [],
+          delayCondonationContext,
+        ),
+      }
+    : undefined;
 
   const hookGroups = buildHookGroupsFromTerms({
     legalHookTerms,
+    cleanedQuery,
     reasonerPlan,
   });
   const relationBundle = buildRelations({
@@ -904,15 +1195,20 @@ export function buildPropositionChecklist(input: {
     reasonerPlan,
   });
   const outcomeConstraint = normalizeOutcomeConstraint({
-    reasonerOutcome: reasonerPlan?.proposition.outcome_constraint,
+    reasonerOutcome: filteredReasonerOutcomeConstraint,
     outcomeTerms,
     contradictionTerms,
     query: cleanedQuery,
   });
 
   const actorRequired = actorTerms.length > 0;
-  const proceedingRequired = proceedingTerms.length > 0;
   const legalHookRequired = hookGroups.some((group) => group.required);
+  const proceedingHasIndependentSignal = proceedingTerms.some(
+    (term) => !isStatutoryProceedingTerm(term) && !isOutcomeLikeProceedingTerm(term),
+  );
+  const proceedingRequired =
+    proceedingTerms.length > 0 &&
+    (proceedingHasIndependentSignal || (!legalHookRequired && proceedingTerms.some((term) => !isOutcomeLikeProceedingTerm(term))));
   const outcomeRequired = outcomeConstraint.required;
 
   const axes: PropositionAxis[] = [
@@ -942,13 +1238,23 @@ export function buildPropositionChecklist(input: {
     }),
   ];
 
+  const graphActorTerms = actorRequired ? actorTerms : [];
+  const graphProceedingTerms = proceedingRequired ? proceedingTerms : [];
+  const graphOutcomeTerms = outcomeRequired ? outcomeConstraint.terms : [];
+  const graphContext: ContextProfile = {
+    ...context,
+    actors: actorRequired ? context.actors : [],
+    procedures: proceedingRequired ? context.procedures : [],
+    issues: outcomeRequired ? context.issues : [],
+  };
+
   const graph = compilePropositionGraph({
     cleanedQuery,
-    context,
-    actorTerms,
-    proceedingTerms,
-    outcomeTerms: outcomeConstraint.terms,
-    outcomePolarity: outcomeConstraint.polarity,
+    context: graphContext,
+    actorTerms: graphActorTerms,
+    proceedingTerms: graphProceedingTerms,
+    outcomeTerms: graphOutcomeTerms,
+    outcomePolarity: outcomeRequired ? outcomeConstraint.polarity : "unknown",
     hookGroupCount: hookGroups.filter((group) => group.required).length,
   });
 
@@ -1267,12 +1573,96 @@ export function gateCandidateAgainstProposition(
     };
   }
 
+  const requiredHookCount = checklist.hookGroups.filter((group) => group.required).length;
+  const singleHookContextProvisional =
+    !signal.contradiction &&
+    requiredHookCount === 1 &&
+    !checklist.outcomeConstraint.required &&
+    !checklist.interactionRequired &&
+    checklist.relations.every((relation) => !relation.required) &&
+    signal.hookGroupCoverage >= 1 &&
+    signal.requiredCoverage >= 0.5 &&
+    signal.coreCoverage >= 0.5 &&
+    contextEvidenceStrength(candidate) >= 2;
+
+  if (singleHookContextProvisional) {
+    return {
+      match: "exact_provisional",
+      missingElements: signal.missingElements,
+      matchedElements: signal.matchedElements,
+      missingCoreElements: signal.missingCoreElements,
+      matchedCoreElements: signal.matchedCoreElements,
+      matchEvidence: signal.evidence,
+      contradiction: false,
+      requiredCoverage: signal.requiredCoverage,
+      coreCoverage: signal.coreCoverage,
+      peripheralCoverage: signal.peripheralCoverage,
+      hookGroupCoverage: signal.hookGroupCoverage,
+      relationSatisfied: signal.relationSatisfied,
+      outcomePolaritySatisfied: signal.outcomePolaritySatisfied,
+      polarityMismatch: signal.polarityMismatch,
+      mandatoryStepCoverage: signal.mandatoryStepCoverage,
+      chainCoverage: signal.chainCoverage,
+      actorRoleSatisfied: signal.actorRoleSatisfied,
+      proceedingRoleSatisfied: signal.proceedingRoleSatisfied,
+      chainSatisfied: signal.chainSatisfied,
+      missingMandatorySteps: signal.missingMandatorySteps,
+      matchedMandatorySteps: signal.matchedMandatorySteps,
+    };
+  }
+
+  const relaxedConsumerProvisional =
+    CONSUMER_RELAXED_GATING_V1 &&
+    !signal.contradiction &&
+    signal.coreCoverage >= 0.35 &&
+    signal.hookGroupCoverage >= 0.5 &&
+    signal.requiredCoverage >= 0.35 &&
+    signal.mandatoryStepCoverage >= 0.25 &&
+    (candidate.verification.detailChecked || contextEvidenceStrength(candidate) >= 1) &&
+    (signal.outcomePolaritySatisfied ||
+      !checklist.outcomeConstraint.required ||
+      signal.coreCoverage >= 0.6);
+
+  if (relaxedConsumerProvisional) {
+    return {
+      match: "exact_provisional",
+      missingElements: signal.missingElements,
+      matchedElements: signal.matchedElements,
+      missingCoreElements: signal.missingCoreElements,
+      matchedCoreElements: signal.matchedCoreElements,
+      matchEvidence: signal.evidence,
+      contradiction: false,
+      requiredCoverage: signal.requiredCoverage,
+      coreCoverage: signal.coreCoverage,
+      peripheralCoverage: signal.peripheralCoverage,
+      hookGroupCoverage: signal.hookGroupCoverage,
+      relationSatisfied: signal.relationSatisfied,
+      outcomePolaritySatisfied: signal.outcomePolaritySatisfied,
+      polarityMismatch: signal.polarityMismatch,
+      mandatoryStepCoverage: signal.mandatoryStepCoverage,
+      chainCoverage: signal.chainCoverage,
+      actorRoleSatisfied: signal.actorRoleSatisfied,
+      proceedingRoleSatisfied: signal.proceedingRoleSatisfied,
+      chainSatisfied: signal.chainSatisfied,
+      missingMandatorySteps: signal.missingMandatorySteps,
+      matchedMandatorySteps: signal.matchedMandatorySteps,
+    };
+  }
+
   const nearMiss =
     doctrinalNearMissEligible &&
     !signal.contradiction &&
-    signal.coreCoverage >= coreThreshold &&
-    signal.requiredCoverage >= threshold &&
-    (signal.matchedCoreElements.length > 0 || signal.matchedElements.length > 0 || signal.matchedHookGroups.length > 0);
+    ((signal.coreCoverage >= coreThreshold &&
+      signal.requiredCoverage >= threshold &&
+      (signal.matchedCoreElements.length > 0 || signal.matchedElements.length > 0 || signal.matchedHookGroups.length > 0)) ||
+      (PROPOSITION_GATE_V6_ENABLED &&
+        contextEvidenceStrength(candidate) >= 2 &&
+        signal.requiredCoverage >= Math.max(0.4, threshold - 0.2) &&
+        signal.coreCoverage >= Math.max(0.35, coreThreshold - 0.25) &&
+        signal.hookGroupCoverage >= 0.5 &&
+        (!checklist.outcomeConstraint.required ||
+          signal.outcomePolaritySatisfied ||
+          signal.coreCoverage >= 0.65)));
 
   if (nearMiss) {
     return {
@@ -1331,6 +1721,18 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
   const exact: ScoredCase[] = [];
   const nearMiss: NearMissCase[] = [];
   const unverifiedRejectBackfill: Array<{
+    enriched: ScoredCase;
+    missingElements: string[];
+    missingCoreElements: string[];
+    signalStrength: number;
+  }> = [];
+  const relatedRejectBackfill: Array<{
+    enriched: ScoredCase;
+    missingElements: string[];
+    missingCoreElements: string[];
+    signalStrength: number;
+  }> = [];
+  const relaxedRejectBackfill: Array<{
     enriched: ScoredCase;
     missingElements: string[];
     missingCoreElements: string[];
@@ -1414,7 +1816,13 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
       continue;
     }
 
-    if (result.match === "near_miss" && isExploratoryEligible({ caseItem: item, result })) {
+    if (
+      result.match === "near_miss" &&
+      isExploratoryEligible(
+        { caseItem: item, result },
+        { allowPolarityMismatch: CONSUMER_RELAXED_GATING_V1 },
+      )
+    ) {
       nearMiss.push({
         ...enriched,
         score: exploratoryScore,
@@ -1442,6 +1850,52 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
           result.coreCoverage * 0.35 +
           result.hookGroupCoverage * 0.1 +
           (result.outcomePolaritySatisfied ? 0.1 : 0),
+      });
+    }
+
+    if (
+      CONSUMER_RELAXED_GATING_V1 &&
+      result.match === "reject" &&
+      !result.contradiction &&
+      isExploratoryEligible({ caseItem: item, result }) &&
+      (result.requiredCoverage >= 0.3 ||
+        result.coreCoverage >= 0.3 ||
+        result.hookGroupCoverage >= 0.5 ||
+        result.matchedElements.length > 0 ||
+        result.matchedCoreElements.length > 0)
+    ) {
+      relaxedRejectBackfill.push({
+        enriched,
+        missingElements: result.missingElements,
+        missingCoreElements: result.missingCoreElements,
+        signalStrength:
+          result.requiredCoverage * 0.4 +
+          result.coreCoverage * 0.35 +
+          result.hookGroupCoverage * 0.15 +
+          (result.outcomePolaritySatisfied ? 0.1 : 0),
+      });
+    }
+    if (
+      CONSUMER_RELAXED_GATING_V1 &&
+      result.match === "reject" &&
+      !result.contradiction &&
+      isExploratoryEligible({ caseItem: item, result }, { allowPolarityMismatch: true }) &&
+      (result.requiredCoverage >= 0.25 ||
+        result.coreCoverage >= 0.25 ||
+        result.hookGroupCoverage >= 0.4 ||
+        result.matchedElements.length > 0 ||
+        result.matchedCoreElements.length > 0)
+    ) {
+      relatedRejectBackfill.push({
+        enriched,
+        missingElements: result.missingElements,
+        missingCoreElements: result.missingCoreElements,
+        signalStrength:
+          result.requiredCoverage * 0.4 +
+          result.coreCoverage * 0.35 +
+          result.hookGroupCoverage * 0.15 +
+          (result.outcomePolaritySatisfied ? 0.12 : 0) -
+          (result.polarityMismatch ? 0.08 : 0),
       });
     }
 
@@ -1492,6 +1946,74 @@ export function splitByProposition(rankedCases: ScoredCase[], checklist: Proposi
       }));
 
     nearMiss.push(...fallbackNearMisses);
+  }
+
+  if (
+    CONSUMER_RELAXED_GATING_V1 &&
+    nearMiss.length < CONSUMER_RELATED_BACKFILL_TARGET &&
+    relatedRejectBackfill.length > 0
+  ) {
+    const needed = Math.max(0, CONSUMER_RELATED_BACKFILL_TARGET - nearMiss.length);
+    const seenUrls = new Set([...exact.map((item) => item.url), ...nearMiss.map((item) => item.url)]);
+    const promotedNearMisses = [...relatedRejectBackfill]
+      .sort((a, b) => {
+        const aScore = a.signalStrength + (a.enriched.confidenceScore ?? a.enriched.score) * 0.35;
+        const bScore = b.signalStrength + (b.enriched.confidenceScore ?? b.enriched.score) * 0.35;
+        return bScore - aScore;
+      })
+      .filter((entry) => {
+        if (seenUrls.has(entry.enriched.url)) return false;
+        seenUrls.add(entry.enriched.url);
+        return true;
+      })
+      .slice(0, needed)
+      .map((entry) => ({
+        ...entry.enriched,
+        score: Math.min(entry.enriched.confidenceScore ?? entry.enriched.score, EXPLORATORY_CONFIDENCE_CAP),
+        confidenceScore: Math.min(entry.enriched.confidenceScore ?? entry.enriched.score, EXPLORATORY_CONFIDENCE_CAP),
+        confidenceBand: exploratoryConfidenceBand(
+          Math.min(entry.enriched.confidenceScore ?? entry.enriched.score, EXPLORATORY_CONFIDENCE_CAP),
+        ),
+        retrievalTier: "exploratory" as const,
+        missingElements: entry.missingElements,
+        missingCoreElements: entry.missingCoreElements,
+        gapSummary: entry.missingElements,
+      }));
+    if (promotedNearMisses.length > 0) {
+      nearMiss.push(...promotedNearMisses);
+    }
+  }
+
+  if (
+    CONSUMER_RELAXED_GATING_V1 &&
+    exact.length < CONSUMER_RELAXED_PROVISIONAL_TARGET &&
+    relaxedRejectBackfill.length > 0
+  ) {
+    const needed = Math.max(0, CONSUMER_RELAXED_PROVISIONAL_TARGET - exact.length);
+    const seenUrls = new Set(exact.map((item) => item.url));
+    const promoted = [...relaxedRejectBackfill]
+      .sort((a, b) => {
+        const aScore = a.signalStrength + (a.enriched.confidenceScore ?? a.enriched.score) * 0.35;
+        const bScore = b.signalStrength + (b.enriched.confidenceScore ?? b.enriched.score) * 0.35;
+        return bScore - aScore;
+      })
+      .filter((entry) => {
+        if (seenUrls.has(entry.enriched.url)) return false;
+        seenUrls.add(entry.enriched.url);
+        return true;
+      })
+      .slice(0, needed)
+      .map((entry) => ({
+        ...entry.enriched,
+        exactnessType: "provisional" as const,
+        retrievalTier: "exact_provisional" as const,
+        missingCoreElements: entry.missingCoreElements,
+        gapSummary: entry.missingElements,
+      }));
+    if (promoted.length > 0) {
+      exactProvisional.push(...promoted);
+      exact.push(...promoted);
+    }
   }
 
   const requiredElementCoverageAvg =

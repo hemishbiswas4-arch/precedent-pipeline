@@ -2,7 +2,13 @@ import { buildKeywordPackWithAI } from "@/lib/ai-keyword-planner";
 import { expandOntologySynonymsForRecall } from "@/lib/kb/legal-ontology";
 import { buildKeywordPack } from "@/lib/keywords";
 import { sanitizeNlqForSearch } from "@/lib/nlq";
-import { IntentProfile, PlannerOutput, QueryVariant } from "@/lib/pipeline/types";
+import {
+  IntentProfile,
+  PlannerOutput,
+  QueryRetrievalDirectives,
+  QueryVariant,
+  RetrievalDoctypeProfile,
+} from "@/lib/pipeline/types";
 import { ReasonerOutcomePolarity, ReasonerPlan } from "@/lib/reasoner-schema";
 import { CaseCandidate, KeywordPack, ScoredCase } from "@/lib/types";
 
@@ -15,7 +21,7 @@ type HookGroupPlan = {
 
 const HIGH_IMPACT_OUTCOME_SYNONYMS: Array<{ match: RegExp; expansions: string[] }> = [
   {
-    match: /\b(?:delay\s+not\s+condoned|condonation(?:\s+of\s+delay)?\s+(?:refused|rejected|denied|declined)|refused)\b/i,
+    match: /\b(?:delay\s+not\s+condoned|condonation(?:\s+of\s+delay)?\s+(?:refused|rejected|denied|declined))\b/i,
     expansions: [
       "condonation of delay refused",
       "application for condonation rejected",
@@ -23,7 +29,7 @@ const HIGH_IMPACT_OUTCOME_SYNONYMS: Array<{ match: RegExp; expansions: string[] 
     ],
   },
   {
-    match: /\b(?:time\s*barred|barred by limitation|appeal dismissed as time barred|dismissed)\b/i,
+    match: /\b(?:time\s*barred|barred by limitation|appeal dismissed as time barred|dismissed on limitation)\b/i,
     expansions: [
       "appeal dismissed as time barred",
       "barred by limitation",
@@ -48,6 +54,44 @@ const HIGH_IMPACT_OUTCOME_SYNONYMS: Array<{ match: RegExp; expansions: string[] 
   },
 ];
 
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (!value) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+const IK_INTENT_V2_ENABLED = parseBoolean(process.env.IK_INTENT_V2, true);
+
+function defaultDoctypeProfile(scope: QueryVariant["courtScope"]): RetrievalDoctypeProfile {
+  if (scope === "SC") return "supremecourt";
+  if (scope === "HC") return "highcourts";
+  return "judgments_sc_hc_tribunal";
+}
+
+function defaultQueryMode(
+  phase: QueryVariant["phase"],
+  strictness: QueryVariant["strictness"],
+): QueryRetrievalDirectives["queryMode"] {
+  if (strictness === "strict") return "precision";
+  if (phase === "rescue" || phase === "micro") return "context";
+  return "expansion";
+}
+
+function buildDefaultRetrievalDirectives(input: {
+  phase: QueryVariant["phase"];
+  strictness: QueryVariant["strictness"];
+  courtScope: QueryVariant["courtScope"];
+}): QueryRetrievalDirectives {
+  const queryMode = defaultQueryMode(input.phase, input.strictness);
+  return {
+    queryMode,
+    doctypeProfile: defaultDoctypeProfile(input.courtScope),
+    applyContradictionExclusions: queryMode === "precision" && !IK_INTENT_V2_ENABLED,
+  };
+}
+
 function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
@@ -71,16 +115,24 @@ function normalizePhrase(value: string): string {
     .toLowerCase();
 }
 
+function isMeaningfulToken(token: string): boolean {
+  if (!token) return false;
+  if (/^\d+$/.test(token)) return true;
+  return token.length > 1;
+}
+
 function tokenizePhrase(value: string): string[] {
-  return normalizePhrase(value).split(/\s+/).filter((token) => token.length > 1);
+  return normalizePhrase(value).split(/\s+/).filter((token) => isMeaningfulToken(token));
 }
 
 function sanitizeTokens(tokens: string[], maxWords: number): string {
-  return tokens
-    .filter((token) => token.length > 1)
-    .slice(0, maxWords)
-    .join(" ")
-    .trim();
+  const filtered = tokens.filter((token) => isMeaningfulToken(token));
+  const deduped: string[] = [];
+  for (const token of filtered) {
+    if (deduped[deduped.length - 1] === token) continue;
+    deduped.push(token);
+  }
+  return deduped.slice(0, maxWords).join(" ").trim();
 }
 
 function withCourtSuffix(phrase: string, court: "supreme court" | "high court"): string {
@@ -137,6 +189,7 @@ function buildVariant(
     mustIncludeTokens?: string[];
     mustExcludeTokens?: string[];
     providerHints?: QueryVariant["providerHints"];
+    retrievalDirectives?: QueryRetrievalDirectives;
   },
 ): QueryVariant {
   const cleaned = normalizePhrase(phrase);
@@ -158,6 +211,15 @@ function buildVariant(
     mustIncludeTokens: metadata?.mustIncludeTokens,
     mustExcludeTokens: metadata?.mustExcludeTokens,
     providerHints: metadata?.providerHints,
+    retrievalDirectives:
+      metadata?.retrievalDirectives ??
+      (IK_INTENT_V2_ENABLED
+        ? buildDefaultRetrievalDirectives({
+            phase,
+            strictness,
+            courtScope,
+          })
+        : undefined),
   };
 }
 
@@ -194,14 +256,69 @@ function expandHookTerms(term: string): string[] {
   return unique(expanded.map((value) => normalizePhrase(value)).filter(Boolean)).slice(0, 8);
 }
 
+function hasDelayCondonationContext(cleanedQuery: string, outcomeTerms: string[]): boolean {
+  const q = normalizePhrase(`${cleanedQuery} ${outcomeTerms.join(" ")}`);
+  return /\b(?:condonation(?:\s+of\s+delay)?|delay\s+condonation|section\s*5\s+limitation|limitation\s+act|time[-\s]*barred|barred\s+by\s+limitation|not\s+condon(?:ed|able)|condon(?:ed|ation|able))\b/.test(
+    q,
+  );
+}
+
+function hasLimitationContextInQuery(cleanedQuery: string): boolean {
+  const q = normalizePhrase(cleanedQuery);
+  return /\b(?:condonation|delay|limitation|time[-\s]*barred|barred\s+by\s+limitation|section\s*5)\b/.test(q);
+}
+
+function filterReasonerOutcomeTermsByContext(cleanedQuery: string, terms: string[]): string[] {
+  const limitationContext = hasLimitationContextInQuery(cleanedQuery);
+  if (limitationContext) return terms;
+  return terms.filter((term) => {
+    const normalized = normalizePhrase(term);
+    if (!normalized) return false;
+    if (
+      /\b(?:condonation|delay|time[-\s]*barred|barred\s+by\s+limitation|dismissed on limitation|dismissed as time[-\s]*barred)\b/.test(
+        normalized,
+      )
+    ) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function inferRoleCueTokens(cleanedQuery: string): string[] {
+  const q = normalizePhrase(cleanedQuery);
+  const cues: string[] = [];
+  if (/\brespondent\b/.test(q)) cues.push("respondent");
+  if (/\bappellant\b/.test(q)) cues.push("appellant");
+  if (/\bpetitioner\b/.test(q)) cues.push("petitioner");
+  if (/\brevisionist\b/.test(q)) cues.push("revisionist");
+  if (/\bcomplainant\b/.test(q)) cues.push("complainant");
+  return unique(cues);
+}
+
 function inferOutcomePolarityCue(cleanedQuery: string, outcomeTerms: string[]): string[] {
   const q = normalizePhrase(`${cleanedQuery} ${outcomeTerms.join(" ")}`);
   const cues: string[] = [];
+  const delayContext = hasDelayCondonationContext(cleanedQuery, outcomeTerms);
   if (/\bsanction\b/.test(q)) {
-    if (/\b(?:not required|no sanction required|without sanction)\b/.test(q)) {
+    const sanctionNotRequired = /\b(?:sanction\s+not\s+required|not\s+required|no\s+sanction\s+required|sanction\s+unnecessary|without\s+(?:prior|previous\s+)?sanction)\b/.test(
+      q,
+    );
+    if (
+      /\b(?:cannot|can not|not)\s+(?:continue|proceed|launch|take cognizance)[a-z\s]{0,40}\bwithout\s+sanction\b/.test(
+        q,
+      ) ||
+      /\bunless\s+(?:prior|previous)?\s*sanction\b/.test(q)
+    ) {
+      cues.push("sanction required");
+    }
+    if (sanctionNotRequired) {
       cues.push("sanction not required");
     }
-    if (/\b(?:required|mandatory|necessary|must)\b/.test(q)) {
+    if (
+      !sanctionNotRequired &&
+      /\b(?:sanction\s+required|prior\s+sanction|previous\s+sanction|mandatory\s+sanction)\b/.test(q)
+    ) {
       cues.push("sanction required");
     }
   }
@@ -212,11 +329,14 @@ function inferOutcomePolarityCue(cleanedQuery: string, outcomeTerms: string[]): 
       q,
     ) ||
     /\bcondonation(?:\s+of\s+delay)?\s+not\s+granted\b/.test(q) ||
-    /\b(?:not condoned|refused|rejected|declined)\b/.test(q)
+    (delayContext && /\b(?:not condoned|refused|rejected|declined|denied)\b/.test(q))
   ) {
     cues.push("delay not condoned");
   }
-  if (/\b(?:dismissed|time barred|barred by limitation)\b/.test(q)) {
+  if (
+    /\b(?:time barred|barred by limitation|dismissed\s+as\s+time[-\s]*barred|dismissed on limitation)\b/.test(q) ||
+    (hasLimitationContextInQuery(cleanedQuery) && /\bdismissed\b/.test(q))
+  ) {
     cues.push("appeal dismissed as time barred");
   }
   if (/\bquashed\b/.test(q)) {
@@ -235,6 +355,20 @@ function inferExpectedPolarity(
     return planPolarity;
   }
   const q = normalizePhrase(`${cleanedQuery} ${outcomeTerms.join(" ")}`);
+  if (
+    /\b(?:cannot|can not|not)\s+(?:continue|proceed|launch|take cognizance)[a-z\s]{0,40}\bwithout\s+sanction\b/.test(
+      q,
+    ) ||
+    /\bunless\s+(?:prior|previous)?\s*sanction\b/.test(q)
+  ) {
+    return "required";
+  }
+  const sanctionNotRequired = /\b(?:sanction\s+not\s+required|not\s+required|no\s+sanction\s+required|sanction\s+unnecessary|without\s+(?:prior|previous\s+)?sanction)\b/.test(
+    q,
+  );
+  if (sanctionNotRequired) {
+    return "not_required";
+  }
   if (/\b(?:appeal\s+dismissed|dismissed\s+as\s+time[-\s]*barred|barred\s+by\s+limitation|time[-\s]*barred)\b/.test(q)) {
     return "dismissed";
   }
@@ -248,10 +382,7 @@ function inferExpectedPolarity(
   if (/\bquashed\b/.test(q)) {
     return "quashed";
   }
-  if (/\b(?:sanction\s+not\s+required|no\s+sanction\s+required|without\s+sanction)\b/.test(q)) {
-    return "not_required";
-  }
-  if (/\b(?:sanction\s+required|mandatory|necessary|must)\b/.test(q)) {
+  if (/\b(?:sanction\s+required|prior\s+sanction|previous\s+sanction|mandatory\s+sanction)\b/.test(q)) {
     return "required";
   }
   return "unknown";
@@ -289,13 +420,18 @@ function expandOutcomeSynonyms(values: string[]): string[] {
 }
 
 function requiredPolarityTokens(intent: IntentProfile, reasonerPlan?: ReasonerPlan): string[] {
+  const reasonerOutcomeTerms = filterReasonerOutcomeTermsByContext(
+    intent.cleanedQuery,
+    reasonerPlan?.proposition.outcome_required ?? [],
+  );
+  const outcomeTerms = reasonerOutcomeTerms.length > 0 ? reasonerOutcomeTerms : intent.issues;
   const rawCues = inferOutcomePolarityCue(
     intent.cleanedQuery,
-    reasonerPlan?.proposition.outcome_required ?? intent.issues,
+    outcomeTerms,
   );
   const expectedPolarity = inferExpectedPolarity(
     intent.cleanedQuery,
-    reasonerPlan?.proposition.outcome_required ?? intent.issues,
+    outcomeTerms,
     reasonerPlan,
   );
   const cues = expandOutcomeSynonyms(filterPolarityCues(rawCues, expectedPolarity));
@@ -390,7 +526,7 @@ function buildLegalSignalTokenSet(intent: IntentProfile, reasonerPlan?: Reasoner
     ...(reasonerPlan?.must_have_terms ?? []),
   ]
     .flatMap((value) => tokenizePhrase(value))
-    .filter((token) => token.length > 1);
+    .filter((token) => isMeaningfulToken(token));
   return new Set(unique(bag));
 }
 
@@ -431,6 +567,10 @@ function buildPropositionStrategy(input: {
     [...intent.actors, ...intent.entities.person, ...intent.entities.org],
     intent.cleanedQuery.includes("state") ? ["state"] : [],
   );
+  const reasonerOutcomeTerms = filterReasonerOutcomeTermsByContext(
+    intent.cleanedQuery,
+    reasonerPlan?.proposition.outcome_required ?? [],
+  );
   const proceedings = axisValuesFromReasonerOrIntent(
     reasonerPlan?.proposition.proceeding,
     intent.procedures,
@@ -439,7 +579,7 @@ function buildPropositionStrategy(input: {
   const requiredHookGroups = buildRequiredHookGroups(intent, reasonerPlan);
   const hooks = representativeHooks(requiredHookGroups);
   const outcomes = axisValuesFromReasonerOrIntent(
-    reasonerPlan?.proposition.outcome_required,
+    reasonerOutcomeTerms,
     [...intent.issues, ...intent.entities.case_citation],
     [],
   );
@@ -505,7 +645,9 @@ function buildPropositionStrategy(input: {
     .filter((phrase) => {
       if (polarityCueTokens.length === 0) return true;
       const phraseTokens = tokenizePhrase(phrase);
-      return polarityCueTokens.every((token) => phraseTokens.includes(token));
+      const matched = polarityCueTokens.filter((token) => phraseTokens.includes(token)).length;
+      const minMatched = Math.min(2, Math.max(1, Math.ceil(polarityCueTokens.length * 0.35)));
+      return matched >= minMatched;
     })
     .slice(0, 24);
   const broadNormalized = unique(broad).slice(0, 32);
@@ -519,23 +661,14 @@ function buildPropositionStrategy(input: {
     actorTokens: new Set(actors.flatMap((value) => tokenizePhrase(value))),
     proceedingTokens: new Set(proceedings.flatMap((value) => tokenizePhrase(value))),
     outcomeTokens: new Set((polarityCues.length > 0 ? polarityCues : outcomes).flatMap((value) => tokenizePhrase(value))),
-    roleTokens: new Set(
-      tokenizePhrase(
-        [
-          /\brespondent\b/.test(intent.cleanedQuery) ? "respondent" : "appellant",
-          proceedings.some((value) => /\bappeal\b/i.test(value)) ? "appeal" : "",
-        ]
-          .filter(Boolean)
-          .join(" "),
-      ),
-    ),
+    roleTokens: new Set(inferRoleCueTokens(intent.cleanedQuery).flatMap((value) => tokenizePhrase(value))),
     chainTokens: new Set(
       tokenizePhrase(
         [
-          /\bcondonation|delay condonation|section 5 limitation\b/i.test(intent.cleanedQuery) ||
-          outcomes.some((value) => /condonation|delay/i.test(value))
+          hasDelayCondonationContext(intent.cleanedQuery, outcomes)
             ? "condonation delay"
             : "",
+          hasDelayCondonationContext(intent.cleanedQuery, outcomes) &&
           polarityCues.some((value) => /not condoned|refused|dismissed|time barred/i.test(value))
             ? "not condoned dismissed"
             : "",
@@ -595,6 +728,10 @@ function appendPhaseVariants(input: {
 
     const base = normalized
       .replace(/\b(?:supreme court|high court)\b/g, " ")
+      .replace(/\b(?:supreme|high)\b(?=\s*(?:$|and|or))/g, " ")
+      .replace(/\b(?:and|or)\b(?=\s*(?:$|and|or))/g, " ")
+      .replace(/[().,:;/-]+$/g, " ")
+      .replace(/\b(?:and|or|the)\b(?:\s+\b(?:and|or|the)\b)*\s*$/g, " ")
       .replace(/\s+/g, " ")
       .trim();
     const phraseCandidates =
@@ -607,13 +744,39 @@ function appendPhaseVariants(input: {
     for (const candidate of phraseCandidates) {
       const tokens = tokenizePhrase(candidate).slice(0, phase === "primary" ? 12 : 10);
       if (tokens.length < 2) continue;
-      if (enforceAllGroups && !phraseMatchesAllRequiredGroups(candidate, requiredHookGroups)) {
+      const strictHookGuard = !IK_INTENT_V2_ENABLED || (phase === "primary" && strictness === "strict");
+      if (enforceAllGroups && strictHookGuard && !phraseMatchesAllRequiredGroups(candidate, requiredHookGroups)) {
         continue;
       }
       if ((phase === "primary" || phase === "fallback") && !hasMinimumLegalSignal(tokens, legalSignalTokens)) {
         continue;
       }
       if (polarityTokens.length > 0 && strictness === "strict") {
+        const strictPolarityGuard = !IK_INTENT_V2_ENABLED || phase === "primary";
+        if (!strictPolarityGuard) {
+          // In intent-first mode, keep polarity as a scoring/gating signal, not a hard retrieval filter.
+          const explicitScope = inferExplicitCourtScope(candidate);
+          const phrase = tokens.join(" ");
+          if (phrase.length < 6 || tokens.length < 3) continue;
+          const signature = `${phase}|${phrase}`;
+          if (seen.has(signature)) continue;
+          seen.add(signature);
+          output.push(
+            buildVariant(
+              phase,
+              purpose,
+              phrase,
+              idx,
+              explicitScope === "ANY" ? courtScope : explicitScope,
+              strictness,
+              {
+                canonicalKey: `${purpose}:${phase}:${phrase}`,
+              },
+            ),
+          );
+          idx += 1;
+          continue;
+        }
         const tokenSet = new Set(tokens);
         const enforcePolarityAndHook = enforceAllGroups && doctrinalHookTokens.size > 0;
         if (enforcePolarityAndHook) {
@@ -626,6 +789,9 @@ function appendPhaseVariants(input: {
         }
       }
       if (strictness === "strict" && strictAxisRequirement?.enabled) {
+        if (IK_INTENT_V2_ENABLED && phase !== "primary") {
+          // Keep strict axis checks only on precision lane in intent-first mode.
+        } else {
         const tokenSet = new Set(tokens);
         const hasActor =
           strictAxisRequirement.actorTokens.size === 0
@@ -648,6 +814,7 @@ function appendPhaseVariants(input: {
             ? true
             : Array.from(strictAxisRequirement.chainTokens).some((token) => tokenSet.has(token));
         if (!hasActor || !hasProceeding || !hasOutcome || !hasRole || !hasChain) continue;
+        }
       }
 
       const phrase = tokens.join(" ");
@@ -685,6 +852,10 @@ function buildVariantsFromKeywordPack(input: {
   reasonerPlan?: ReasonerPlan;
 }): PlannerOutput {
   const { intent, keywordPack, plannerSource, plannerModelId, plannerError, reasonerPlan } = input;
+  const reasonerOutcomeTerms = filterReasonerOutcomeTermsByContext(
+    intent.cleanedQuery,
+    reasonerPlan?.proposition.outcome_required ?? [],
+  );
   const propositionStrategy = buildPropositionStrategy({ intent, reasonerPlan, keywordPack });
   const legalSignalTokens = buildLegalSignalTokenSet(intent, reasonerPlan);
   const requiredHookGroups = buildRequiredHookGroups(intent, reasonerPlan);
@@ -692,17 +863,20 @@ function buildVariantsFromKeywordPack(input: {
   const polarityTokens = requiredPolarityTokens(intent, reasonerPlan);
   const expectedPolarity = inferExpectedPolarity(
     intent.cleanedQuery,
-    reasonerPlan?.proposition.outcome_required ?? intent.issues,
+    reasonerOutcomeTerms.length > 0 ? reasonerOutcomeTerms : intent.issues,
     reasonerPlan,
   );
   const outcomePhrases = unique([
     ...expandOutcomeSynonyms(
       filterPolarityCues(
-        inferOutcomePolarityCue(intent.cleanedQuery, reasonerPlan?.proposition.outcome_required ?? intent.issues),
+        inferOutcomePolarityCue(
+          intent.cleanedQuery,
+          reasonerOutcomeTerms.length > 0 ? reasonerOutcomeTerms : intent.issues,
+        ),
         expectedPolarity,
       ),
     ),
-    ...(reasonerPlan?.proposition.outcome_required ?? []),
+    ...reasonerOutcomeTerms,
     ...intent.issues,
   ])
     .map((value) => sanitizeTokens(tokenizePhrase(value), 8))
@@ -867,18 +1041,23 @@ export function buildReasonerQueryVariants(input: {
   plan: ReasonerPlan;
 }): QueryVariant[] {
   const { intent, plan } = input;
+  const reasonerOutcomeTerms = filterReasonerOutcomeTermsByContext(
+    intent.cleanedQuery,
+    plan.proposition.outcome_required,
+  );
+  const effectiveOutcomeTerms = reasonerOutcomeTerms.length > 0 ? reasonerOutcomeTerms : intent.issues;
   const legalSignalTokens = buildLegalSignalTokenSet(intent, plan);
   const requiredHookGroups = buildRequiredHookGroups(intent, plan);
   const doctrinalHookTokens = doctrinalHookTokenSet(requiredHookGroups);
   const polarityTokens = requiredPolarityTokens(intent, plan);
   const expectedPolarity = inferExpectedPolarity(
     intent.cleanedQuery,
-    plan.proposition.outcome_required.length > 0 ? plan.proposition.outcome_required : intent.issues,
+    effectiveOutcomeTerms,
     plan,
   );
   const filteredPlanCues = expandOutcomeSynonyms(
     filterPolarityCues(
-      inferOutcomePolarityCue(intent.cleanedQuery, plan.proposition.outcome_required),
+      inferOutcomePolarityCue(intent.cleanedQuery, effectiveOutcomeTerms),
       expectedPolarity,
     ),
   );
@@ -895,26 +1074,27 @@ export function buildReasonerQueryVariants(input: {
     outcomeTokens: new Set(
       (filteredPlanCues.length > 0
         ? filteredPlanCues
-        : plan.proposition.outcome_required.length > 0
-          ? plan.proposition.outcome_required
+        : reasonerOutcomeTerms.length > 0
+          ? reasonerOutcomeTerms
           : intent.issues
       ).flatMap((value) => tokenizePhrase(value)),
     ),
-    roleTokens: new Set(
-      tokenizePhrase(
-        [
-          /\brespondent\b/.test(intent.cleanedQuery) ? "respondent" : "appellant",
-          /\bappeal\b/.test(intent.cleanedQuery) ? "appeal" : "",
-        ]
-          .filter(Boolean)
-          .join(" "),
-      ),
-    ),
+    roleTokens: new Set(inferRoleCueTokens(intent.cleanedQuery).flatMap((value) => tokenizePhrase(value))),
     chainTokens: new Set(
       tokenizePhrase(
         [
-          /\bcondonation|delay condonation|section 5 limitation\b/i.test(intent.cleanedQuery) ? "condonation delay" : "",
-          /\bnot condoned|refused|dismissed|time barred\b/i.test(intent.cleanedQuery) ? "not condoned dismissed" : "",
+          hasDelayCondonationContext(
+            intent.cleanedQuery,
+            effectiveOutcomeTerms,
+          )
+            ? "condonation delay"
+            : "",
+          hasDelayCondonationContext(
+            intent.cleanedQuery,
+            effectiveOutcomeTerms,
+          ) && /\bnot condoned|refused|dismissed|time barred\b/i.test(intent.cleanedQuery)
+            ? "not condoned dismissed"
+            : "",
         ]
           .filter(Boolean)
           .join(" "),
@@ -1094,6 +1274,7 @@ export function mergeCanonicalRewriteVariants(input: {
     if (candidatePriority > existingPriority) {
       merged.set(key, {
         ...candidate,
+        retrievalDirectives: candidate.retrievalDirectives ?? existing.retrievalDirectives,
         mustIncludeTokens:
           candidate.mustIncludeTokens && existing.mustIncludeTokens
             ? unique([...candidate.mustIncludeTokens, ...existing.mustIncludeTokens]).slice(0, 24)
@@ -1107,6 +1288,7 @@ export function mergeCanonicalRewriteVariants(input: {
     }
     merged.set(key, {
       ...existing,
+      retrievalDirectives: existing.retrievalDirectives ?? candidate.retrievalDirectives,
       mustIncludeTokens:
         candidate.mustIncludeTokens && existing.mustIncludeTokens
           ? unique([...existing.mustIncludeTokens, ...candidate.mustIncludeTokens]).slice(0, 24)

@@ -18,6 +18,10 @@ export type IkRawDocument = {
   permalink?: string;
   citations?: string[];
   equivalentCitations?: string[];
+  numcites?: number;
+  numcitedby?: number;
+  author?: string;
+  bench?: string;
   statutes?: string[];
   sections?: string[];
   text?: string;
@@ -74,6 +78,20 @@ function normalizeCourt(value: string | undefined): CourtLevel {
   return "UNKNOWN";
 }
 
+function isNonJudgmentSource(value: string | undefined): boolean {
+  const normalized = normalizeToken(value ?? "");
+  if (!normalized) return false;
+  return (
+    normalized.includes("act") ||
+    normalized.includes("rules") ||
+    normalized.includes("regulation") ||
+    normalized.includes("notification") ||
+    normalized.includes("ordinance") ||
+    normalized.includes("constitution") ||
+    normalized === "law"
+  );
+}
+
 function normalizeDocId(input: IkRawDocument): string {
   const docId = input.docId ?? input.documentId ?? input.id ?? input.tid;
   if (docId !== undefined && docId !== null) {
@@ -123,6 +141,10 @@ function extractStatuteTokens(input: IkRawDocument): string[] {
     bag.push("prevention of corruption act");
     bag.push("pc act");
   }
+  if (isNonJudgmentSource(input.docsource ?? input.courtName ?? input.court)) {
+    bag.push("statutory material");
+    bag.push("non judgment");
+  }
 
   return unique(
     bag
@@ -136,7 +158,10 @@ export function normalizeIkDocument(input: IkRawDocument, sourceVersion = "ik_ap
   const title = normalizeText(input.title ?? input.headline ?? "Untitled case");
   const urlCandidate = normalizeText(input.url ?? input.permalink ?? "");
   const url = urlCandidate || `https://indiankanoon.org/doc/${docId}/`;
-  const text = normalizeText(input.text ?? input.judgmentText ?? input.snippet ?? title);
+  const nonJudgmentSource = isNonJudgmentSource(input.docsource ?? input.courtName ?? input.court);
+  const text = nonJudgmentSource
+    ? normalizeText(`${title}. ${input.snippet ?? ""}. statutory material`)
+    : normalizeText(input.text ?? input.judgmentText ?? input.snippet ?? title);
 
   return {
     docId,

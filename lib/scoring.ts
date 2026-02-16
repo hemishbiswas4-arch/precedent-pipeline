@@ -195,10 +195,10 @@ export function scoreCases(
       const proposition = evaluateChecklistCoverage({ text: corpus, evidenceText }, options?.checklist);
 
       const lexicalScore =
-        blendedOverlap * 0.34 +
-        mustIncludeOverlap * 0.12 +
-        strictOverlap * 0.08 +
-        checklistOverlap * 0.06;
+        blendedOverlap * 0.16 +
+        mustIncludeOverlap * 0.08 +
+        strictOverlap * 0.05 +
+        checklistOverlap * 0.04;
       let rawScore = lexicalScore;
       const reasons: string[] = [];
 
@@ -212,45 +212,45 @@ export function scoreCases(
         reasons.push(`Strict-query overlap ${(strictOverlap * 100).toFixed(0)}%`);
       }
       if (anchorsMatched > 0) {
-        rawScore += Math.min(anchorsMatched * 0.02, 0.14);
+        rawScore += Math.min(anchorsMatched * 0.018, 0.09);
         reasons.push(`Context anchors matched: ${anchorsMatched}`);
       }
       if (issuesMatched > 0) {
-        rawScore += Math.min(issuesMatched * 0.06, 0.18);
+        rawScore += Math.min(issuesMatched * 0.05, 0.16);
         reasons.push(`Issue match count: ${issuesMatched}`);
       }
       if (proceduresMatched > 0) {
-        rawScore += Math.min(proceduresMatched * 0.05, 0.14);
+        rawScore += Math.min(proceduresMatched * 0.045, 0.12);
         reasons.push(`Procedure match count: ${proceduresMatched}`);
       }
       if (statutesMatched > 0) {
-        rawScore += Math.min(statutesMatched * 0.04, 0.12);
+        rawScore += Math.min(statutesMatched * 0.03, 0.1);
         reasons.push(`Statute/section match count: ${statutesMatched}`);
       }
 
       if (options?.checklist) {
         if (proposition.requiredCoverage > 0) {
-          rawScore += proposition.requiredCoverage * 0.2 * detailWeight;
+          rawScore += proposition.requiredCoverage * 0.26 * detailWeight;
           reasons.push(`Proposition coverage ${(proposition.requiredCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.coreCoverage > 0) {
-          rawScore += proposition.coreCoverage * 0.2 * detailWeight;
+          rawScore += proposition.coreCoverage * 0.26 * detailWeight;
           reasons.push(`Core coverage ${(proposition.coreCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.peripheralCoverage > 0) {
-          rawScore += proposition.peripheralCoverage * 0.08 * detailWeight;
+          rawScore += proposition.peripheralCoverage * 0.1 * detailWeight;
           reasons.push(`Peripheral coverage ${(proposition.peripheralCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.hookGroupCoverage > 0) {
-          rawScore += proposition.hookGroupCoverage * 0.16 * detailWeight;
+          rawScore += proposition.hookGroupCoverage * 0.2 * detailWeight;
           reasons.push(`Hook-group coverage ${(proposition.hookGroupCoverage * 100).toFixed(0)}%`);
         }
         if (proposition.relationSatisfied && options.checklist.relations.some((relation) => relation.required)) {
-          rawScore += 0.06 * detailWeight;
+          rawScore += 0.08 * detailWeight;
           reasons.push("Required hook interaction satisfied");
         }
         if (proposition.outcomePolaritySatisfied && options.checklist.outcomeConstraint.required) {
-          rawScore += 0.07 * detailWeight;
+          rawScore += 0.09 * detailWeight;
           reasons.push(`Outcome polarity matched (${options.checklist.outcomeConstraint.polarity})`);
         }
         if (proposition.matchedLabels.length > 0) {
@@ -260,19 +260,19 @@ export function scoreCases(
           reasons.push(`Missing elements: ${proposition.missingLabels.join(", ")}`);
         }
         if (!proposition.relationSatisfied && options.checklist.relations.some((relation) => relation.required)) {
-          rawScore -= 0.13;
+          rawScore -= 0.16;
           reasons.push("Required hook interaction not satisfied");
         }
         if (proposition.polarityMismatch) {
-          rawScore -= 0.2;
+          rawScore -= 0.24;
           reasons.push("Outcome polarity mismatch");
         }
         if (proposition.contradiction) {
-          rawScore -= 0.28;
+          rawScore -= 0.32;
           reasons.push("Contradiction signal present against required outcome");
         }
         if (proposition.hookGroupCoverage < 1) {
-          rawScore -= 0.08;
+          rawScore -= 0.1;
         }
       }
 
@@ -288,20 +288,20 @@ export function scoreCases(
       }
 
       if (detailChecked) {
-        rawScore += 0.03;
+        rawScore += 0.05;
         reasons.push("Detail verified evidence");
       } else {
-        rawScore -= 0.09;
+        rawScore -= 0.12;
         reasons.push("Detail not verified (down-ranked)");
       }
 
       if (typeof fusionScore === "number" && Number.isFinite(fusionScore)) {
         const boundedFusion = Math.max(0, Math.min(1, fusionScore * 8));
-        rawScore += boundedFusion * 0.08;
+        rawScore += boundedFusion * 0.06;
         reasons.push(`Hybrid fusion signal ${(boundedFusion * 100).toFixed(0)}%`);
       }
       if (typeof rerankScore === "number" && Number.isFinite(rerankScore)) {
-        rawScore += (Math.max(0, Math.min(1, rerankScore)) - 0.5) * 0.2;
+        rawScore += (Math.max(0, Math.min(1, rerankScore)) - 0.5) * 0.16;
         reasons.push(`Rerank signal ${(Math.max(0, Math.min(1, rerankScore)) * 100).toFixed(0)}%`);
       }
 
@@ -316,16 +316,36 @@ export function scoreCases(
       }
 
       if (candidate.court === "SC") {
-        rawScore += 0.05;
+        rawScore += 0.04;
         reasons.push("Supreme Court weighting");
       } else if (candidate.court === "HC") {
-        rawScore += 0.04;
+        rawScore += 0.03;
         reasons.push("High Court weighting");
       }
 
       if (typeof candidate.citedByCount === "number" && candidate.citedByCount >= 50) {
-        rawScore += Math.min(candidate.citedByCount / 8000, 0.05);
+        rawScore += Math.min(candidate.citedByCount / 3000, 0.09);
         reasons.push(`Citation influence (cited by ${candidate.citedByCount})`);
+      }
+      if (typeof candidate.citesCount === "number" && candidate.citesCount >= 20) {
+        rawScore += Math.min(candidate.citesCount / 2500, 0.04);
+        reasons.push(`Authority signal (cites ${candidate.citesCount})`);
+      }
+      if (candidate.author && candidate.author.length > 2) {
+        rawScore += 0.015;
+        reasons.push("Author/judge metadata matched");
+      }
+      if (candidate.bench && candidate.bench.length > 2) {
+        rawScore += 0.015;
+        reasons.push("Bench metadata matched");
+      }
+      if (
+        candidate.evidenceQuality?.hasRelationSentence ||
+        candidate.evidenceQuality?.hasPolaritySentence ||
+        candidate.evidenceQuality?.hasHookIntersectionSentence
+      ) {
+        rawScore += 0.03;
+        reasons.push("Evidence-window authority signal");
       }
 
       const centered = (rawScore - 0.45) * 3.1;

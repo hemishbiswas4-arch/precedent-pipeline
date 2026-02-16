@@ -18,10 +18,16 @@ const ATTEMPT_FETCH_TIMEOUT_CAP_MS = Math.max(
   1_400,
   Number(process.env.ATTEMPT_FETCH_TIMEOUT_CAP_MS ?? "3500"),
 );
-const PRIMARY_MAX_PAGES = Math.max(1, Math.min(Number(process.env.PRIMARY_MAX_PAGES ?? "1"), 2));
+const DEFAULT_PRIMARY_MAX_PAGES = Math.max(1, Math.min(Number(process.env.PRIMARY_MAX_PAGES ?? "2"), 3));
+const DEFAULT_FALLBACK_MAX_PAGES = Math.max(1, Math.min(Number(process.env.FALLBACK_MAX_PAGES ?? "2"), 3));
+const DEFAULT_OTHER_MAX_PAGES = Math.max(1, Math.min(Number(process.env.OTHER_MAX_PAGES ?? "1"), 2));
 const ADAPTIVE_VARIANT_SCHEDULER_ENABLED = (() => {
   const raw = (process.env.ADAPTIVE_VARIANT_SCHEDULER ?? "1").trim().toLowerCase();
   return !["0", "false", "no", "off"].includes(raw);
+})();
+const RAW_CANDIDATE_EARLY_STOP_ENABLED = (() => {
+  const raw = (process.env.SCHEDULER_STOP_ON_RAW_CANDIDATE_TARGET ?? "0").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(raw);
 })();
 
 function sleep(ms: number): Promise<void> {
@@ -494,19 +500,37 @@ export async function runRetrievalSchedule(input: {
       );
       const dynamicMax429Retries =
         remainingBeforeAttempt < perAttemptTimeoutMs + 3_000 ? 0 : (config.max429Retries ?? 1);
-      const successfulAttemptsSoFar = attempts.some((attempt) => attempt.ok && attempt.parsedCount > 0);
-      const allowLateExtraPage =
-        (phase === "rescue" || phase === "browse") &&
-        remainingBeforeAttempt > 3_500 &&
-        !successfulAttemptsSoFar;
-      const maxPages = phase === "primary" ? PRIMARY_MAX_PAGES : allowLateExtraPage ? 2 : 1;
+      const maxPagesPolicy = config.maxPagesByPhase;
+      const maxPages =
+        phase === "primary"
+          ? maxPagesPolicy?.primary ?? DEFAULT_PRIMARY_MAX_PAGES
+          : phase === "fallback"
+            ? maxPagesPolicy?.fallback ?? DEFAULT_FALLBACK_MAX_PAGES
+            : maxPagesPolicy?.other ?? DEFAULT_OTHER_MAX_PAGES;
+      const contradictionExclusionsEnabled =
+        variant.retrievalDirectives?.applyContradictionExclusions !== false;
+      const providerHints = contradictionExclusionsEnabled
+        ? variant.providerHints
+        : {
+            ...variant.providerHints,
+            excludeTerms: undefined,
+          };
+      const queryMode = variant.retrievalDirectives?.queryMode;
+      const maxResultsPerPhrase =
+        provider.id === "serper"
+          ? queryMode === "expansion"
+            ? 20
+            : queryMode === "context"
+              ? 18
+              : 16
+          : 14;
       let delayMs = 80 + Math.floor(Math.random() * 80);
       const canonicalKey = canonicalVariantKey(variant);
       try {
         const result = await provider.search({
           phrase,
           courtScope: variant.courtScope,
-          maxResultsPerPhrase: 14,
+          maxResultsPerPhrase,
           maxPages,
           courtType,
           fromDate,
@@ -519,8 +543,15 @@ export async function runRetrievalSchedule(input: {
           cooldownScope,
           compiledQuery: variant.providerHints?.compiledQuery,
           includeTokens: variant.mustIncludeTokens,
-          excludeTokens: variant.mustExcludeTokens,
-          providerHints: variant.providerHints,
+          excludeTokens: contradictionExclusionsEnabled ? variant.mustExcludeTokens : undefined,
+          providerHints,
+          queryMode,
+          doctypeProfile: variant.retrievalDirectives?.doctypeProfile,
+          titleTerms: variant.retrievalDirectives?.titleTerms,
+          citeTerms: variant.retrievalDirectives?.citeTerms,
+          authorTerms: variant.retrievalDirectives?.authorTerms,
+          benchTerms: variant.retrievalDirectives?.benchTerms,
+          categoryExpansions: variant.retrievalDirectives?.categoryExpansions,
           variantPriority: variant.priority,
         });
         const utilityStats = computeAttemptUtility({
@@ -543,6 +574,7 @@ export async function runRetrievalSchedule(input: {
         attempts.push({
           providerId: provider.id,
           sourceLabel: result.debug.sourceTag,
+          queryMode: variant.retrievalDirectives?.queryMode ?? result.debug.queryMode,
           phase,
           courtScope: variant.courtScope,
           variantId: variant.id,
@@ -578,6 +610,10 @@ export async function runRetrievalSchedule(input: {
           fusionLatencyMs: result.debug.fusionLatencyMs,
           docFragmentHydrationMs: result.debug.docFragmentHydrationMs,
           docFragmentCalls: result.debug.docFragmentCalls,
+          categoryExpansionCount: result.debug.categoryExpansionCount,
+          docmetaHydrationMs: result.debug.docmetaHydrationMs,
+          docmetaCalls: result.debug.docmetaCalls,
+          docmetaHydrated: result.debug.docmetaHydrated,
           error: null,
         });
 
@@ -646,6 +682,7 @@ export async function runRetrievalSchedule(input: {
           attempts.push({
             providerId: provider.id,
             sourceLabel: debug.sourceTag,
+            queryMode: variant.retrievalDirectives?.queryMode ?? debug.queryMode,
             phase,
             courtScope: variant.courtScope,
             variantId: variant.id,
@@ -679,6 +716,10 @@ export async function runRetrievalSchedule(input: {
             fusedCandidateCount: debug.fusedCandidateCount,
             rerankApplied: debug.rerankApplied,
             fusionLatencyMs: debug.fusionLatencyMs,
+            categoryExpansionCount: debug.categoryExpansionCount,
+            docmetaHydrationMs: debug.docmetaHydrationMs,
+            docmetaCalls: debug.docmetaCalls,
+            docmetaHydrated: debug.docmetaHydrated,
             error: errorMessage,
           });
           if (debug.blockedType === "local_cooldown") {
@@ -745,6 +786,7 @@ export async function runRetrievalSchedule(input: {
                 : provider.id === "indiankanoon_html"
                   ? "lexical_html"
                   : "web_search",
+            queryMode: variant.retrievalDirectives?.queryMode,
             phase,
             courtScope: variant.courtScope,
             variantId: variant.id,
@@ -785,7 +827,7 @@ export async function runRetrievalSchedule(input: {
       }
 
       const deduped = dedupeCases(allCandidates);
-      if (config.stopOnCandidateTarget !== false) {
+      if (config.stopOnCandidateTarget !== false && RAW_CANDIDATE_EARLY_STOP_ENABLED) {
         const likelyCaseCandidates = deduped.filter((candidate) => classifyCandidate(candidate).kind === "case");
         const likelyCases = likelyCaseCandidates.length;
         const scCount = likelyCaseCandidates.filter((candidate) => candidate.court === "SC").length;

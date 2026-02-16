@@ -63,6 +63,8 @@ const PROCEDURE_TERMS: Array<{ label: string; terms: string[] }> = [
   { label: "appeal against acquittal", terms: ["appeal against acquittal", "leave to appeal", "section 378"] },
   { label: "delay condonation application", terms: ["condonation", "delay condonation", "section 5 limitation"] },
   { label: "revision", terms: ["revision"] },
+  { label: "discharge", terms: ["discharge", "section 227 crpc"] },
+  { label: "framing of charge", terms: ["framing of charge", "frame charge", "charge framed", "section 228 crpc"] },
   { label: "writ petition", terms: ["writ petition", "article 226", "article 32"] },
   { label: "section 482 crpc", terms: ["section 482 crpc", "quashing"] },
   { label: "investigation", terms: ["investigation", "enquiry", "inquiry"] },
@@ -105,6 +107,46 @@ const ISSUE_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
   {
     label: "delay condoned",
     pattern: /\bdelay\s+(?:has|was|is|had)?\s*(?:been\s+)?condoned\b/gi,
+  },
+  {
+    label: "discharge",
+    pattern: /\b(?:order\s+of\s+)?discharge\b/gi,
+  },
+  {
+    label: "refused to interfere",
+    pattern: /\b(?:refused|declined|not\s+inclined)\s+to\s+interfere\b/gi,
+  },
+  {
+    label: "discharge upheld",
+    pattern: /\b(?:upheld|affirmed|confirmed)\s+(?:the\s+)?(?:order\s+of\s+)?discharge\b/gi,
+  },
+  {
+    label: "framing of charge",
+    pattern: /\bframing\s+of\s+charge\b|\bcharge\s+(?:was\s+)?framed\b|\bframe\s+charge\b/gi,
+  },
+  {
+    label: "quashing of proceedings",
+    pattern: /\b(?:quash|quashing)\s+(?:of\s+)?(?:fir|f\.?i\.?r\.?|proceedings?|complaint)\b/gi,
+  },
+  {
+    label: "civil nature allegations",
+    pattern: /\b(?:civil\s+in\s+nature|civil\s+dispute|purely\s+civil)\b/gi,
+  },
+  {
+    label: "road accident",
+    pattern: /\b(?:road\s+accident|motor(?:\s+vehicle)?\s+accident)\b/gi,
+  },
+  {
+    label: "rash and negligent driving",
+    pattern: /\b(?:rash\s+and\s+negligent\s+driving|rash\s+driving|negligent\s+driving)\b/gi,
+  },
+  {
+    label: "drunken driving",
+    pattern: /\b(?:drunk(?:en)?\s+driving|driving\s+under\s+the\s+influence)\b/gi,
+  },
+  {
+    label: "knowledge versus negligence",
+    pattern: /\bknowledge\s+(?:versus|vs\.?|v\.?)\s+negligence\b/gi,
   },
   {
     label: "condonation granted",

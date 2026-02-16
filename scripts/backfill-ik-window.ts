@@ -46,6 +46,26 @@ function runBackfillPreflight(): void {
   }
 }
 
+function progressiveDomainQueries(baseQuery: string): string[] {
+  const queries = [
+    baseQuery,
+    "section 197 crpc sanction section 19 prevention of corruption act",
+    "delay condonation refused limitation act section 5",
+    "appeal dismissed as time barred prosecution appeal",
+    "section 482 crpc quashing criminal proceedings",
+    "tribunal appeal limitation condonation",
+  ];
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const query of queries) {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    output.push(query.trim());
+  }
+  return output;
+}
+
 async function main(): Promise<void> {
   runBackfillPreflight();
   const startYear = Number(process.env.IK_BACKFILL_START_YEAR ?? "2016");
@@ -56,6 +76,9 @@ async function main(): Promise<void> {
     );
   }
   const reverse = parseBoolean(process.env.IK_BACKFILL_REVERSE, true);
+  const progressiveCoverage = parseBoolean(process.env.IK_PROGRESSIVE_INDEX_V2, true);
+  const baseQuery = process.env.IK_API_INDEX_QUERY ?? "judgment";
+  const queries = progressiveCoverage ? progressiveDomainQueries(baseQuery) : [baseQuery];
 
   const years: number[] = [];
   for (let year = startYear; year <= endYear; year += 1) {
@@ -72,7 +95,8 @@ async function main(): Promise<void> {
     const result = await runIndexJob({
       fromDate,
       toDate,
-      query: process.env.IK_API_INDEX_QUERY ?? "judgment",
+      query: baseQuery,
+      queries,
       maxPages: Number(process.env.IK_API_INDEX_MAX_PAGES ?? "12"),
     });
 

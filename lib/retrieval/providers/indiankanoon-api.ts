@@ -8,6 +8,10 @@ import {
   RetrievalSearchResult,
 } from "@/lib/retrieval/providers/types";
 
+const IK_API_STRUCTURED_QUERY_V2_ENABLED = parseBoolean(process.env.IK_API_STRUCTURED_QUERY_V2, true);
+const IK_CATEGORY_EXPANSION_V1_ENABLED = parseBoolean(process.env.IK_CATEGORY_EXPANSION_V1, true);
+const IK_DOCMETA_ENRICH_V1_ENABLED = parseBoolean(process.env.IK_DOCMETA_ENRICH_V1, true);
+
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (!value) return fallback;
   const normalized = value.trim().toLowerCase();
@@ -60,47 +64,102 @@ function quoteTerm(value: string): string {
   return normalized;
 }
 
-function buildFormInput(input: RetrievalSearchInput): string {
+function buildFormInput(
+  input: RetrievalSearchInput,
+  options?: {
+    categoryExpansions?: string[];
+  },
+): string {
   const base = normalizeTerm(input.compiledQuery?.trim() || input.phrase.trim()).toLowerCase();
+  const baseTokenCount = base.split(/\s+/).filter(Boolean).length;
+  const includeLimit =
+    input.queryMode === "precision"
+      ? baseTokenCount >= 8
+        ? 3
+        : 5
+      : 6;
   const includeTerms = uniqueTerms(
     [
       ...(input.providerHints?.canonicalOrderTerms ?? []),
       ...(input.providerHints?.serperQuotedTerms ?? []),
+      ...(input.titleTerms ?? []),
+      ...(input.citeTerms ?? []),
+      ...(input.authorTerms ?? []),
+      ...(input.benchTerms ?? []),
       ...(input.includeTokens ?? []),
     ],
-    6,
+    includeLimit,
   );
   const excludeTerms = uniqueTerms(
     [
       ...(input.excludeTokens ?? []),
       ...(input.providerHints?.excludeTerms ?? []),
     ],
-    5,
+    input.queryMode === "precision" ? 3 : 5,
   );
+  const expansionTerms = uniqueTerms(
+    [
+      ...(input.categoryExpansions ?? []),
+      ...(options?.categoryExpansions ?? []),
+    ],
+    4,
+  );
+
+  if (!IK_API_STRUCTURED_QUERY_V2_ENABLED) {
+    const legacyClauses: string[] = [];
+    if (base) legacyClauses.push(base);
+    for (const term of includeTerms) {
+      const quoted = quoteTerm(term);
+      if (quoted && !base.includes(term)) legacyClauses.push(quoted);
+    }
+    let query = legacyClauses.length > 0 ? legacyClauses.join(" ANDD ") : base;
+    for (const term of excludeTerms) {
+      const quoted = quoteTerm(term);
+      if (!quoted) continue;
+      query = query.length > 0 ? `${query} ANDD NOTT ${quoted}` : `NOTT ${quoted}`;
+    }
+    return query.trim() || base || input.phrase.trim();
+  }
 
   const clauses: string[] = [];
   if (base) clauses.push(base);
   for (const term of includeTerms) {
-    const quoted = quoteTerm(term);
-    if (quoted && !base.includes(term)) clauses.push(quoted);
+    if (!term || base.includes(term)) continue;
+    clauses.push(term);
   }
 
-  let query = clauses.length > 0 ? clauses.join(" ANDD ") : base;
-  for (const term of excludeTerms) {
-    const quoted = quoteTerm(term);
-    if (!quoted) continue;
-    query = query.length > 0 ? `${query} ANDD NOTT ${quoted}` : `NOTT ${quoted}`;
+  let query = clauses.join(" ").replace(/\s+/g, " ").trim();
+  if (input.queryMode === "expansion" && expansionTerms.length > 0) {
+    const expansionExpr = expansionTerms.map(quoteTerm).filter(Boolean).join(" ORR ");
+    if (expansionExpr) {
+      query = query.length > 0 ? `${query} ORR ${expansionExpr}` : expansionExpr;
+    }
+  }
+
+  const shouldApplyNot =
+    input.queryMode === "precision" &&
+    (input.includeTokens?.length ?? 0) >= 2 &&
+    excludeTerms.length > 0;
+  if (shouldApplyNot) {
+    for (const term of excludeTerms) {
+      const quoted = quoteTerm(term);
+      if (!quoted) continue;
+      query = query.length > 0 ? `${query} ANDD NOTT ${quoted}` : `NOTT ${quoted}`;
+    }
   }
 
   return query.trim() || base || input.phrase.trim();
 }
 
 function resolveDoctypes(input: RetrievalSearchInput): string | undefined {
+  if (input.doctypeProfile === "judgments_sc_hc_tribunal") return "supremecourt,highcourts,tribunals";
+  if (input.doctypeProfile === "supremecourt") return "supremecourt";
+  if (input.doctypeProfile === "highcourts") return "highcourts";
   if (input.courtType === "supremecourt") return "supremecourt";
   if (input.courtType === "highcourts") return "highcourts";
   if (input.courtScope === "SC") return "supremecourt";
   if (input.courtScope === "HC") return "highcourts";
-  return undefined;
+  return "supremecourt,highcourts,tribunals";
 }
 
 function extractDocId(url: string | undefined): string | undefined {
@@ -121,11 +180,56 @@ const DOCFRAGMENT_MIN_SNIPPET_CHARS = Math.max(
   16,
   Math.min(Number(process.env.IK_API_DOCFRAGMENT_MIN_SNIPPET_CHARS ?? "48"), 220),
 );
+const DOCMETA_TOP_N = Math.max(0, Math.min(Number(process.env.IK_API_DOCMETA_TOP_N ?? "4"), 12));
+const DOCMETA_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number(process.env.IK_API_DOCMETA_CONCURRENCY ?? "2"), 6),
+);
+const DOCMETA_TIMEOUT_MS = Math.max(
+  400,
+  Math.min(Number(process.env.IK_API_DOCMETA_TIMEOUT_MS ?? "1200"), 3500),
+);
 const HYBRID_SHADOW_CAPTURE = parseBoolean(process.env.HYBRID_SHADOW_CAPTURE, true);
 const HYBRID_SHADOW_TIMEOUT_MS = Math.max(
   100,
   Math.min(Number(process.env.HYBRID_SHADOW_TIMEOUT_MS ?? "900"), 2500),
 );
+
+function parseCategoryTerms(value: unknown): string[] {
+  const output: string[] = [];
+  const pushValue = (raw: unknown): void => {
+    if (typeof raw !== "string") return;
+    const normalized = normalizeTerm(raw).toLowerCase();
+    if (!normalized || output.includes(normalized)) return;
+    output.push(normalized);
+  };
+
+  if (Array.isArray(value)) {
+    for (const row of value) {
+      if (typeof row === "string") {
+        pushValue(row);
+        continue;
+      }
+      if (row && typeof row === "object") {
+        const payload = row as Record<string, unknown>;
+        pushValue(payload.name);
+        pushValue(payload.label);
+        pushValue(payload.category);
+      }
+    }
+  } else if (value && typeof value === "object") {
+    const payload = value as Record<string, unknown>;
+    for (const entry of Object.values(payload)) {
+      if (Array.isArray(entry)) {
+        for (const item of entry) pushValue(item);
+      } else {
+        pushValue(entry);
+      }
+    }
+  }
+
+  return output.slice(0, 6);
+}
 
 function classifyDocSource(value: string | undefined): "judgment" | "non_judgment" | "unknown" {
   if (!value) return "unknown";
@@ -165,6 +269,19 @@ function shouldSkipDocFragment(input: {
     return true;
   }
   return classifyDocSource(input.docSource) === "non_judgment";
+}
+
+function isStatutoryTitleLike(title: string): boolean {
+  const normalized = normalizeTerm(title).toLowerCase();
+  if (!normalized) return false;
+  if (/\b v(?:s\.?|\.?) \b/.test(normalized)) return false;
+  return (
+    /\bact,\s*\d{4}\b/.test(normalized) ||
+    /\brules,\s*\d{4}\b/.test(normalized) ||
+    /\bcode,\s*\d{4}\b/.test(normalized) ||
+    /\bconstitution of india\b/.test(normalized) ||
+    /\bregulation\b/.test(normalized)
+  );
 }
 
 async function runWithConcurrency<T>(
@@ -211,6 +328,7 @@ async function settleWithTimeout<T>(
 async function enrichWithDocFragments(
   client: IndianKanoonApiClient,
   formInput: string,
+  queryMode: RetrievalSearchInput["queryMode"],
   cases: RetrievalSearchResult["cases"],
   docSourceByDocId: Map<string, string | undefined>,
 ): Promise<{
@@ -218,7 +336,13 @@ async function enrichWithDocFragments(
   docFragmentHydrationMs: number;
   docFragmentCalls: number;
 }> {
-  if (DOCFRAGMENT_TOP_N <= 0 || formInput.length < 3 || cases.length === 0) {
+  const effectiveTopN =
+    queryMode === "precision"
+      ? Math.max(DOCFRAGMENT_TOP_N, 6)
+      : queryMode === "context"
+        ? Math.max(DOCFRAGMENT_TOP_N, 4)
+        : DOCFRAGMENT_TOP_N;
+  if (effectiveTopN <= 0 || formInput.length < 3 || cases.length === 0) {
     return {
       cases,
       docFragmentHydrationMs: 0,
@@ -233,7 +357,7 @@ async function enrichWithDocFragments(
     item: RetrievalSearchResult["cases"][number];
   }> = [];
 
-  for (let i = 0; i < Math.min(DOCFRAGMENT_TOP_N, out.length); i += 1) {
+  for (let i = 0; i < Math.min(effectiveTopN, out.length); i += 1) {
     const item = out[i];
     const docId = extractDocId(item.url) ?? extractDocId(item.fullDocumentUrl);
     if (!docId) continue;
@@ -277,6 +401,84 @@ async function enrichWithDocFragments(
   };
 }
 
+async function enrichWithDocMeta(
+  client: IndianKanoonApiClient,
+  queryMode: RetrievalSearchInput["queryMode"],
+  cases: RetrievalSearchResult["cases"],
+): Promise<{
+  cases: RetrievalSearchResult["cases"];
+  docmetaHydrationMs: number;
+  docmetaCalls: number;
+  docmetaHydrated: number;
+}> {
+  if (!IK_DOCMETA_ENRICH_V1_ENABLED || DOCMETA_TOP_N <= 0 || cases.length === 0) {
+    return {
+      cases,
+      docmetaHydrationMs: 0,
+      docmetaCalls: 0,
+      docmetaHydrated: 0,
+    };
+  }
+
+  const effectiveTopN = queryMode === "precision" ? Math.max(DOCMETA_TOP_N, 6) : DOCMETA_TOP_N;
+  const out = [...cases];
+  const targets: Array<{ index: number; docId: string; item: RetrievalSearchResult["cases"][number] }> = [];
+  for (let i = 0; i < Math.min(effectiveTopN, out.length); i += 1) {
+    const item = out[i];
+    const docId = extractDocId(item.url) ?? extractDocId(item.fullDocumentUrl);
+    if (!docId) continue;
+    targets.push({ index: i, docId, item });
+  }
+  if (targets.length === 0) {
+    return {
+      cases: out,
+      docmetaHydrationMs: 0,
+      docmetaCalls: 0,
+      docmetaHydrated: 0,
+    };
+  }
+
+  const startedAt = Date.now();
+  let docmetaCalls = 0;
+  let docmetaHydrated = 0;
+  await runWithConcurrency(targets, DOCMETA_CONCURRENCY, async (target) => {
+    docmetaCalls += 1;
+    const metaSettled = await settleWithTimeout(client.fetchDocMeta(target.docId), DOCMETA_TIMEOUT_MS);
+    if (!metaSettled.ok) return;
+    const meta = metaSettled.value;
+    const citesCount =
+      typeof meta.numcites === "number"
+        ? meta.numcites
+        : Array.isArray(meta.citations)
+          ? meta.citations.length
+          : target.item.citesCount;
+    const citedByCount =
+      typeof meta.numcitedby === "number"
+        ? meta.numcitedby
+        : Array.isArray(meta.equivalentCitations)
+          ? meta.equivalentCitations.length
+          : target.item.citedByCount;
+    const author = normalizeTerm(meta.author ?? "");
+    const bench = normalizeTerm(meta.bench ?? "");
+
+    out[target.index] = {
+      ...target.item,
+      author: author || target.item.author,
+      bench: bench || target.item.bench,
+      citesCount,
+      citedByCount,
+    };
+    docmetaHydrated += 1;
+  });
+
+  return {
+    cases: out,
+    docmetaHydrationMs: Math.max(0, Date.now() - startedAt),
+    docmetaCalls,
+    docmetaHydrated,
+  };
+}
+
 function withShadowTelemetry(
   lexicalResult: RetrievalSearchResult,
   shadowResult: RetrievalSearchResult | undefined,
@@ -295,6 +497,12 @@ function withShadowTelemetry(
       fusedCandidateCount: fusedCount,
       rerankApplied: shadowResult?.debug.rerankApplied ?? false,
       fusionLatencyMs: shadowResult?.debug.fusionLatencyMs,
+      queryMode: lexicalResult.debug.queryMode ?? shadowResult?.debug.queryMode,
+      categoryExpansionCount:
+        lexicalResult.debug.categoryExpansionCount ?? shadowResult?.debug.categoryExpansionCount,
+      docmetaHydrationMs: lexicalResult.debug.docmetaHydrationMs,
+      docmetaCalls: lexicalResult.debug.docmetaCalls,
+      docmetaHydrated: lexicalResult.debug.docmetaHydrated,
     },
   };
 }
@@ -320,6 +528,7 @@ const ikApiLexicalProvider: RetrievalProvider = {
       });
     }
 
+    const queryMode = input.queryMode ?? "context";
     const formInput = buildFormInput(input);
     const doctypes = resolveDoctypes(input);
 
@@ -331,12 +540,75 @@ const ikApiLexicalProvider: RetrievalProvider = {
         doctypes,
         fromdate: input.fromDate,
         todate: input.toDate,
+        title: input.titleTerms?.slice(0, 2).join(" "),
+        cite: input.citeTerms?.[0],
+        author: input.authorTerms?.[0],
+        bench: input.benchTerms?.[0],
         maxcites: Math.max(0, Math.min(Number(process.env.IK_API_MAXCITES ?? "0"), 50)),
       });
+      let mergedRows = [...response.rows];
+      let categoryExpansionCount = 0;
+      const discoveredCategoryTerms = parseCategoryTerms(response.categories);
+      const categoryTerms = uniqueTerms(
+        [
+          ...(input.categoryExpansions ?? []),
+          ...discoveredCategoryTerms,
+        ],
+        4,
+      );
+      const shouldExpandByCategory =
+        IK_CATEGORY_EXPANSION_V1_ENABLED &&
+        queryMode !== "precision" &&
+        categoryTerms.length > 0 &&
+        response.rows.length < Math.max(8, input.maxResultsPerPhrase);
+      if (shouldExpandByCategory) {
+        const expansionFormInput = buildFormInput(
+          {
+            ...input,
+            queryMode: "expansion",
+            categoryExpansions: categoryTerms,
+          },
+          {
+            categoryExpansions: categoryTerms,
+          },
+        );
+        if (expansionFormInput && expansionFormInput !== formInput) {
+          const expansionResponse = await client.search({
+            formInput: expansionFormInput,
+            pagenum: 0,
+            maxpages: Math.max(1, Math.min(input.maxPages, 1000)),
+            doctypes,
+            fromdate: input.fromDate,
+            todate: input.toDate,
+            title: input.titleTerms?.slice(0, 2).join(" "),
+            cite: input.citeTerms?.[0],
+            author: input.authorTerms?.[0],
+            bench: input.benchTerms?.[0],
+            maxcites: Math.max(0, Math.min(Number(process.env.IK_API_MAXCITES ?? "0"), 50)),
+          });
+          const dedupedByDoc = new Map<string, (typeof mergedRows)[number]>();
+          for (const row of [...mergedRows, ...expansionResponse.rows]) {
+            const key = String(row.docId ?? row.documentId ?? row.id ?? row.tid ?? row.url ?? "").trim();
+            if (!key) continue;
+            if (!dedupedByDoc.has(key)) dedupedByDoc.set(key, row);
+          }
+          mergedRows = Array.from(dedupedByDoc.values());
+          categoryExpansionCount = categoryTerms.length;
+        }
+      }
 
-      const normalizedDocs = normalizeIkDocuments(response.rows, "ik_api_v1");
+      const normalizedDocs = normalizeIkDocuments(mergedRows, "ik_api_v1");
       const docSourceByDocId = new Map<string, string | undefined>();
-      for (const row of response.rows) {
+      const rowMetaByDocId = new Map<
+        string,
+        {
+          author?: string;
+          bench?: string;
+          numcites?: number;
+          numcitedby?: number;
+        }
+      >();
+      for (const row of mergedRows) {
         const docIdCandidate = row.docId ?? row.documentId ?? row.id ?? row.tid;
         if (docIdCandidate === undefined || docIdCandidate === null) continue;
         const docId = String(docIdCandidate).trim();
@@ -347,8 +619,15 @@ const ikApiLexicalProvider: RetrievalProvider = {
             ? row.court
             : undefined;
         docSourceByDocId.set(docId, docSource);
+        rowMetaByDocId.set(docId, {
+          author: typeof row.author === "string" ? row.author : undefined,
+          bench: typeof row.bench === "string" ? row.bench : undefined,
+          numcites: typeof row.numcites === "number" ? row.numcites : undefined,
+          numcitedby: typeof row.numcitedby === "number" ? row.numcitedby : undefined,
+        });
       }
       const baseCases = normalizedDocs.map((doc) => ({
+        ...(rowMetaByDocId.get(doc.docId) ?? {}),
         source: "indiankanoon" as const,
         title: doc.title,
         url: doc.url,
@@ -360,22 +639,38 @@ const ikApiLexicalProvider: RetrievalProvider = {
           sourceVersion: doc.sourceVersion,
         },
       }));
-      const enriched = await enrichWithDocFragments(client, formInput, baseCases, docSourceByDocId);
+      const judgmentFocusedCases = baseCases.filter((candidate) => {
+        const docId = extractDocId(candidate.url) ?? extractDocId(candidate.fullDocumentUrl);
+        const docSource = docId ? docSourceByDocId.get(docId) : undefined;
+        if (classifyDocSource(docSource) === "non_judgment") return false;
+        if (isStatutoryTitleLike(candidate.title)) return false;
+        return true;
+      });
+      const lexicalCases = judgmentFocusedCases.length > 0 ? judgmentFocusedCases : baseCases;
+      const enriched = await enrichWithDocFragments(
+        client,
+        formInput,
+        queryMode,
+        lexicalCases,
+        docSourceByDocId,
+      );
+      const docmetaEnriched = await enrichWithDocMeta(client, queryMode, enriched.cases);
 
       return {
-        cases: enriched.cases,
+        cases: docmetaEnriched.cases,
         debug: {
           searchQuery: formInput,
+          queryMode,
           status: response.status,
           ok: true,
-          parsedCount: enriched.cases.length,
+          parsedCount: docmetaEnriched.cases.length,
           parserMode: "ik_api",
           pagesScanned: Math.max(1, Math.min(input.maxPages, 1000)),
-          pageCaseCounts: [enriched.cases.length],
+          pageCaseCounts: [docmetaEnriched.cases.length],
           nextPageDetected: false,
-          rawParsedCount: response.rows.length,
+          rawParsedCount: mergedRows.length,
           excludedStatuteCount: 0,
-          excludedWeakCount: Math.max(0, response.rows.length - enriched.cases.length),
+          excludedWeakCount: Math.max(0, mergedRows.length - docmetaEnriched.cases.length),
           cloudflareDetected: false,
           challengeDetected: false,
           retryAfterMs: response.retryAfterMs,
@@ -383,6 +678,12 @@ const ikApiLexicalProvider: RetrievalProvider = {
           docFragmentHydrationMs:
             enriched.docFragmentHydrationMs > 0 ? enriched.docFragmentHydrationMs : undefined,
           docFragmentCalls: enriched.docFragmentCalls > 0 ? enriched.docFragmentCalls : undefined,
+          categoryExpansionCount: categoryExpansionCount > 0 ? categoryExpansionCount : undefined,
+          docmetaHydrationMs:
+            docmetaEnriched.docmetaHydrationMs > 0 ? docmetaEnriched.docmetaHydrationMs : undefined,
+          docmetaCalls: docmetaEnriched.docmetaCalls > 0 ? docmetaEnriched.docmetaCalls : undefined,
+          docmetaHydrated:
+            docmetaEnriched.docmetaHydrated > 0 ? docmetaEnriched.docmetaHydrated : undefined,
         },
       };
     } catch (error) {
@@ -399,6 +700,7 @@ const ikApiLexicalProvider: RetrievalProvider = {
             : "ik_api_failed";
       throw new RetrievalProviderError(message, {
         searchQuery: formInput,
+        queryMode,
         status,
         ok: false,
         parsedCount: 0,
@@ -418,7 +720,10 @@ export const indianKanoonApiProvider: RetrievalProvider = {
   id: "indiankanoon_api",
   supportsDetailFetch: true,
   async search(input: RetrievalSearchInput): Promise<RetrievalSearchResult> {
-    const hybridEnabled = parseBoolean(process.env.HYBRID_RETRIEVAL_V1, false);
+    const hybridEnabled = parseBoolean(
+      process.env.HYBRID_RETRIEVAL_V2,
+      parseBoolean(process.env.HYBRID_RETRIEVAL_V1, true),
+    );
     if (hybridEnabled) {
       try {
         return await runHybridSearch({
@@ -448,4 +753,10 @@ export const indianKanoonApiProvider: RetrievalProvider = {
     }
     return withShadowTelemetry(lexicalResult, shadowSettled.value);
   },
+};
+
+export const ikApiProviderTestUtils = {
+  buildFormInput,
+  resolveDoctypes,
+  parseCategoryTerms,
 };

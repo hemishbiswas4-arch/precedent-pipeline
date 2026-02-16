@@ -11,6 +11,12 @@ import {
 export type QueryPhase = "primary" | "fallback" | "rescue" | "micro" | "revolving" | "browse";
 export type CourtScope = "SC" | "HC" | "ANY";
 export type QueryStrictness = "strict" | "relaxed";
+export type RetrievalQueryMode = "precision" | "context" | "expansion";
+export type RetrievalDoctypeProfile =
+  | "judgments_sc_hc_tribunal"
+  | "supremecourt"
+  | "highcourts"
+  | "any";
 
 export type QueryProviderHints = {
   compiledQuery?: string;
@@ -18,6 +24,17 @@ export type QueryProviderHints = {
   serperCoreTerms?: string[];
   canonicalOrderTerms?: string[];
   excludeTerms?: string[];
+};
+
+export type QueryRetrievalDirectives = {
+  queryMode: RetrievalQueryMode;
+  doctypeProfile?: RetrievalDoctypeProfile;
+  titleTerms?: string[];
+  citeTerms?: string[];
+  authorTerms?: string[];
+  benchTerms?: string[];
+  categoryExpansions?: string[];
+  applyContradictionExclusions?: boolean;
 };
 
 export type QueryVariant = {
@@ -33,6 +50,32 @@ export type QueryVariant = {
   mustIncludeTokens?: string[];
   mustExcludeTokens?: string[];
   providerHints?: QueryProviderHints;
+  retrievalDirectives?: QueryRetrievalDirectives;
+};
+
+export type RetrievalIntentProfile = {
+  actors: string[];
+  proceeding: string[];
+  hookGroups: Array<{
+    groupId: string;
+    terms: string[];
+    required: boolean;
+  }>;
+  outcomePolarity:
+    | "required"
+    | "not_required"
+    | "allowed"
+    | "refused"
+    | "dismissed"
+    | "quashed"
+    | "unknown";
+  citationHints: string[];
+  judgeHints: string[];
+  dateWindow: {
+    fromDate?: string;
+    toDate?: string;
+  };
+  doctypeProfile: RetrievalDoctypeProfile;
 };
 
 export type IntentProfile = {
@@ -50,6 +93,7 @@ export type IntentProfile = {
     fromDate?: string;
     toDate?: string;
   };
+  retrievalIntent: RetrievalIntentProfile;
   entities: {
     person: string[];
     org: string[];
@@ -81,6 +125,7 @@ export type ClassifiedCandidate = CaseCandidate & {
 export type RetrievalAttempt = {
   providerId?: string;
   sourceLabel?: "lexical_api" | "lexical_html" | "web_search" | "semantic_vector" | "fused";
+  queryMode?: RetrievalQueryMode;
   phase: QueryPhase;
   courtScope?: CourtScope;
   variantId: string;
@@ -116,6 +161,10 @@ export type RetrievalAttempt = {
   fusionLatencyMs?: number;
   docFragmentHydrationMs?: number;
   docFragmentCalls?: number;
+  categoryExpansionCount?: number;
+  docmetaHydrationMs?: number;
+  docmetaCalls?: number;
+  docmetaHydrated?: number;
   error: string | null;
 };
 
@@ -124,6 +173,11 @@ export type SchedulerConfig = {
   verifyLimit: number;
   globalBudget: number;
   phaseLimits: Record<QueryPhase, number>;
+  maxPagesByPhase?: {
+    primary: number;
+    fallback: number;
+    other: number;
+  };
   blockedThreshold: number;
   minCaseTarget: number;
   requireSupremeCourt: boolean;

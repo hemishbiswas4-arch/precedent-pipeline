@@ -77,6 +77,7 @@ export type CaseCandidate = {
   snippet: string;
   court: CourtLevel;
   courtText?: string;
+  bench?: string;
   citesCount?: number;
   citedByCount?: number;
   author?: string;
@@ -303,6 +304,7 @@ export type SearchResponse = {
       statusCounts: Record<string, number>;
       challengeCount: number;
       rateLimitCount: number;
+      noMatchCount?: number;
       cooldownSkipCount?: number;
       timeoutCount?: number;
       fetchTimeoutMsUsed?: number;
@@ -332,6 +334,19 @@ export type SearchResponse = {
       fusionLatencyMs?: number;
       docFragmentHydrationMs?: number;
       docFragmentCalls?: number;
+      queryModeCounts?: {
+        precision: number;
+        context: number;
+        expansion: number;
+      };
+      categoryExpansionCount?: number;
+      docmetaHydrationCoverage?: number;
+      precisionLaneStats?: {
+        strictRetrieved: number;
+        strictAccepted: number;
+        strictRejected: number;
+        relatedAccepted: number;
+      };
     };
       classification: {
         counts: Record<CandidateKind, number>;

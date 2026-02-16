@@ -3,7 +3,6 @@ import {
   DEFAULT_BLOCKED_THRESHOLD,
   DEFAULT_GLOBAL_BUDGET,
   DEFAULT_VERIFY_LIMIT,
-  PHASE_LIMITS,
   PHASE_ORDER,
 } from "@/lib/kb/query-templates";
 import { ontologyTemplatesForContext } from "@/lib/kb/legal-ontology";
@@ -149,6 +148,7 @@ const STALE_FALLBACK_MIN_SIMILARITY = Math.min(
 const ADAPTIVE_VARIANT_SCHEDULER_ENABLED = parseBooleanEnv(process.env.ADAPTIVE_VARIANT_SCHEDULER, true);
 const QUERY_REWRITE_V2_ENABLED = parseBooleanEnv(process.env.QUERY_REWRITE_V2, true);
 const CANONICAL_LEXICAL_SCORING_ENABLED = parseBooleanEnv(process.env.CANONICAL_LEXICAL_SCORING, true);
+const IK_INTENT_V2_ENABLED = parseBooleanEnv(process.env.IK_INTENT_V2, true);
 
 type ReasonerHealthStatus =
   | "ok"
@@ -347,6 +347,15 @@ function isRelevantCase(item: ScoredCase): boolean {
   );
 }
 
+function isTribunalLikeCandidate(candidate: CaseCandidate): boolean {
+  const bag = `${candidate.title} ${candidate.snippet} ${candidate.courtText ?? ""}`.toLowerCase();
+  return (
+    /\btribunal\b/.test(bag) ||
+    /\bappellate tribunal\b/.test(bag) ||
+    /\bnclat\b|\bnclt\b|\bcat\b|\bsat\b|\bait\b/.test(bag)
+  );
+}
+
 function applySupremeCourtPreference(cases: ScoredCase[]): ScoredCase[] {
   if (!SUPREME_COURT_PREFERENCE_ENABLED || cases.length === 0) {
     return cases;
@@ -507,7 +516,12 @@ async function evaluateCandidates(input: {
       return candidate;
     });
 
-  const courtFiltered = caseCandidates.filter((candidate) => candidate.court === "SC" || candidate.court === "HC");
+  const courtFiltered = caseCandidates.filter(
+    (candidate) =>
+      candidate.court === "SC" ||
+      candidate.court === "HC" ||
+      isTribunalLikeCandidate(candidate),
+  );
   const scoredInput = courtFiltered.length > 0 ? courtFiltered : caseCandidates;
   const scored = scoreCases(input.query, input.context, scoredInput, {
     checklist: input.checklist,
@@ -685,6 +699,27 @@ function mergeVariantTokenLists(values: string[] | undefined, fallback: string[]
   return uniqueLimit([...(values ?? []), ...(fallback ?? [])], max);
 }
 
+function mergeRetrievalDirectives(
+  preferred: QueryVariant["retrievalDirectives"],
+  secondary: QueryVariant["retrievalDirectives"],
+): QueryVariant["retrievalDirectives"] {
+  if (!preferred && !secondary) return undefined;
+  const contradictionExclusions =
+    preferred?.applyContradictionExclusions === false || secondary?.applyContradictionExclusions === false
+      ? false
+      : preferred?.applyContradictionExclusions ?? secondary?.applyContradictionExclusions;
+  return {
+    queryMode: preferred?.queryMode ?? secondary?.queryMode ?? "context",
+    doctypeProfile: preferred?.doctypeProfile ?? secondary?.doctypeProfile,
+    titleTerms: mergeVariantTokenLists(preferred?.titleTerms, secondary?.titleTerms, 8),
+    citeTerms: mergeVariantTokenLists(preferred?.citeTerms, secondary?.citeTerms, 8),
+    authorTerms: mergeVariantTokenLists(preferred?.authorTerms, secondary?.authorTerms, 6),
+    benchTerms: mergeVariantTokenLists(preferred?.benchTerms, secondary?.benchTerms, 6),
+    categoryExpansions: mergeVariantTokenLists(preferred?.categoryExpansions, secondary?.categoryExpansions, 6),
+    applyContradictionExclusions: contradictionExclusions,
+  };
+}
+
 function mergeVariants(variants: QueryVariant[]): QueryVariant[] {
   const merged = new Map<string, QueryVariant>();
   for (const variant of variants) {
@@ -706,6 +741,10 @@ function mergeVariants(variants: QueryVariant[]): QueryVariant[] {
     merged.set(key, {
       ...preferred,
       canonicalKey: preferred.canonicalKey ?? secondary.canonicalKey,
+      retrievalDirectives: mergeRetrievalDirectives(
+        preferred.retrievalDirectives,
+        secondary.retrievalDirectives,
+      ),
       mustIncludeTokens: mergeVariantTokenLists(preferred.mustIncludeTokens, secondary.mustIncludeTokens, 24),
       mustExcludeTokens: mergeVariantTokenLists(preferred.mustExcludeTokens, secondary.mustExcludeTokens, 16),
       providerHints: {
@@ -875,7 +914,19 @@ export async function runPipelineSearch(input: {
     strictCaseOnly,
     verifyLimit: effectiveVerifyLimit,
     globalBudget: effectiveGlobalBudget,
-    phaseLimits: PHASE_LIMITS,
+    phaseLimits: {
+      primary: RUNTIME_PROFILE.schedulerPhaseLimits.primary,
+      fallback: RUNTIME_PROFILE.schedulerPhaseLimits.fallback,
+      rescue: RUNTIME_PROFILE.schedulerPhaseLimits.rescue,
+      micro: RUNTIME_PROFILE.schedulerPhaseLimits.micro,
+      revolving: RUNTIME_PROFILE.schedulerPhaseLimits.revolving,
+      browse: RUNTIME_PROFILE.schedulerPhaseLimits.browse,
+    },
+    maxPagesByPhase: {
+      primary: RUNTIME_PROFILE.schedulerMaxPages.primary,
+      fallback: RUNTIME_PROFILE.schedulerMaxPages.fallback,
+      other: RUNTIME_PROFILE.schedulerMaxPages.other,
+    },
     blockedThreshold: DEFAULT_BLOCKED_THRESHOLD,
     minCaseTarget,
     requireSupremeCourt,
@@ -925,9 +976,10 @@ export async function runPipelineSearch(input: {
   let queryRewriteApplied = false;
   let queryRewriteError: string | undefined;
 
-  const initialReasonerVariants = activeReasonerPlan
-    ? buildReasonerQueryVariants({ intent, plan: activeReasonerPlan })
-    : [];
+  const initialReasonerVariants =
+    !IK_INTENT_V2_ENABLED && activeReasonerPlan
+      ? buildReasonerQueryVariants({ intent, plan: activeReasonerPlan })
+      : [];
   try {
     if (QUERY_REWRITE_V2_ENABLED) {
       canonicalIntent = buildCanonicalIntent(intent, activeReasonerPlan);
@@ -1104,10 +1156,12 @@ export async function runPipelineSearch(input: {
           reasonerPlan: activeReasonerPlan,
         }),
       );
-      const pass2ReasonerVariants = buildReasonerQueryVariants({
-        intent,
-        plan: activeReasonerPlan,
-      });
+      const pass2ReasonerVariants = IK_INTENT_V2_ENABLED
+        ? []
+        : buildReasonerQueryVariants({
+            intent,
+            plan: activeReasonerPlan,
+          });
       pass2Variants = pass2ReasonerVariants;
       if (QUERY_REWRITE_V2_ENABLED) {
         try {
@@ -1674,6 +1728,41 @@ export async function runPipelineSearch(input: {
     (sum, attempt) => sum + (attempt.docFragmentCalls ?? 0),
     0,
   );
+  const queryModeCounts = scheduler.attempts.reduce(
+    (acc, attempt) => {
+      const mode = attempt.queryMode;
+      if (mode === "precision") acc.precision += 1;
+      if (mode === "context") acc.context += 1;
+      if (mode === "expansion") acc.expansion += 1;
+      return acc;
+    },
+    { precision: 0, context: 0, expansion: 0 },
+  );
+  const categoryExpansionCount = scheduler.attempts.reduce(
+    (sum, attempt) => sum + (attempt.categoryExpansionCount ?? 0),
+    0,
+  );
+  const docmetaCalls = scheduler.attempts.reduce((sum, attempt) => sum + (attempt.docmetaCalls ?? 0), 0);
+  const docmetaHydrated = scheduler.attempts.reduce(
+    (sum, attempt) => sum + (attempt.docmetaHydrated ?? 0),
+    0,
+  );
+  const docmetaHydrationCoverage =
+    docmetaCalls > 0 ? Number((docmetaHydrated / docmetaCalls).toFixed(3)) : undefined;
+  const candidateProvenance = scheduler.carryState.candidateProvenance ?? {};
+  const strictRetrieved = evaluation.rankedPool.reduce((count, item) => {
+    const provenance = candidateProvenance[item.url];
+    return count + ((provenance?.strictHits ?? 0) > 0 ? 1 : 0);
+  }, 0);
+  const strictAccepted = casesExactStrict.length + casesExactProvisional.length;
+  const strictRejected = Math.max(0, strictRetrieved - strictAccepted);
+  const relatedAccepted = casesExploratory.length;
+  const precisionLaneStats = {
+    strictRetrieved: Math.max(strictRetrieved, strictAccepted),
+    strictAccepted,
+    strictRejected,
+    relatedAccepted,
+  };
   if (semanticCandidateCount > 0 || fusedCandidateCount > 0) {
     notes.push(
       `Hybrid retrieval engaged (lexical=${lexicalCandidateCount}, semantic=${semanticCandidateCount}, fused=${fusedCandidateCount}, rerank=${rerankApplied ? "on" : "off"}).`,
@@ -1857,6 +1946,7 @@ export async function runPipelineSearch(input: {
         statusCounts,
         challengeCount,
         rateLimitCount,
+        noMatchCount,
         cooldownSkipCount,
         timeoutCount,
         fetchTimeoutMsUsed,
@@ -1876,6 +1966,10 @@ export async function runPipelineSearch(input: {
         fusionLatencyMs: fusionLatencyMs > 0 ? fusionLatencyMs : undefined,
         docFragmentHydrationMs: docFragmentHydrationMs > 0 ? docFragmentHydrationMs : undefined,
         docFragmentCalls: docFragmentCalls > 0 ? docFragmentCalls : undefined,
+        queryModeCounts,
+        categoryExpansionCount: categoryExpansionCount > 0 ? categoryExpansionCount : undefined,
+        docmetaHydrationCoverage,
+        precisionLaneStats,
       },
       classification: {
         counts: evaluation.counts,
@@ -1995,6 +2089,11 @@ export async function runPipelineSearch(input: {
         fusionLatencyMs: attempt.fusionLatencyMs,
         docFragmentHydrationMs: attempt.docFragmentHydrationMs,
         docFragmentCalls: attempt.docFragmentCalls,
+        queryMode: attempt.queryMode,
+        categoryExpansionCount: attempt.categoryExpansionCount,
+        docmetaHydrationMs: attempt.docmetaHydrationMs,
+        docmetaCalls: attempt.docmetaCalls,
+        docmetaHydrated: attempt.docmetaHydrated,
         status: attempt.status,
         ok: attempt.ok,
         phase: attempt.phase,

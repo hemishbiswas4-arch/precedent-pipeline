@@ -1,4 +1,10 @@
-export type SearchRuntimeProfile = "fast_balanced" | "recall_max" | "latency_first";
+export type SearchRuntimeProfile =
+  | "consumer_precision"
+  | "fast_balanced"
+  | "recall_max"
+  | "latency_first";
+
+type RuntimePhase = "primary" | "fallback" | "rescue" | "micro" | "revolving" | "browse";
 
 type ProfileSettings = {
   pipelineMaxElapsedMs: {
@@ -26,9 +32,55 @@ type ProfileSettings = {
     cap: number;
     min: number;
   };
+  schedulerPhaseLimits: Record<RuntimePhase, number>;
+  schedulerMaxPages: {
+    primary: number;
+    fallback: number;
+    other: number;
+  };
 };
 
 const PROFILE_SETTINGS: Record<SearchRuntimeProfile, ProfileSettings> = {
+  consumer_precision: {
+    pipelineMaxElapsedMs: {
+      defaultValue: 14_000,
+      cap: 20_000,
+      min: 5_000,
+    },
+    defaultGlobalBudget: {
+      defaultValue: 8,
+      cap: 10,
+      min: 5,
+    },
+    guaranteeExtraAttempts: {
+      defaultValue: 1,
+      cap: 2,
+      min: 1,
+    },
+    llmReasonerTimeoutMs: {
+      defaultValue: 3_600,
+      cap: 4_500,
+      min: 200,
+    },
+    llmReasonerMaxCallsPerRequest: {
+      defaultValue: 1,
+      cap: 1,
+      min: 0,
+    },
+    schedulerPhaseLimits: {
+      primary: 3,
+      fallback: 2,
+      rescue: 1,
+      micro: 1,
+      revolving: 1,
+      browse: 1,
+    },
+    schedulerMaxPages: {
+      primary: 2,
+      fallback: 2,
+      other: 1,
+    },
+  },
   fast_balanced: {
     pipelineMaxElapsedMs: {
       defaultValue: 12_000,
@@ -54,6 +106,19 @@ const PROFILE_SETTINGS: Record<SearchRuntimeProfile, ProfileSettings> = {
       defaultValue: 1,
       cap: 1,
       min: 0,
+    },
+    schedulerPhaseLimits: {
+      primary: 2,
+      fallback: 2,
+      rescue: 1,
+      micro: 1,
+      revolving: 1,
+      browse: 1,
+    },
+    schedulerMaxPages: {
+      primary: 1,
+      fallback: 1,
+      other: 1,
     },
   },
   recall_max: {
@@ -82,6 +147,19 @@ const PROFILE_SETTINGS: Record<SearchRuntimeProfile, ProfileSettings> = {
       cap: 2,
       min: 0,
     },
+    schedulerPhaseLimits: {
+      primary: 3,
+      fallback: 3,
+      rescue: 2,
+      micro: 1,
+      revolving: 1,
+      browse: 1,
+    },
+    schedulerMaxPages: {
+      primary: 2,
+      fallback: 2,
+      other: 1,
+    },
   },
   latency_first: {
     pipelineMaxElapsedMs: {
@@ -109,14 +187,28 @@ const PROFILE_SETTINGS: Record<SearchRuntimeProfile, ProfileSettings> = {
       cap: 1,
       min: 0,
     },
+    schedulerPhaseLimits: {
+      primary: 2,
+      fallback: 1,
+      rescue: 1,
+      micro: 1,
+      revolving: 1,
+      browse: 1,
+    },
+    schedulerMaxPages: {
+      primary: 1,
+      fallback: 1,
+      other: 1,
+    },
   },
 };
 
 export function parseSearchRuntimeProfile(value: string | undefined): SearchRuntimeProfile {
   const normalized = value?.trim().toLowerCase();
+  if (normalized === "consumer_precision") return "consumer_precision";
   if (normalized === "recall_max") return "recall_max";
   if (normalized === "latency_first") return "latency_first";
-  return "fast_balanced";
+  return "consumer_precision";
 }
 
 export function getSearchRuntimeProfileSettings(profile: SearchRuntimeProfile): ProfileSettings {

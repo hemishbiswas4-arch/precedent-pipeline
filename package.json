@@ -12,7 +12,7 @@
     "backfill:ik": "tsx scripts/backfill-ik-window.ts",
     "eval:retrieval": "tsx scripts/eval-retrieval.ts",
     "eval:recall": "tsx scripts/eval-retrieval-recall.ts",
-    "test:hybrid": "tsx --test lib/ingestion/chunker.test.ts lib/ingestion/ik-api-client.test.ts lib/retrieval/hybrid.test.ts lib/retrieval/hybrid.integration.test.ts lib/scoring-rerank.test.ts"
+    "test:hybrid": "tsx --test lib/ingestion/chunker.test.ts lib/ingestion/ik-api-client.test.ts lib/retrieval/hybrid.test.ts lib/retrieval/hybrid.integration.test.ts lib/retrieval/providers/indiankanoon-api.test.ts lib/pipeline/query-rewrite.test.ts lib/pipeline/scheduler-adaptive.test.ts lib/scoring-rerank.test.ts lib/scoring-paraphrase.test.ts lib/proposition-gate.test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.987.0",

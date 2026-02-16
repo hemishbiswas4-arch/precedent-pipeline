@@ -2,6 +2,7 @@ import { embedText } from "@/lib/retrieval/embeddings";
 import { rerankCandidates } from "@/lib/retrieval/reranker";
 import { ManagedVectorStore } from "@/lib/retrieval/vector-store";
 import {
+  hasRetrievalDebug,
   RetrievalProvider,
   RetrievalSearchInput,
   RetrievalSearchResult,
@@ -16,15 +17,17 @@ type RetrievalSourceTag =
   | "fused";
 
 const HYBRID_RETRIEVAL_ENABLED = (() => {
-  const raw = (process.env.HYBRID_RETRIEVAL_V1 ?? "0").trim().toLowerCase();
-  return ["1", "true", "yes", "on"].includes(raw);
+  const raw = (process.env.HYBRID_RETRIEVAL_V2 ?? process.env.HYBRID_RETRIEVAL_V1 ?? "1")
+    .trim()
+    .toLowerCase();
+  return !["0", "false", "no", "off"].includes(raw);
 })();
 const HYBRID_RRF_K = Math.max(1, Number(process.env.HYBRID_RRF_K ?? "60"));
 const HYBRID_SEMANTIC_TOPK = Math.max(4, Number(process.env.HYBRID_SEMANTIC_TOPK ?? "24"));
 const HYBRID_LEXICAL_TOPK = Math.max(4, Number(process.env.HYBRID_LEXICAL_TOPK ?? "18"));
 const HYBRID_SOURCE_DOMINANCE_CAP = Math.min(
   0.95,
-  Math.max(Number(process.env.HYBRID_SOURCE_DOMINANCE_CAP ?? "0.7"), 0.5),
+  Math.max(Number(process.env.HYBRID_SOURCE_DOMINANCE_CAP ?? "0.82"), 0.55),
 );
 
 function normalizeText(value: string): string {
@@ -113,13 +116,30 @@ function rrfScore(rank: number, weight: number): number {
   return weight / (HYBRID_RRF_K + rank);
 }
 
+function sourceWeights(queryMode: RetrievalSearchInput["queryMode"]): { lexical: number; semantic: number } {
+  if (queryMode === "precision") {
+    return { lexical: 1.35, semantic: 0.75 };
+  }
+  if (queryMode === "expansion") {
+    return { lexical: 1.05, semantic: 1.0 };
+  }
+  return { lexical: 1.2, semantic: 0.9 };
+}
+
+function sourceDominanceCap(queryMode: RetrievalSearchInput["queryMode"]): number {
+  if (queryMode === "precision") return Math.max(0.75, HYBRID_SOURCE_DOMINANCE_CAP);
+  return HYBRID_SOURCE_DOMINANCE_CAP;
+}
+
 function fuseCandidates(input: {
   lexical: CaseCandidate[];
   semantic: CaseCandidate[];
   limit: number;
+  queryMode?: RetrievalSearchInput["queryMode"];
 }): CaseCandidate[] {
   const lexical = annotateRank({ items: input.lexical, kind: "lexical" });
   const semantic = annotateRank({ items: input.semantic, kind: "semantic" });
+  const weights = sourceWeights(input.queryMode);
 
   const map = new Map<string, CaseCandidate>();
 
@@ -168,9 +188,9 @@ function fuseCandidates(input: {
       const lexicalRank = item.retrieval?.lexicalRank;
       const semanticRank = item.retrieval?.semanticRank;
       const lexicalComponent =
-        typeof lexicalRank === "number" && lexicalRank > 0 ? rrfScore(lexicalRank, 1.0) : 0;
+        typeof lexicalRank === "number" && lexicalRank > 0 ? rrfScore(lexicalRank, weights.lexical) : 0;
       const semanticComponent =
-        typeof semanticRank === "number" && semanticRank > 0 ? rrfScore(semanticRank, 1.15) : 0;
+        typeof semanticRank === "number" && semanticRank > 0 ? rrfScore(semanticRank, weights.semantic) : 0;
       const fusionScore = lexicalComponent + semanticComponent;
 
       return {
@@ -184,10 +204,17 @@ function fuseCandidates(input: {
         },
       };
     })
-    .sort((left, right) => (right.retrieval?.fusionScore ?? 0) - (left.retrieval?.fusionScore ?? 0));
+    .sort((left, right) => {
+      const rightFusion = right.retrieval?.fusionScore ?? 0;
+      const leftFusion = left.retrieval?.fusionScore ?? 0;
+      if (rightFusion !== leftFusion) return rightFusion - leftFusion;
+      const leftLexicalRank = left.retrieval?.lexicalRank ?? Number.POSITIVE_INFINITY;
+      const rightLexicalRank = right.retrieval?.lexicalRank ?? Number.POSITIVE_INFINITY;
+      return leftLexicalRank - rightLexicalRank;
+    });
 
   const target = Math.max(1, Math.min(input.limit, scored.length));
-  const maxPerSource = Math.max(1, Math.floor(target * HYBRID_SOURCE_DOMINANCE_CAP));
+  const maxPerSource = Math.max(1, Math.floor(target * sourceDominanceCap(input.queryMode)));
   const selected: CaseCandidate[] = [];
   let lexicalCount = 0;
   let semanticCount = 0;
@@ -262,11 +289,20 @@ export async function runHybridSearch(input: {
       0,
       input.searchInput.maxResultsPerPhrase,
     );
+    const lexicalDebug = hasRetrievalDebug(lexicalResult.reason) ? lexicalResult.reason.debug : undefined;
+
+    if (semanticOnly.length === 0) {
+      if (lexicalResult.reason instanceof Error) {
+        throw lexicalResult.reason;
+      }
+      throw new Error("hybrid_retrieval_lexical_failed_semantic_empty");
+    }
 
     return {
       cases: semanticOnly,
       debug: {
         searchQuery: input.searchInput.compiledQuery ?? input.searchInput.phrase,
+        queryMode: input.searchInput.queryMode,
         status: 200,
         ok: true,
         parsedCount: semanticOnly.length,
@@ -277,8 +313,15 @@ export async function runHybridSearch(input: {
         rawParsedCount: semanticOnly.length,
         excludedStatuteCount: 0,
         excludedWeakCount: 0,
-        cloudflareDetected: false,
-        challengeDetected: false,
+        cloudflareDetected: lexicalDebug?.cloudflareDetected ?? false,
+        challengeDetected: lexicalDebug?.challengeDetected ?? false,
+        blockedType: lexicalDebug?.blockedType,
+        retryAfterMs: lexicalDebug?.retryAfterMs,
+        htmlPreview:
+          lexicalDebug?.htmlPreview ??
+          (typeof lexicalDebug?.status === "number"
+            ? `hybrid_semantic_only_lexical_status_${lexicalDebug.status}`
+            : "hybrid_semantic_only_lexical_failed"),
         sourceTag: "semantic_vector",
         semanticCandidateCount: semanticOnly.length,
         lexicalCandidateCount: 0,
@@ -316,12 +359,19 @@ export async function runHybridSearch(input: {
     lexical: lexical.cases,
     semantic,
     limit: Math.max(input.searchInput.maxResultsPerPhrase, HYBRID_LEXICAL_TOPK),
+    queryMode: input.searchInput.queryMode,
   });
 
+  const rerankTopN =
+    input.searchInput.queryMode === "precision"
+      ? Math.max(10, Math.min(18, fused.length))
+      : input.searchInput.queryMode === "context"
+        ? Math.max(10, Math.min(22, fused.length))
+        : Math.max(10, Math.min(26, fused.length));
   const reranked = await rerankCandidates({
     query: input.searchInput.compiledQuery ?? input.searchInput.phrase,
     candidates: fused,
-    topN: Math.max(8, Math.min(24, fused.length)),
+    topN: rerankTopN,
   });
 
   const finalCases = reranked.reranked.slice(0, input.searchInput.maxResultsPerPhrase);

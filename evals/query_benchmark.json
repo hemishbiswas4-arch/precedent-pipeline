@@ -1,42 +1,1042 @@
 [
   {
-    "id": "q1_condonation_refused_state_appeal",
-    "query": "State criminal appeal dismissed as time barred after delay condonation was refused under Section 5 of the Limitation Act.",
-    "expected": {
-      "polarity": "refused",
-      "requiredHooks": ["section 5 limitation act"]
-    }
-  },
-  {
-    "id": "q2_sanction_interaction",
-    "query": "Whether prosecution for disproportionate assets requires sanction under Section 197 CrPC read with Section 19 of the Prevention of Corruption Act.",
+    "id": "q001",
+    "query": "state criminal appeal under section 197 crpc read with section 19 prevention of corruption act where prior sanction was mandatory.",
     "expected": {
       "polarity": "required",
-      "requiredHooks": ["section 197 crpc", "section 19 prevention of corruption act"]
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
     }
   },
   {
-    "id": "q3_sanction_not_required",
-    "query": "Find cases where prior sanction under Section 197 CrPC was held not required for prosecution under the PC Act.",
+    "id": "q002",
+    "query": "state criminal appeal under section 197 crpc read with section 19 prevention of corruption act where previous sanction required before prosecution.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q003",
+    "query": "state criminal appeal under section 197 crpc read with section 19 prevention of corruption act where sanction required for taking cognizance.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q004",
+    "query": "state criminal appeal under section 197 crpc read with section 19 prevention of corruption act where prosecution cannot continue unless prior sanction is granted.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q005",
+    "query": "state revision petition under section 197 crpc read with section 19 prevention of corruption act where prior sanction was mandatory.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q006",
+    "query": "state revision petition under section 197 crpc read with section 19 prevention of corruption act where previous sanction required before prosecution.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q007",
+    "query": "state revision petition under section 197 crpc read with section 19 prevention of corruption act where sanction required for taking cognizance.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q008",
+    "query": "state revision petition under section 197 crpc read with section 19 prevention of corruption act where prosecution cannot continue unless prior sanction is granted.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q009",
+    "query": "state leave to appeal under section 197 crpc read with section 19 prevention of corruption act where prior sanction was mandatory.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q010",
+    "query": "state leave to appeal under section 197 crpc read with section 19 prevention of corruption act where previous sanction required before prosecution.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q011",
+    "query": "state leave to appeal under section 197 crpc read with section 19 prevention of corruption act where sanction required for taking cognizance.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q012",
+    "query": "state leave to appeal under section 197 crpc read with section 19 prevention of corruption act where prosecution cannot continue unless prior sanction is granted.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q013",
+    "query": "state special leave petition under section 197 crpc read with section 19 prevention of corruption act where prior sanction was mandatory.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q014",
+    "query": "state special leave petition under section 197 crpc read with section 19 prevention of corruption act where previous sanction required before prosecution.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q015",
+    "query": "state special leave petition under section 197 crpc read with section 19 prevention of corruption act where sanction required for taking cognizance.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q016",
+    "query": "state special leave petition under section 197 crpc read with section 19 prevention of corruption act where prosecution cannot continue unless prior sanction is granted.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q017",
+    "query": "cbi criminal appeal under section 197 crpc read with section 19 prevention of corruption act where prior sanction was mandatory.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q018",
+    "query": "cbi criminal appeal under section 197 crpc read with section 19 prevention of corruption act where previous sanction required before prosecution.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q019",
+    "query": "cbi criminal appeal under section 197 crpc read with section 19 prevention of corruption act where sanction required for taking cognizance.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q020",
+    "query": "cbi criminal appeal under section 197 crpc read with section 19 prevention of corruption act where prosecution cannot continue unless prior sanction is granted.",
+    "expected": {
+      "polarity": "required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "section 19 prevention of corruption act"
+      ]
+    }
+  },
+  {
+    "id": "q021",
+    "query": "state criminal appeal for pc act prosecution under section 197 crpc where prior sanction was not required.",
     "expected": {
       "polarity": "not_required",
-      "requiredHooks": ["section 197 crpc", "pc act"]
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
     }
   },
   {
-    "id": "q4_quash",
-    "query": "Can criminal proceedings be quashed under Section 482 CrPC when allegations are purely civil in nature?",
+    "id": "q022",
+    "query": "cbi revision petition for pc act prosecution under section 197 crpc where sanction unnecessary for prosecution.",
     "expected": {
-      "polarity": "quashed",
-      "requiredHooks": ["section 482 crpc"]
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
     }
   },
   {
-    "id": "q5_limitation_barred",
-    "query": "Appeal by the prosecution rejected as barred by limitation because condonation of delay application failed.",
+    "id": "q023",
+    "query": "anti corruption bureau leave to appeal for pc act prosecution under section 197 crpc where court held no sanction required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q024",
+    "query": "special public prosecutor special leave petition for pc act prosecution under section 197 crpc where prosecution allowed without prior sanction.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q025",
+    "query": "vigilance department criminal appeal for pc act prosecution under section 197 crpc where prior sanction was not required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q026",
+    "query": "state revision petition for pc act prosecution under section 197 crpc where sanction unnecessary for prosecution.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q027",
+    "query": "cbi leave to appeal for pc act prosecution under section 197 crpc where court held no sanction required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q028",
+    "query": "anti corruption bureau special leave petition for pc act prosecution under section 197 crpc where prosecution allowed without prior sanction.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q029",
+    "query": "special public prosecutor criminal appeal for pc act prosecution under section 197 crpc where prior sanction was not required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q030",
+    "query": "vigilance department revision petition for pc act prosecution under section 197 crpc where sanction unnecessary for prosecution.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q031",
+    "query": "state leave to appeal for pc act prosecution under section 197 crpc where court held no sanction required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q032",
+    "query": "cbi special leave petition for pc act prosecution under section 197 crpc where prosecution allowed without prior sanction.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q033",
+    "query": "anti corruption bureau criminal appeal for pc act prosecution under section 197 crpc where prior sanction was not required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q034",
+    "query": "special public prosecutor revision petition for pc act prosecution under section 197 crpc where sanction unnecessary for prosecution.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q035",
+    "query": "vigilance department leave to appeal for pc act prosecution under section 197 crpc where court held no sanction required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q036",
+    "query": "state special leave petition for pc act prosecution under section 197 crpc where prosecution allowed without prior sanction.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q037",
+    "query": "cbi criminal appeal for pc act prosecution under section 197 crpc where prior sanction was not required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q038",
+    "query": "anti corruption bureau revision petition for pc act prosecution under section 197 crpc where sanction unnecessary for prosecution.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q039",
+    "query": "special public prosecutor leave to appeal for pc act prosecution under section 197 crpc where court held no sanction required.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q040",
+    "query": "vigilance department special leave petition for pc act prosecution under section 197 crpc where prosecution allowed without prior sanction.",
+    "expected": {
+      "polarity": "not_required",
+      "requiredHooks": [
+        "section 197 crpc",
+        "pc act"
+      ]
+    }
+  },
+  {
+    "id": "q041",
+    "query": "state criminal appeal under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
     "expected": {
       "polarity": "dismissed",
-      "requiredHooks": ["limitation act"]
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q042",
+    "query": "cbi revision petition under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q043",
+    "query": "anti corruption bureau leave to appeal under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q044",
+    "query": "special public prosecutor special leave petition under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q045",
+    "query": "vigilance department criminal appeal under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q046",
+    "query": "state revision petition under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q047",
+    "query": "cbi leave to appeal under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q048",
+    "query": "anti corruption bureau special leave petition under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q049",
+    "query": "special public prosecutor criminal appeal under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q050",
+    "query": "vigilance department revision petition under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q051",
+    "query": "state leave to appeal under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q052",
+    "query": "cbi special leave petition under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q053",
+    "query": "anti corruption bureau criminal appeal under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q054",
+    "query": "special public prosecutor revision petition under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q055",
+    "query": "vigilance department leave to appeal under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q056",
+    "query": "state special leave petition under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q057",
+    "query": "cbi criminal appeal under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q058",
+    "query": "anti corruption bureau revision petition under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q059",
+    "query": "special public prosecutor leave to appeal under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q060",
+    "query": "vigilance department special leave petition under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q061",
+    "query": "state criminal appeal under section 482 crpc where criminal proceedings quashed under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q062",
+    "query": "cbi revision petition under section 482 crpc where fir quashed for abuse of process under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q063",
+    "query": "anti corruption bureau leave to appeal under section 482 crpc where complaint quashed as purely civil dispute.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q064",
+    "query": "special public prosecutor special leave petition under section 482 crpc where charge sheet quashed in inherent jurisdiction.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q065",
+    "query": "vigilance department criminal appeal under section 482 crpc where criminal proceedings quashed under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q066",
+    "query": "state revision petition under section 482 crpc where fir quashed for abuse of process under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q067",
+    "query": "cbi leave to appeal under section 482 crpc where complaint quashed as purely civil dispute.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q068",
+    "query": "anti corruption bureau special leave petition under section 482 crpc where charge sheet quashed in inherent jurisdiction.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q069",
+    "query": "special public prosecutor criminal appeal under section 482 crpc where criminal proceedings quashed under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q070",
+    "query": "vigilance department revision petition under section 482 crpc where fir quashed for abuse of process under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q071",
+    "query": "state leave to appeal under section 482 crpc where complaint quashed as purely civil dispute.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q072",
+    "query": "cbi special leave petition under section 482 crpc where charge sheet quashed in inherent jurisdiction.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q073",
+    "query": "anti corruption bureau criminal appeal under section 482 crpc where criminal proceedings quashed under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q074",
+    "query": "special public prosecutor revision petition under section 482 crpc where fir quashed for abuse of process under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q075",
+    "query": "vigilance department leave to appeal under section 482 crpc where complaint quashed as purely civil dispute.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q076",
+    "query": "state special leave petition under section 482 crpc where charge sheet quashed in inherent jurisdiction.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q077",
+    "query": "cbi criminal appeal under section 482 crpc where criminal proceedings quashed under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q078",
+    "query": "anti corruption bureau revision petition under section 482 crpc where fir quashed for abuse of process under section 482 crpc.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q079",
+    "query": "special public prosecutor leave to appeal under section 482 crpc where complaint quashed as purely civil dispute.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q080",
+    "query": "vigilance department special leave petition under section 482 crpc where charge sheet quashed in inherent jurisdiction.",
+    "expected": {
+      "polarity": "quashed",
+      "requiredHooks": [
+        "section 482 crpc"
+      ]
+    }
+  },
+  {
+    "id": "q081",
+    "query": "central administrative tribunal appeal on limitation and condonation under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q082",
+    "query": "nclat appeal on limitation and condonation under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q083",
+    "query": "nclt appeal on limitation and condonation under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q084",
+    "query": "debt recovery appellate tribunal appeal on limitation and condonation under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q085",
+    "query": "customs tribunal appeal on limitation and condonation under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q086",
+    "query": "central administrative tribunal appeal on limitation and condonation under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q087",
+    "query": "nclat appeal on limitation and condonation under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q088",
+    "query": "nclt appeal on limitation and condonation under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q089",
+    "query": "debt recovery appellate tribunal appeal on limitation and condonation under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q090",
+    "query": "customs tribunal appeal on limitation and condonation under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q091",
+    "query": "central administrative tribunal appeal on limitation and condonation under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q092",
+    "query": "nclat appeal on limitation and condonation under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q093",
+    "query": "nclt appeal on limitation and condonation under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q094",
+    "query": "debt recovery appellate tribunal appeal on limitation and condonation under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q095",
+    "query": "customs tribunal appeal on limitation and condonation under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q096",
+    "query": "central administrative tribunal appeal on limitation and condonation under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q097",
+    "query": "nclat appeal on limitation and condonation under section 5 limitation act where delay condonation refused and appeal dismissed as time barred.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q098",
+    "query": "nclt appeal on limitation and condonation under section 5 limitation act where application for condonation rejected as barred by limitation.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q099",
+    "query": "debt recovery appellate tribunal appeal on limitation and condonation under section 5 limitation act where delay not condoned and appeal rejected.",
+    "expected": {
+      "polarity": "refused",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
+    }
+  },
+  {
+    "id": "q100",
+    "query": "customs tribunal appeal on limitation and condonation under section 5 limitation act where state appeal dismissed for limitation delay.",
+    "expected": {
+      "polarity": "dismissed",
+      "requiredHooks": [
+        "section 5 limitation act"
+      ]
     }
   }
 ]

@@ -12,7 +12,17 @@ type IndexWindow = {
   toDate: string;
 };
 
+type DoctypeTarget = "supremecourt" | "highcourts" | "tribunals";
+
 let indexPreflightDone = false;
+
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (!value) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
 
 function arg(name: string, fallback?: string): string {
   const prefix = `--${name}=`;
@@ -65,7 +75,7 @@ function runIndexPreflight(): void {
 
 async function fetchWindowDocs(input: {
   client: IndianKanoonApiClient;
-  court: "SC" | "HC";
+  doctype: DoctypeTarget;
   window: IndexWindow;
   query: string;
   maxPages: number;
@@ -74,7 +84,7 @@ async function fetchWindowDocs(input: {
   for (let page = 0; page < input.maxPages; page += 1) {
     const response = await input.client.search({
       formInput: input.query,
-      court: input.court,
+      doctypes: input.doctype,
       fromDate: input.window.fromDate,
       toDate: input.window.toDate,
       pagenum: page,
@@ -86,6 +96,26 @@ async function fetchWindowDocs(input: {
   }
 
   return normalizeIkDocuments(rows, "ik_api_v1");
+}
+
+function progressiveQueries(baseQuery: string): string[] {
+  const curated = [
+    baseQuery,
+    "section 197 crpc sanction section 19 prevention of corruption act",
+    "delay condonation refused limitation act section 5 appeal dismissed time barred",
+    "quashing proceedings section 482 crpc abuse of process",
+    "corruption disproportionate assets section 13 prevention of corruption act",
+    "tribunal service matter limitation condonation",
+  ];
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const query of curated) {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    output.push(query.trim());
+  }
+  return output;
 }
 
 function toVectorRecords(input: {
@@ -119,6 +149,7 @@ export async function runIndexJob(input?: {
   fromDate?: string;
   toDate?: string;
   query?: string;
+  queries?: string[];
   maxPages?: number;
 }): Promise<{ indexed: number; chunks: number; documents: number }> {
   runIndexPreflight();
@@ -127,17 +158,43 @@ export async function runIndexJob(input?: {
     toDate: input?.toDate ?? new Date().toISOString().slice(0, 10),
   };
   const query = input?.query ?? (process.env.IK_API_INDEX_QUERY?.trim() || "judgment");
+  const progressiveEnabled = parseBoolean(
+    process.env.IK_PROGRESSIVE_INDEX_V2,
+    true,
+  );
+  const queryList =
+    input?.queries && input.queries.length > 0
+      ? input.queries
+      : progressiveEnabled
+        ? progressiveQueries(query)
+        : [query];
   const maxPages = Math.max(1, Math.min(input?.maxPages ?? Number(process.env.IK_API_INDEX_MAX_PAGES ?? "6"), 60));
+  const pagesPerQuery = Math.max(1, Math.floor(maxPages / Math.max(1, queryList.length)));
 
   const client = new IndianKanoonApiClient();
   const vectorStore = new ManagedVectorStore();
+  const doctypeTargets: DoctypeTarget[] = ["supremecourt", "highcourts", "tribunals"];
+  const windows = await Promise.all(
+    doctypeTargets.flatMap((doctype) =>
+      queryList.map((q) =>
+        fetchWindowDocs({
+          client,
+          doctype,
+          window,
+          query: q,
+          maxPages: pagesPerQuery,
+        }),
+      ),
+    ),
+  );
 
-  const [scDocs, hcDocs] = await Promise.all([
-    fetchWindowDocs({ client, court: "SC", window, query, maxPages }),
-    fetchWindowDocs({ client, court: "HC", window, query, maxPages }),
-  ]);
-
-  const documents = [...scDocs, ...hcDocs];
+  const dedupedByDoc = new Map<string, (typeof windows)[number][number]>();
+  for (const docs of windows) {
+    for (const doc of docs) {
+      if (!dedupedByDoc.has(doc.docId)) dedupedByDoc.set(doc.docId, doc);
+    }
+  }
+  const documents = Array.from(dedupedByDoc.values());
   const chunks = chunkLegalDocuments({ documents });
   const embeddings = await embedTexts({
     texts: chunks.map((chunk) => chunk.text),

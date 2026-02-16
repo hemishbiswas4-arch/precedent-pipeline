@@ -43,3 +43,32 @@ test("rerank signal influences final score ordering when lexical ties are close"
   const ranked = scoreCases(query, context, cases);
   assert.equal(ranked[0].url, "https://indiankanoon.org/doc/1/");
 });
+
+test("authority signals (cited-by and bench metadata) improve ranking under near-tie lexical matches", () => {
+  const query = "section 197 crpc sanction required";
+  const cases = [
+    {
+      source: "indiankanoon" as const,
+      title: "Case Authority",
+      url: "https://indiankanoon.org/doc/10/",
+      snippet: "section 197 crpc sanction required before prosecution",
+      court: "SC" as const,
+      citedByCount: 240,
+      citesCount: 72,
+      author: "Justice A",
+      bench: "Division Bench",
+    },
+    {
+      source: "indiankanoon" as const,
+      title: "Case Weak",
+      url: "https://indiankanoon.org/doc/11/",
+      snippet: "section 197 crpc sanction required before prosecution",
+      court: "SC" as const,
+      citedByCount: 3,
+      citesCount: 1,
+    },
+  ];
+
+  const ranked = scoreCases(query, context, cases);
+  assert.equal(ranked[0].url, "https://indiankanoon.org/doc/10/");
+});

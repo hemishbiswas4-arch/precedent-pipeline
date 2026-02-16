@@ -16,6 +16,22 @@ export type BedrockHealthResponse = {
   error?: string;
 };
 
+export type IndianKanoonHealthResponse = {
+  ok: boolean;
+  baseUrl: string;
+  status?: number;
+  latencyMs?: number;
+  timeoutMs?: number;
+  rows?: number;
+  found?: number | string;
+  query?: string;
+  endpoint?: string;
+  retryAfterMs?: number;
+  detail?: string;
+  hint?: string;
+  error?: string;
+};
+
 export type DebugPayload = {
   requestId: string;
   cleanedQuery?: string;

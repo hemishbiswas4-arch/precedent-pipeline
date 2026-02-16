@@ -7,6 +7,12 @@ export type RetrievalSourceTag =
   | "web_search"
   | "semantic_vector"
   | "fused";
+export type RetrievalQueryMode = "precision" | "context" | "expansion";
+export type RetrievalDoctypeProfile =
+  | "judgments_sc_hc_tribunal"
+  | "supremecourt"
+  | "highcourts"
+  | "any";
 
 export type RetrievalBlockedType = "local_cooldown" | "cloudflare_challenge" | "rate_limit";
 
@@ -17,6 +23,13 @@ export type RetrievalSearchInput = {
   fromDate?: string;
   toDate?: string;
   sortByMostRecent?: boolean;
+  queryMode?: RetrievalQueryMode;
+  doctypeProfile?: RetrievalDoctypeProfile;
+  titleTerms?: string[];
+  citeTerms?: string[];
+  authorTerms?: string[];
+  benchTerms?: string[];
+  categoryExpansions?: string[];
   compiledQuery?: string;
   includeTokens?: string[];
   excludeTokens?: string[];
@@ -38,6 +51,7 @@ export type RetrievalSearchInput = {
 
 export type RetrievalSearchDebug = {
   searchQuery: string;
+  queryMode?: RetrievalQueryMode;
   status: number;
   ok: boolean;
   parsedCount: number;
@@ -64,6 +78,10 @@ export type RetrievalSearchDebug = {
   fusionLatencyMs?: number;
   docFragmentHydrationMs?: number;
   docFragmentCalls?: number;
+  categoryExpansionCount?: number;
+  docmetaHydrationMs?: number;
+  docmetaCalls?: number;
+  docmetaHydrated?: number;
 };
 
 export type RetrievalSearchResult = {
