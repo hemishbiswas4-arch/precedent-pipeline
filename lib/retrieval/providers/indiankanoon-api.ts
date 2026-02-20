@@ -44,11 +44,16 @@ function normalizeTerm(value: string): string {
     .trim();
 }
 
-function uniqueTerms(values: string[], limit: number): string[] {
+function uniqueTerms(values: string[], limit: number, maxWords = 12): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const value of values) {
-    const normalized = normalizeTerm(value).toLowerCase();
+    const normalized = normalizeTerm(value)
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, Math.max(1, maxWords))
+      .join(" ");
     if (!normalized || seen.has(normalized)) continue;
     seen.add(normalized);
     out.push(normalized);
