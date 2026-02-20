@@ -8,6 +8,11 @@ import {
 } from "@/lib/pipeline/types";
 import { ReasonerOutcomePolarity, ReasonerPlan } from "@/lib/reasoner-schema";
 import { expandOntologySynonymsForRecall } from "@/lib/kb/legal-ontology";
+import {
+  expandMinimalTransitionAliases,
+  isLikelyLegalDisjunction,
+  parseLegalReferences,
+} from "@/lib/kb/legal-reference-parser";
 
 export type CanonicalHookGroup = {
   groupId: string;
@@ -37,6 +42,9 @@ export type CanonicalIntent = {
   mustExcludeTokens: string[];
   canonicalOrderTerms: string[];
   disjunctiveQuery: boolean;
+  softHintTerms: string[];
+  notificationTerms: string[];
+  transitionAliases: string[];
 };
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
@@ -298,7 +306,7 @@ function isStatutoryHookTerm(term: string): boolean {
   return (
     /\bsection\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\([a-z]\))?/i.test(normalized) ||
     /\barticle\s*\d+[a-z]?\b/i.test(normalized) ||
-    /\b(?:ipc|crpc|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
+    /\b(?:ipc|crpc|bnss|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
     /\b[a-z][a-z\s]{2,}\s+act\b/i.test(normalized)
   );
 }
@@ -313,14 +321,14 @@ function isWeakHookTerm(term: string): boolean {
 }
 
 function hasDisjunctiveSignals(cleanedQuery: string): boolean {
-  const normalized = normalizeText(cleanedQuery);
-  return /\b(?:or|either|alternatively|versus|vs\.?|instead of)\b/.test(normalized);
+  const refs = parseLegalReferences(cleanedQuery);
+  return isLikelyLegalDisjunction(cleanedQuery, refs);
 }
 
 function detectHookFamily(term: string): string | null {
   const normalized = normalizeText(term);
   if (/prevention of corruption|pc act/.test(normalized)) return "pc_act";
-  if (/\bcrpc\b|criminal procedure/.test(normalized)) return "crpc";
+  if (/\bcrpc\b|criminal procedure|\bbnss\b|bharatiya nagarik suraksha sanhita/.test(normalized)) return "crpc";
   if (/\bipc\b|indian penal code/.test(normalized)) return "ipc";
   if (/\bcpc\b|civil procedure/.test(normalized)) return "cpc";
   if (/limitation act/.test(normalized)) return "limitation_act";
@@ -602,21 +610,9 @@ function extractHookGroups(intent: IntentProfile, reasonerPlan?: ReasonerPlan): 
 }
 
 function buildMustIncludeTokens(input: {
-  actors: string[];
-  proceedings: string[];
-  outcomes: string[];
-  hookGroups: CanonicalHookGroup[];
+  hardIncludeTerms: string[];
 }): string[] {
-  const requiredHookRepresentatives = input.hookGroups.filter((group) => group.required).map((group) => group.representative);
-  const tokens = [
-    ...input.actors.slice(0, 3),
-    ...input.proceedings.slice(0, 3),
-    ...input.outcomes.slice(0, 3),
-    ...requiredHookRepresentatives.slice(0, 4),
-  ]
-    .flatMap((value) => tokenize(value))
-    .filter((token) => isMeaningfulToken(token));
-  return unique(tokens).slice(0, 20);
+  return unique(input.hardIncludeTerms).slice(0, 20);
 }
 
 function phraseIncludesAllRequiredGroups(phrase: string, requiredGroups: CanonicalHookGroup[]): boolean {
@@ -669,6 +665,7 @@ function buildVariant(
 }
 
 export function buildCanonicalIntent(intent: IntentProfile, reasonerPlan?: ReasonerPlan): CanonicalIntent {
+  const legalRefs = parseLegalReferences(intent.cleanedQuery);
   const filteredReasonerOutcomes = filterReasonerOutcomeTerms(intent, reasonerPlan?.proposition.outcome_required ?? []);
   const filteredReasonerContradictions = filterReasonerOutcomeTerms(
     intent,
@@ -685,12 +682,22 @@ export function buildCanonicalIntent(intent: IntentProfile, reasonerPlan?: Reaso
   ]).slice(0, 8);
   const proceedings = unique([...(reasonerPlan?.proposition.proceeding ?? []), ...intent.procedures]).slice(0, 6);
   const outcomes = unique([...filteredReasonerOutcomes, ...intent.issues]).slice(0, 8);
+  const transitionAliases = expandMinimalTransitionAliases([
+    ...legalRefs.statutes,
+    ...intent.statutes,
+    ...intent.entities.statute,
+    ...intent.entities.section,
+    ...(reasonerPlan?.proposition.legal_hooks ?? []),
+  ]);
   const legalHooks = unique([
     ...(reasonerPlan?.proposition.legal_hooks ?? []),
     ...intent.statutes,
     ...intent.entities.statute,
     ...intent.entities.section,
-  ]).slice(0, 14);
+    ...legalRefs.statutes,
+    ...legalRefs.sections,
+    ...transitionAliases,
+  ]).slice(0, 18);
   const citationHints = unique([
     ...intent.retrievalIntent.citationHints,
     ...intent.entities.case_citation,
@@ -704,16 +711,23 @@ export function buildCanonicalIntent(intent: IntentProfile, reasonerPlan?: Reaso
   ]).slice(0, 14);
   const disjunctiveQuery = hasDisjunctiveSignals(intent.cleanedQuery);
   const mustIncludeTokens = buildMustIncludeTokens({
-    actors,
-    proceedings,
-    outcomes,
-    hookGroups,
+    hardIncludeTerms: legalRefs.hardIncludeTokens,
   });
+  const softHintTerms = unique([
+    ...legalRefs.softHintTerms,
+    ...transitionAliases,
+    ...legalHooks,
+  ]).slice(0, 24);
+  const notificationTerms = unique([
+    ...legalRefs.notificationIds,
+    ...legalRefs.notificationDates,
+  ]).slice(0, 12);
   const mustExcludeTokens = buildContradictionExclusionTerms(contradictionTerms);
   const canonicalOrderTerms = unique([
     ...actors,
     ...proceedings,
     ...hookGroups.filter((group) => group.required).map((group) => group.representative),
+    ...transitionAliases,
     ...outcomes,
   ]).slice(0, 14);
 
@@ -734,6 +748,9 @@ export function buildCanonicalIntent(intent: IntentProfile, reasonerPlan?: Reaso
     mustExcludeTokens,
     canonicalOrderTerms,
     disjunctiveQuery,
+    softHintTerms,
+    notificationTerms,
+    transitionAliases,
   };
 }
 
@@ -790,6 +807,13 @@ export function synthesizeRetrievalQueries(input: {
   }
   for (const phrase of deterministicPlanner.keywordPack.primary.slice(0, 10)) {
     broadSeeds.push(phrase);
+  }
+  for (const phrase of canonicalIntent.transitionAliases.slice(0, 8)) {
+    broadSeeds.push(phrase);
+    strictSeeds.push(phrase);
+  }
+  if (canonicalIntent.transitionAliases.length >= 2) {
+    strictSeeds.push(canonicalIntent.transitionAliases.slice(0, 2).join(" "));
   }
   for (const phrase of expandOntologySynonymsForRecall({
     terms: [
@@ -859,7 +883,11 @@ export function synthesizeRetrievalQueries(input: {
     ]).slice(0, 5),
     canonicalOrderTerms: canonicalIntent.canonicalOrderTerms.slice(0, 14),
     excludeTerms: canonicalIntent.mustExcludeTokens.slice(0, 10),
+    softTerms: canonicalIntent.softHintTerms.slice(0, 10),
+    notificationTerms: canonicalIntent.notificationTerms.slice(0, 8),
   };
+  const includeTokensForMode = (queryMode: QueryRetrievalDirectives["queryMode"]): string[] =>
+    queryMode === "precision" ? canonicalIntent.mustIncludeTokens : [];
   const makeDirectives = (queryMode: QueryRetrievalDirectives["queryMode"]): QueryRetrievalDirectives => {
     return {
       queryMode,
@@ -899,7 +927,7 @@ export function synthesizeRetrievalQueries(input: {
         courtScope: canonicalIntent.courtScope,
         canonicalKeyPrefix: "rewrite:strict",
         priority: entry.priority - Math.min(idx, 6),
-        mustIncludeTokens: canonicalIntent.mustIncludeTokens,
+        mustIncludeTokens: includeTokensForMode("precision"),
         mustExcludeTokens: canonicalIntent.mustExcludeTokens,
         providerHints: providerHintsBase,
         retrievalDirectives: makeDirectives("precision"),
@@ -928,7 +956,7 @@ export function synthesizeRetrievalQueries(input: {
       courtScope: canonicalIntent.courtScope,
       canonicalKeyPrefix: queryMode === "expansion" ? "rewrite:expansion" : "rewrite:context",
       priority: 82 - Math.min(i, 28),
-      mustIncludeTokens: canonicalIntent.mustIncludeTokens,
+      mustIncludeTokens: includeTokensForMode(queryMode),
       mustExcludeTokens: canonicalIntent.mustExcludeTokens,
       providerHints: providerHintsBase,
       retrievalDirectives: makeDirectives(queryMode),

@@ -377,3 +377,84 @@ test("open-ended quashing query does not force outcome polarity", () => {
   const canonical = buildCanonicalIntent(intent);
   assert.equal(canonical.outcomePolarity, "unknown");
 });
+
+test("CrPC to BNSS transition query retains legal transition hooks and avoids delay-condonation drift", async () => {
+  const intent = buildIntentProfile(
+    "References to the Code of Criminal Procedure in existing laws or proceedings must be construed as references to the BNSS.",
+  );
+  const deterministic = await planDeterministicQueryVariants(intent);
+  const canonical = buildCanonicalIntent(intent);
+  const variants = synthesizeRetrievalQueries({
+    canonicalIntent: canonical,
+    deterministicPlanner: deterministic,
+    reasonerVariants: [],
+  });
+
+  assert.ok(canonical.legalHooks.some((term) => term.includes("crpc") || term.includes("criminal procedure")));
+  assert.ok(canonical.legalHooks.some((term) => term.includes("bnss") || term.includes("nagarik suraksha")));
+  assert.equal(
+    variants.some((variant) => /delay not condoned|condonation|time barred/.test(variant.phrase)),
+    false,
+  );
+});
+
+test("notification-driven transition query keeps hard include tokens in precision lane only", async () => {
+  const intent = buildIntentProfile(
+    "Have any courts interpreted or applied the Ministry of Law and Justice Notification dated 16 July 2024 (S.O. 2790(E)) issued under Section 8 of the General Clauses Act to hold that references to the Code of Criminal Procedure, 1973 are to be read as references to the Bharatiya Nagarik Suraksha Sanhita, 2023?",
+  );
+  const deterministic = await planDeterministicQueryVariants(intent);
+  const canonical = buildCanonicalIntent(intent);
+  const variants = synthesizeRetrievalQueries({
+    canonicalIntent: canonical,
+    deterministicPlanner: deterministic,
+    reasonerVariants: [],
+  });
+
+  const precision = variants.filter((variant) => variant.retrievalDirectives?.queryMode === "precision");
+  assert.ok(precision.length > 0);
+  assert.ok(precision.some((variant) => (variant.mustIncludeTokens?.length ?? 0) > 0));
+  assert.ok(canonical.mustIncludeTokens.some((term) => term.includes("section 8")));
+  assert.ok(canonical.mustIncludeTokens.some((term) => term.includes("s o 2790(e)")));
+
+  const broad = variants.filter((variant) =>
+    variant.retrievalDirectives?.queryMode === "context" || variant.retrievalDirectives?.queryMode === "expansion");
+  assert.ok(broad.length > 0);
+  assert.equal(
+    broad.some((variant) => (variant.mustIncludeTokens?.length ?? 0) > 0),
+    false,
+  );
+});
+
+test("Indian Kanoon HTML query builder de-duplicates repeated token assembly", () => {
+  const htmlQuery = buildIndianKanoonSearchQueryForTest("section 8 general clauses act", {
+    canonicalOrderTerms: ["section 8", "section 8", "general clauses act"],
+    includeTokens: ["section 8", "section 8", "s.o. 2790(e)"],
+    excludeTokens: [],
+  });
+
+  assert.equal(htmlQuery.includes("section section"), false);
+  assert.equal(htmlQuery.includes("2790(e) 2790(e)"), false);
+});
+
+test("IK API context query keeps notification/date hints optional via ORR", () => {
+  const query = ikApiProviderTestUtils.buildFormInput({
+    phrase: "section 8 general clauses act crpc bnss transition",
+    compiledQuery: "section 8 general clauses act crpc bnss transition",
+    courtScope: "ANY",
+    queryMode: "context",
+    includeTokens: [],
+    providerHints: {
+      canonicalOrderTerms: ["section 8 general clauses act", "crpc bnss"],
+      softTerms: ["statutory reference substitution", "code of criminal procedure reference read as bnss reference"],
+      notificationTerms: ["s.o. 2790(e)", "16 july 2024"],
+    },
+    maxResultsPerPhrase: 8,
+    maxPages: 1,
+    crawlMaxElapsedMs: 1200,
+    fetchTimeoutMs: 900,
+    max429Retries: 0,
+  });
+
+  assert.ok(query.includes("ORR"));
+  assert.ok(/s\.o\.?\s+2790\(e\)/.test(query));
+});

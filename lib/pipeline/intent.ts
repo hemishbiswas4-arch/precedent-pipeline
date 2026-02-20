@@ -144,7 +144,9 @@ function buildHookGroups(input: {
     if (/\bsection\s*482\b/.test(term)) return "sec_482_crpc";
     if (/\bsection\s*5\b/.test(term) && /\blimitation/.test(term)) return "sec_5_limitation";
     if (/\bpc act|prevention of corruption/.test(term)) return "pc_act";
-    if (/\bcrpc\b/.test(term)) return "crpc";
+    if (/\bcrpc\b|\bcode of criminal procedure\b|\bbnss\b|\bbharatiya nagarik suraksha sanhita\b/.test(term)) {
+      return "crpc";
+    }
     if (/\bipc\b/.test(term)) return "ipc";
     if (/\blimitation act\b/.test(term)) return "limitation_act";
     const section = term.match(/\bsection\s*([0-9]+(?:\([0-9a-z]+\))*(?:\([a-z]\))?)/i)?.[1];

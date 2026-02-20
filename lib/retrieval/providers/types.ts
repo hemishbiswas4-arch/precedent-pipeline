@@ -38,6 +38,8 @@ export type RetrievalSearchInput = {
     serperCoreTerms?: string[];
     canonicalOrderTerms?: string[];
     excludeTerms?: string[];
+    softTerms?: string[];
+    notificationTerms?: string[];
   };
   variantPriority?: number;
   maxResultsPerPhrase: number;

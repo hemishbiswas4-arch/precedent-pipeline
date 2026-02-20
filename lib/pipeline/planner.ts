@@ -1,5 +1,6 @@
 import { buildKeywordPackWithAI } from "@/lib/ai-keyword-planner";
 import { expandOntologySynonymsForRecall } from "@/lib/kb/legal-ontology";
+import { parseLegalReferences } from "@/lib/kb/legal-reference-parser";
 import { buildKeywordPack } from "@/lib/keywords";
 import { sanitizeNlqForSearch } from "@/lib/nlq";
 import {
@@ -226,7 +227,7 @@ function buildVariant(
 function inferHookGroupId(term: string): string {
   const normalized = normalizePhrase(term);
   if (/prevention of corruption|pc act/.test(normalized)) return "pc_act";
-  if (/\bcrpc\b|criminal procedure/.test(normalized)) return "crpc";
+  if (/\bcrpc\b|criminal procedure|\bbnss\b|bharatiya nagarik suraksha sanhita/.test(normalized)) return "crpc";
   if (/\bipc\b|indian penal code/.test(normalized)) return "ipc";
   if (/\bcpc\b|civil procedure/.test(normalized)) return "cpc";
   if (/limitation act/.test(normalized)) return "limitation_act";
@@ -250,8 +251,14 @@ function expandHookTerms(term: string): string[] {
   if (/prevention of corruption|pc act/.test(normalized)) {
     expanded.push("prevention of corruption act", "pc act");
   }
-  if (/\bcrpc\b|criminal procedure/.test(normalized)) {
-    expanded.push("crpc", "code of criminal procedure", "section 197 crpc");
+  if (/\bcrpc\b|criminal procedure|\bbnss\b|bharatiya nagarik suraksha sanhita/.test(normalized)) {
+    expanded.push(
+      "crpc",
+      "code of criminal procedure",
+      "bnss",
+      "bharatiya nagarik suraksha sanhita",
+      "section 197 crpc",
+    );
   }
   return unique(expanded.map((value) => normalizePhrase(value)).filter(Boolean)).slice(0, 8);
 }
@@ -843,6 +850,85 @@ function appendPhaseVariants(input: {
   }
 }
 
+function buildSparseStrictBackstopPhrases(input: {
+  intent: IntentProfile;
+  reasonerPlan?: ReasonerPlan;
+  keywordPack: KeywordPack;
+  outcomePhrases: string[];
+}): string[] {
+  const refs = parseLegalReferences(input.intent.cleanedQuery);
+  const actorPool = (
+    input.reasonerPlan?.proposition.actors?.length
+      ? input.reasonerPlan.proposition.actors
+      : [...input.intent.actors, ...input.intent.entities.org]
+  )
+    .map((value) => sanitizeTokens(tokenizePhrase(value), 4))
+    .filter((value) => value.length > 1)
+    .slice(0, 3);
+  const procedurePool = (
+    input.reasonerPlan?.proposition.proceeding?.length
+      ? input.reasonerPlan.proposition.proceeding
+      : input.intent.procedures
+  )
+    .map((value) => sanitizeTokens(tokenizePhrase(value), 4))
+    .filter((value) => value.length > 1)
+    .slice(0, 3);
+  const outcomePool = (input.reasonerPlan?.proposition.outcome_required?.length
+    ? input.reasonerPlan.proposition.outcome_required
+    : input.outcomePhrases
+  )
+    .map((value) => sanitizeTokens(tokenizePhrase(value), 5))
+    .filter((value) => value.length > 1)
+    .slice(0, 3);
+
+  const legalSeeds = unique([
+    ...refs.hardIncludeTokens,
+    ...refs.transitionAliases,
+    ...input.intent.statutes,
+    ...input.intent.entities.statute,
+    ...input.intent.entities.section,
+    ...input.keywordPack.searchPhrases.slice(0, 8),
+    ...input.intent.anchors.slice(0, 10),
+  ])
+    .map((value) => sanitizeTokens(tokenizePhrase(value), 7))
+    .filter((value) => value.length >= 4)
+    .slice(0, 10);
+
+  const phrases: string[] = [];
+  for (const actor of actorPool.length > 0 ? actorPool : [""]) {
+    for (const procedure of procedurePool.length > 0 ? procedurePool : [""]) {
+      for (const seed of legalSeeds.slice(0, 6)) {
+        for (const outcome of outcomePool.length > 0 ? outcomePool : [""]) {
+          const phrase = sanitizeTokens(tokenizePhrase(`${actor} ${procedure} ${seed} ${outcome}`), 13);
+          if (phrase.length >= 10) phrases.push(phrase);
+        }
+      }
+    }
+  }
+
+  const cleanedWindow = sanitizeTokens(tokenizePhrase(input.intent.cleanedQuery), 13);
+  if (cleanedWindow.length >= 10) phrases.push(cleanedWindow);
+
+  const seedPairs = legalSeeds.slice(0, 5);
+  for (let i = 0; i < seedPairs.length; i += 1) {
+    for (let j = i + 1; j < seedPairs.length; j += 1) {
+      const pairPhrase = sanitizeTokens(tokenizePhrase(`${seedPairs[i]} ${seedPairs[j]}`), 12);
+      if (pairPhrase.length >= 8) phrases.push(pairPhrase);
+    }
+  }
+
+  if (phrases.length === 0) {
+    phrases.push(
+      ...input.keywordPack.searchPhrases
+        .slice(0, 4)
+        .map((value) => sanitizeTokens(tokenizePhrase(value), 12))
+        .filter((value) => value.length >= 8),
+    );
+  }
+
+  return unique(phrases).slice(0, 14);
+}
+
 function buildVariantsFromKeywordPack(input: {
   intent: IntentProfile;
   keywordPack: KeywordPack;
@@ -933,22 +1019,12 @@ function buildVariantsFromKeywordPack(input: {
   });
 
   if (!variants.some((variant) => variant.strictness === "strict")) {
-    const actorPool = (reasonerPlan?.proposition.actors?.length ? reasonerPlan.proposition.actors : intent.actors).slice(0, 3);
-    const procedurePool = (
-      reasonerPlan?.proposition.proceeding?.length ? reasonerPlan.proposition.proceeding : intent.procedures
-    ).slice(0, 3);
-    const outcomePool = (
-      reasonerPlan?.proposition.outcome_required?.length ? reasonerPlan.proposition.outcome_required : outcomePhrases
-    ).slice(0, 3);
-    const fallbackStrict: string[] = [];
-    for (const actor of actorPool.length > 0 ? actorPool : ["state"]) {
-      for (const procedure of procedurePool.length > 0 ? procedurePool : ["appeal"]) {
-        for (const outcome of outcomePool.length > 0 ? outcomePool : ["delay not condoned"]) {
-          const phrase = sanitizeTokens(tokenizePhrase(`${actor} ${procedure} ${outcome}`), 12);
-          if (phrase.length >= 10) fallbackStrict.push(phrase);
-        }
-      }
-    }
+    const fallbackStrict = buildSparseStrictBackstopPhrases({
+      intent,
+      reasonerPlan,
+      keywordPack,
+      outcomePhrases,
+    });
     appendPhaseVariants({
       output: variants,
       seen,

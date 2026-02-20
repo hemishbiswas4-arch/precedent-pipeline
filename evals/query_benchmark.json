@@ -1038,5 +1038,28 @@
         "section 5 limitation act"
       ]
     }
+  },
+  {
+    "id": "q101",
+    "query": "References to the Code of Criminal Procedure in existing laws or proceedings must be construed as references to the BNSS.",
+    "expected": {
+      "polarity": "unknown",
+      "requiredHooks": [
+        "code of criminal procedure, 1973",
+        "bharatiya nagarik suraksha sanhita, 2023"
+      ]
+    }
+  },
+  {
+    "id": "q102",
+    "query": "Have any courts interpreted or applied the Ministry of Law and Justice Notification dated 16 July 2024 (S.O. 2790(E)) issued under Section 8 of the General Clauses Act to hold that references to the Code of Criminal Procedure, 1973 are to be read as references to the Bharatiya Nagarik Suraksha Sanhita, 2023?",
+    "expected": {
+      "polarity": "unknown",
+      "requiredHooks": [
+        "section 8 general clauses act",
+        "code of criminal procedure, 1973",
+        "bharatiya nagarik suraksha sanhita, 2023"
+      ]
+    }
   }
 ]

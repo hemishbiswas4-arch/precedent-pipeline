@@ -61,6 +61,8 @@ export type IndianKanoonSearchOptions = {
   includeTokens?: string[];
   excludeTokens?: string[];
   canonicalOrderTerms?: string[];
+  softTerms?: string[];
+  notificationTerms?: string[];
   maxPages?: number;
   crawlMaxElapsedMs?: number;
   fetchTimeoutMs?: number;
@@ -388,6 +390,8 @@ function buildSearchQuery(phrase: string, options: IndianKanoonSearchOptions): s
     [
       ...(options.canonicalOrderTerms ?? []),
       ...(options.includeTokens ?? []),
+      ...((options.includeTokens?.length ?? 0) > 0 ? options.softTerms ?? [] : []),
+      ...((options.includeTokens?.length ?? 0) > 0 ? options.notificationTerms ?? [] : []),
       options.compiledQuery ?? "",
       phrase,
     ],
@@ -398,12 +402,19 @@ function buildSearchQuery(phrase: string, options: IndianKanoonSearchOptions): s
       .flatMap((value) => value.split(/\s+/))
       .filter((token) => token.length > 1),
   );
-  const canonicalPhrase = orderedTerms
-    .flatMap((value) => value.split(/\s+/))
-    .filter((token) => token.length > 1 && !excluded.has(token))
-    .slice(0, 18)
-    .join(" ")
-    .trim();
+  const canonicalTokens: string[] = [];
+  const seenTokens = new Set<string>();
+  for (const term of orderedTerms) {
+    for (const token of term.split(/\s+/)) {
+      if (token.length <= 1 || excluded.has(token)) continue;
+      if (seenTokens.has(token)) continue;
+      seenTokens.add(token);
+      canonicalTokens.push(token);
+      if (canonicalTokens.length >= 18) break;
+    }
+    if (canonicalTokens.length >= 18) break;
+  }
+  const canonicalPhrase = canonicalTokens.join(" ").trim();
 
   const parts: string[] = [];
   if (options.courtType) {

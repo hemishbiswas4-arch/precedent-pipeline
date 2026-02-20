@@ -385,7 +385,7 @@ function findTermPositions(text: string, term: string): number[] {
 
 function detectHookFamily(normalized: string): string | null {
   if (/prevention of corruption|pc act/.test(normalized)) return "pc_act";
-  if (/\bcrpc\b|criminal procedure/.test(normalized)) return "crpc";
+  if (/\bcrpc\b|criminal procedure|\bbnss\b|bharatiya nagarik suraksha sanhita/.test(normalized)) return "crpc";
   if (/\bipc\b|indian penal code/.test(normalized)) return "ipc";
   if (/\bcpc\b|civil procedure/.test(normalized)) return "cpc";
   if (/limitation act/.test(normalized)) return "limitation_act";
@@ -465,8 +465,8 @@ function expandHookTerm(term: string, boundFamily?: string | null): string[] {
   if (/prevention of corruption/.test(normalized) || /\bpc act\b/.test(normalized)) {
     expanded.push("prevention of corruption act", "pc act");
   }
-  if (/\bcrpc\b/.test(normalized) || /criminal procedure/.test(normalized)) {
-    expanded.push("crpc", "cr.p.c", "code of criminal procedure");
+  if (/\bcrpc\b|\bbnss\b/.test(normalized) || /criminal procedure|bharatiya nagarik suraksha sanhita/.test(normalized)) {
+    expanded.push("crpc", "cr.p.c", "code of criminal procedure", "bnss", "bharatiya nagarik suraksha sanhita");
   }
   if (/\bipc\b/.test(normalized) || /indian penal code/.test(normalized)) {
     expanded.push("ipc", "indian penal code");
@@ -676,7 +676,7 @@ function isStatutoryHookTerm(term: string): boolean {
   return (
     /\bsection\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\([a-z]\))?/i.test(normalized) ||
     /\barticle\s*\d+[a-z]?\b/i.test(normalized) ||
-    /\b(?:ipc|crpc|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
+    /\b(?:ipc|crpc|bnss|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
     /\b[a-z][a-z\s]{2,}\s+act\b/i.test(normalized)
   );
 }

@@ -33,6 +33,8 @@ export const indianKanoonHtmlProvider: RetrievalProvider = {
         includeTokens: input.includeTokens,
         excludeTokens: input.excludeTokens,
         canonicalOrderTerms: input.providerHints?.canonicalOrderTerms,
+        softTerms: input.providerHints?.softTerms,
+        notificationTerms: input.providerHints?.notificationTerms,
       });
 
       return {

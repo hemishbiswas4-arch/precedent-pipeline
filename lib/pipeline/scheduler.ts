@@ -542,7 +542,7 @@ export async function runRetrievalSchedule(input: {
           maxRetryAfterMs: config.maxRetryAfterMs,
           cooldownScope,
           compiledQuery: variant.providerHints?.compiledQuery,
-          includeTokens: variant.mustIncludeTokens,
+          includeTokens: queryMode === "precision" ? variant.mustIncludeTokens : undefined,
           excludeTokens: contradictionExclusionsEnabled ? variant.mustExcludeTokens : undefined,
           providerHints,
           queryMode,

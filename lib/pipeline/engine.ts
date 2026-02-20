@@ -1446,6 +1446,12 @@ export async function runPipelineSearch(input: {
   ]);
   const rewriteStrictCount = rewriteVariantsUsed.filter((variant) => variant.strictness === "strict").length;
   const rewriteBroadCount = Math.max(0, rewriteVariantsUsed.length - rewriteStrictCount);
+  const precisionIncludeTokenCount = rewriteVariantsUsed
+    .filter((variant) => variant.retrievalDirectives?.queryMode === "precision")
+    .reduce((sum, variant) => sum + (variant.mustIncludeTokens?.length ?? 0), 0);
+  const broadIncludeTokenCount = rewriteVariantsUsed
+    .filter((variant) => variant.retrievalDirectives?.queryMode !== "precision")
+    .reduce((sum, variant) => sum + (variant.mustIncludeTokens?.length ?? 0), 0);
   const variantUtilityEntries = Object.entries(scheduler.carryState.variantUtility ?? {});
   const variantUtilityTop = variantUtilityEntries
     .map(([canonicalKey, snapshot]) => ({
@@ -1911,6 +1917,10 @@ export async function runPipelineSearch(input: {
           broadVariantCount: rewriteBroadCount,
           canonicalMustIncludeCount: canonicalIntent?.mustIncludeTokens.length ?? 0,
           canonicalMustExcludeCount: canonicalIntent?.mustExcludeTokens.length ?? 0,
+          transitionAliasCount: canonicalIntent?.transitionAliases.length ?? 0,
+          notificationHintCount: canonicalIntent?.notificationTerms.length ?? 0,
+          precisionIncludeTokenCount,
+          broadIncludeTokenCount,
         },
         variantCount: allVariants.length,
         phaseCounts,

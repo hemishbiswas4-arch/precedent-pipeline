@@ -24,6 +24,8 @@ export type QueryProviderHints = {
   serperCoreTerms?: string[];
   canonicalOrderTerms?: string[];
   excludeTerms?: string[];
+  softTerms?: string[];
+  notificationTerms?: string[];
 };
 
 export type QueryRetrievalDirectives = {

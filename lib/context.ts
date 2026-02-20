@@ -1,4 +1,5 @@
 import { ContextProfile } from "@/lib/types";
+import { parseLegalReferences, ParsedLegalReferences } from "@/lib/kb/legal-reference-parser";
 
 const STOPWORDS = new Set([
   "a",
@@ -36,7 +37,10 @@ const STOPWORDS = new Set([
 ]);
 
 const DOMAIN_MAP: Array<{ domain: string; terms: string[] }> = [
-  { domain: "criminal", terms: ["criminal", "crpc", "ipc", "prosecution", "acquittal", "conviction", "fir"] },
+  {
+    domain: "criminal",
+    terms: ["criminal", "crpc", "bnss", "ipc", "prosecution", "acquittal", "conviction", "fir"],
+  },
   { domain: "civil", terms: ["civil", "cpc", "decree", "contract", "plaintiff", "defendant"] },
   { domain: "tax", terms: ["tax", "gst", "assessment", "adjudication", "customs", "excise"] },
   { domain: "appellate", terms: ["appeal", "appellate", "limitation", "condonation"] },
@@ -174,32 +178,11 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function extractSectionsAndStatutes(query: string): string[] {
+function extractSectionsAndStatutes(query: string, refs: ParsedLegalReferences): string[] {
   const q = normalize(query);
-  const sections = Array.from(
-    q.matchAll(
-      /\b(?:section|sec\.?|s\.)\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\s*(?:ipc|crpc|cpc|pc act|limitation act))?/gi,
-    ),
-  ).map((match) => match[0].replace(/\s+/g, " ").trim());
-  // Match subsection tokens like 13(1)(e) even though they end with ')', which breaks \b boundaries.
-  const bareSections = Array.from(
-    q.matchAll(
-      /(?:^|[^a-z0-9])(\d+(?:\([0-9a-z]+\))+(?:\s*(?:ipc|crpc|cpc|pc act|prevention of corruption act|limitation act))?)(?=$|[^a-z0-9])/gi,
-    ),
-  ).map((match) => {
-    const token = (match[1] ?? "").replace(/\s+/g, " ").trim();
-    return token.startsWith("section") ? token : `section ${token}`;
-  });
-
   const acts: string[] = [];
-  if (/\bipc\b/.test(q)) acts.push("ipc");
-  if (/\bcrpc\b/.test(q)) acts.push("crpc");
-  if (/\bcpc\b/.test(q)) acts.push("cpc");
-  if (/\blimitation act\b/.test(q)) acts.push("limitation act");
-  if (/\bprevention of corruption act\b|\bpc act\b/.test(q)) acts.push("prevention of corruption act");
   if (/\bgst\b/.test(q)) acts.push("gst");
-
-  return unique([...sections, ...bareSections, ...acts]).slice(0, 20);
+  return unique([...refs.sections, ...refs.statutes, ...refs.transitionAliases, ...acts]).slice(0, 24);
 }
 
 function extractDomains(query: string): string[] {
@@ -217,7 +200,7 @@ function extractProcedures(query: string): string[] {
   return PROCEDURE_TERMS.filter((item) => item.terms.some((term) => q.includes(term))).map((item) => item.label);
 }
 
-function extractIssues(query: string): string[] {
+function extractIssues(query: string, refs: ParsedLegalReferences): string[] {
   const q = normalize(query);
   const issues: string[] = [];
   const hasSectionSpecific = /\bsection\s*\d+|\b\d+\([0-9a-z]+\)(?:\([a-z]\))?/i.test(q);
@@ -243,6 +226,26 @@ function extractIssues(query: string): string[] {
     issues.push("statutory interaction required");
   }
 
+  if (
+    /\b(?:construed as|to be construed as|read as references?|to be read as references?)\b/.test(q) ||
+    /\breferences?\s+to\b[\s\S]{0,80}\bread as\b/.test(q)
+  ) {
+    issues.push("statutory reference substitution");
+  }
+
+  if (
+    /\b(?:notification|s\.?\s*o\.?|g\.?\s*s\.?\s*r\.?)\b/.test(q) &&
+    /\b(?:interpreted|applied|construed|read as)\b/.test(q)
+  ) {
+    issues.push("notification interpretation");
+  }
+
+  const hasCrpcAlias = refs.transitionAliases.some((term) => term.includes("crpc"));
+  const hasBnssAlias = refs.transitionAliases.some((term) => term.includes("bnss"));
+  if (hasCrpcAlias && hasBnssAlias) {
+    issues.push("crpc bnss transition interpretation");
+  }
+
   return unique(issues).slice(0, 16);
 }
 
@@ -252,6 +255,7 @@ function extractAnchors(input: {
   procedures: string[];
   actors: string[];
   issues: string[];
+  softTerms: string[];
 }): string[] {
   const queryTokens = tokenize(input.query);
   const phraseAnchors = [
@@ -259,22 +263,25 @@ function extractAnchors(input: {
     ...input.procedures,
     ...input.actors,
     ...input.issues,
+    ...input.softTerms,
   ];
   return unique([...phraseAnchors, ...queryTokens]).slice(0, 28);
 }
 
 export function buildContextProfile(query: string): ContextProfile {
+  const legalRefs = parseLegalReferences(query);
   const domains = extractDomains(query);
-  const statutesOrSections = extractSectionsAndStatutes(query);
+  const statutesOrSections = extractSectionsAndStatutes(query, legalRefs);
   const procedures = extractProcedures(query);
   const actors = extractActors(query);
-  const issues = extractIssues(query);
+  const issues = extractIssues(query, legalRefs);
   const anchors = extractAnchors({
     query,
     statutesOrSections,
     procedures,
     actors,
     issues,
+    softTerms: legalRefs.softHintTerms.slice(0, 8),
   });
 
   return {

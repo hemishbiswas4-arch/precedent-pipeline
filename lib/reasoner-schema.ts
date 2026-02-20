@@ -185,7 +185,7 @@ function isStatutoryHookTerm(term: string): boolean {
   return (
     /\bsection\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\([a-z]\))?/i.test(normalized) ||
     /\barticle\s*\d+[a-z]?\b/i.test(normalized) ||
-    /\b(?:ipc|crpc|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
+    /\b(?:ipc|crpc|bnss|cpc|pc act|limitation act|prevention of corruption act)\b/i.test(normalized) ||
     /\b[a-z][a-z\s]{2,}\s+act\b/i.test(normalized)
   );
 }
@@ -577,8 +577,10 @@ function buildLegalSignalTokenSet(input: { cleanedQuery: string; context: Contex
     if (/\bpc act\b|\bprevention of corruption\b/.test(normalized)) {
       ["pc", "prevention", "corruption", "act"].forEach((token) => signals.add(token));
     }
-    if (/\bcrpc\b|\bcriminal procedure\b/.test(normalized)) {
-      ["crpc", "criminal", "procedure", "code"].forEach((token) => signals.add(token));
+    if (/\bcrpc\b|\bbnss\b|\bcriminal procedure\b|bharatiya nagarik suraksha sanhita/.test(normalized)) {
+      ["crpc", "bnss", "criminal", "procedure", "code", "bharatiya", "nagarik", "suraksha", "sanhita"].forEach(
+        (token) => signals.add(token),
+      );
     }
     if (/\bipc\b|\bindian penal code\b/.test(normalized)) {
       ["ipc", "indian", "penal", "code"].forEach((token) => signals.add(token));

@@ -262,6 +262,10 @@ export type SearchResponse = {
         broadVariantCount: number;
         canonicalMustIncludeCount: number;
         canonicalMustExcludeCount: number;
+        transitionAliasCount?: number;
+        notificationHintCount?: number;
+        precisionIncludeTokenCount?: number;
+        broadIncludeTokenCount?: number;
       };
       variantCount: number;
       phaseCounts: Record<string, number>;

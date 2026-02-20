@@ -1,4 +1,5 @@
 import { ContextProfile } from "@/lib/types";
+import { parseLegalReferences } from "@/lib/kb/legal-reference-parser";
 
 export type EnrichedEntities = {
   person: string[];
@@ -29,19 +30,11 @@ function unique(values: string[]): string[] {
 }
 
 function extractSections(query: string): string[] {
-  const values = Array.from(
-    query.matchAll(
-      /\b(?:section|sec\.?|s\.)\s*\d+[a-z]?(?:\([0-9a-z]+\))*(?:\s*(?:ipc|crpc|cpc|pc act|limitation act))?/gi,
-    ),
-  ).map((match) => match[0]);
-  const bare = Array.from(
-    query.matchAll(/(?:^|[^a-z0-9])(\d+(?:\([0-9a-z]+\))+(?:\([a-z]\))?)(?=$|[^a-z0-9])/gi),
-  ).map((match) => `section ${match[1]}`);
-
-  return unique([...values, ...bare]).slice(0, 24);
+  return parseLegalReferences(query).sections.slice(0, 24);
 }
 
 function extractStatutes(query: string, context: ContextProfile): string[] {
+  const refs = parseLegalReferences(query);
   const acts = Array.from(query.matchAll(/\b([a-z][a-z\s]{2,40}? act)\b/gi)).map((match) => match[1]);
   const abbreviations: string[] = [];
   if (/\bcrpc\b/i.test(query)) abbreviations.push("crpc");
@@ -52,7 +45,10 @@ function extractStatutes(query: string, context: ContextProfile): string[] {
   }
   if (/\blimitation act\b/i.test(query)) abbreviations.push("limitation act");
 
-  return unique([...acts, ...abbreviations, ...context.statutesOrSections]).slice(0, 24);
+  return unique([...acts, ...abbreviations, ...refs.statutes, ...refs.transitionAliases, ...context.statutesOrSections]).slice(
+    0,
+    24,
+  );
 }
 
 function extractOrganizations(query: string): string[] {

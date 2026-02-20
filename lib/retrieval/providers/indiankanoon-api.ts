@@ -104,6 +104,12 @@ function buildFormInput(
     ],
     4,
   );
+  const softTerms = uniqueTerms([...(input.providerHints?.softTerms ?? [])], input.queryMode === "precision" ? 2 : 5);
+  const notificationTerms = uniqueTerms(
+    [...(input.providerHints?.notificationTerms ?? [])],
+    input.queryMode === "precision" ? 2 : 4,
+    6,
+  );
 
   if (!IK_API_STRUCTURED_QUERY_V2_ENABLED) {
     const legacyClauses: string[] = [];
@@ -129,10 +135,19 @@ function buildFormInput(
   }
 
   let query = clauses.join(" ").replace(/\s+/g, " ").trim();
-  if (input.queryMode === "expansion" && expansionTerms.length > 0) {
-    const expansionExpr = expansionTerms.map(quoteTerm).filter(Boolean).join(" ORR ");
-    if (expansionExpr) {
-      query = query.length > 0 ? `${query} ORR ${expansionExpr}` : expansionExpr;
+  const optionalTerms = uniqueTerms(
+    [
+      ...(input.queryMode === "expansion" ? expansionTerms : []),
+      ...(input.queryMode === "precision" ? [] : softTerms),
+      ...(input.queryMode === "precision" ? [] : notificationTerms),
+    ],
+    6,
+    8,
+  );
+  if (optionalTerms.length > 0) {
+    const optionalExpr = optionalTerms.map(quoteTerm).filter(Boolean).join(" ORR ");
+    if (optionalExpr) {
+      query = query.length > 0 ? `${query} ORR ${optionalExpr}` : optionalExpr;
     }
   }
 
